@@ -1,0 +1,30 @@
+[package]
+name = "fauna-scan"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "fauna-scan"
+path = "src/main.rs"
+
+[lib]
+name = "fauna_scan"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"
