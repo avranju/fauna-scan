@@ -97,7 +97,7 @@ impl FromStr for ImageKey {
 // ── Timestamp ──────────────────────────────────────────────────────────────
 
 /// UTC-normalized application timestamp.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Timestamp(DateTime<Utc>);
 
 impl Timestamp {
@@ -140,7 +140,7 @@ impl FromStr for Timestamp {
 // ── Download status ────────────────────────────────────────────────────────
 
 /// The download lifecycle state for a discovered image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadStatus {
     /// Discovered but not yet downloaded.
@@ -196,7 +196,7 @@ impl FromStr for DownloadStatus {
 // ── Processing status ──────────────────────────────────────────────────────
 
 /// The classification-processing lifecycle state for a downloaded image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessingStatus {
     /// Downloaded and ready for classification.
@@ -246,6 +246,98 @@ impl FromStr for ProcessingStatus {
             "missing" => Ok(Self::Missing),
             other => Err(format!("unknown processing status: {other}")),
         }
+    }
+}
+
+// ── Database row identifiers ──────────────────────────────────────────────
+
+/// Internal database identifier for an image row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ImageId(i64);
+
+impl ImageId {
+    /// Create a new image ID.
+    pub fn new(id: i64) -> Self {
+        Self(id)
+    }
+
+    /// Return the raw integer value.
+    pub fn get(&self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ImageId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Internal database identifier for a classification row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClassificationId(i64);
+
+impl ClassificationId {
+    /// Create a new classification ID.
+    pub fn new(id: i64) -> Self {
+        Self(id)
+    }
+
+    /// Return the raw integer value.
+    pub fn get(&self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for ClassificationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// ── Download status transitions ────────────────────────────────────────────
+
+impl DownloadStatus {
+    /// Return true if this status may legally transition to `next`.
+    ///
+    /// This encodes the valid lifecycle edges for download states:
+    ///
+    /// * `pending` → `downloading` (claim)
+    /// * `downloading` → `downloaded`, `retry_wait`, `unavailable`, `failed`
+    /// * `retry_wait` → `downloading` (retry after delay)
+    pub fn can_transition_to(&self, next: DownloadStatus) -> bool {
+        matches!(
+            (self, next),
+            (Self::Pending, Self::Downloading)
+                | (Self::Downloading, Self::Downloaded)
+                | (Self::Downloading, Self::RetryWait)
+                | (Self::Downloading, Self::Unavailable)
+                | (Self::Downloading, Self::Failed)
+                | (Self::RetryWait, Self::Downloading)
+        )
+    }
+}
+
+// ── Processing status transitions ──────────────────────────────────────────
+
+impl ProcessingStatus {
+    /// Return true if this status may legally transition to `next`.
+    ///
+    /// This encodes the valid lifecycle edges for processing states:
+    ///
+    /// * `new` → `processing` (claim)
+    /// * `processing` → `done`, `retry_wait`, `failed`, `missing`
+    /// * `retry_wait` → `processing` (retry after delay)
+    pub fn can_transition_to(&self, next: ProcessingStatus) -> bool {
+        matches!(
+            (self, next),
+            (Self::New, Self::Processing)
+                | (Self::Processing, Self::Done)
+                | (Self::Processing, Self::RetryWait)
+                | (Self::Processing, Self::Failed)
+                | (Self::Processing, Self::Missing)
+                | (Self::RetryWait, Self::Processing)
+        )
     }
 }
 
@@ -408,6 +500,187 @@ mod tests {
             let json = serde_json::to_string(&status).unwrap();
             let back: ProcessingStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, back, "round-trip failed for {status}");
+        }
+    }
+
+    // ── ImageId and ClassificationId ──────────────────────────────────────
+
+    #[test]
+    fn image_id_round_trip() {
+        let id = ImageId::new(99);
+        assert_eq!(id.get(), 99);
+        assert_eq!(format!("{id}"), "99");
+    }
+
+    #[test]
+    fn classification_id_round_trip() {
+        let id = ClassificationId::new(42);
+        assert_eq!(id.get(), 42);
+        assert_eq!(format!("{id}"), "42");
+    }
+
+    #[test]
+    fn image_id_serde_round_trip() {
+        let id = ImageId::new(7);
+        let json = serde_json::to_string(&id).unwrap();
+        let back: ImageId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+    }
+
+    #[test]
+    fn classification_id_serde_round_trip() {
+        let id = ClassificationId::new(13);
+        let json = serde_json::to_string(&id).unwrap();
+        let back: ClassificationId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, back);
+    }
+
+    // ── DownloadStatus transition validation ──────────────────────────────
+
+    #[test]
+    fn download_can_claim_pending() {
+        assert!(DownloadStatus::Pending.can_transition_to(DownloadStatus::Downloading));
+    }
+
+    #[test]
+    fn download_can_complete_downloading() {
+        assert!(DownloadStatus::Downloading.can_transition_to(DownloadStatus::Downloaded));
+    }
+
+    #[test]
+    fn download_can_retry_from_downloading() {
+        assert!(DownloadStatus::Downloading.can_transition_to(DownloadStatus::RetryWait));
+    }
+
+    #[test]
+    fn download_can_fail_from_downloading() {
+        assert!(DownloadStatus::Downloading.can_transition_to(DownloadStatus::Failed));
+        assert!(DownloadStatus::Downloading.can_transition_to(DownloadStatus::Unavailable));
+    }
+
+    #[test]
+    fn download_can_retry_after_wait() {
+        assert!(DownloadStatus::RetryWait.can_transition_to(DownloadStatus::Downloading));
+    }
+
+    #[test]
+    fn download_cannot_go_downloaded_to_pending() {
+        assert!(!DownloadStatus::Downloaded.can_transition_to(DownloadStatus::Pending));
+        assert!(!DownloadStatus::Downloaded.can_transition_to(DownloadStatus::Downloading));
+    }
+
+    #[test]
+    fn download_cannot_go_failed_to_downloading() {
+        assert!(!DownloadStatus::Failed.can_transition_to(DownloadStatus::Downloading));
+        assert!(!DownloadStatus::Unavailable.can_transition_to(DownloadStatus::Downloading));
+    }
+
+    #[test]
+    fn download_cannot_go_pending_to_downloaded() {
+        assert!(!DownloadStatus::Pending.can_transition_to(DownloadStatus::Downloaded));
+    }
+
+    #[test]
+    fn download_cannot_go_downloading_to_pending() {
+        assert!(!DownloadStatus::Downloading.can_transition_to(DownloadStatus::Pending));
+    }
+
+    // Exhaustive download transition matrix
+    #[test]
+    fn download_exhaustive_transition_matrix() {
+        let all: [DownloadStatus; 6] = [
+            DownloadStatus::Pending,
+            DownloadStatus::Downloading,
+            DownloadStatus::Downloaded,
+            DownloadStatus::RetryWait,
+            DownloadStatus::Unavailable,
+            DownloadStatus::Failed,
+        ];
+        for from in &all {
+            for to in &all {
+                let allowed = from.can_transition_to(*to);
+                let expected = matches!(
+                    (from, to),
+                    (DownloadStatus::Pending, DownloadStatus::Downloading)
+                        | (DownloadStatus::Downloading, DownloadStatus::Downloaded)
+                        | (DownloadStatus::Downloading, DownloadStatus::RetryWait)
+                        | (DownloadStatus::Downloading, DownloadStatus::Unavailable)
+                        | (DownloadStatus::Downloading, DownloadStatus::Failed)
+                        | (DownloadStatus::RetryWait, DownloadStatus::Downloading)
+                );
+                assert_eq!(allowed, expected, "transition {from} -> {to}");
+            }
+        }
+    }
+
+    // ── ProcessingStatus transition validation ───────────────────────────
+
+    #[test]
+    fn processing_can_claim_new() {
+        assert!(ProcessingStatus::New.can_transition_to(ProcessingStatus::Processing));
+    }
+
+    #[test]
+    fn processing_can_complete_processing() {
+        assert!(ProcessingStatus::Processing.can_transition_to(ProcessingStatus::Done));
+    }
+
+    #[test]
+    fn processing_can_retry_from_processing() {
+        assert!(ProcessingStatus::Processing.can_transition_to(ProcessingStatus::RetryWait));
+    }
+
+    #[test]
+    fn processing_can_fail_from_processing() {
+        assert!(ProcessingStatus::Processing.can_transition_to(ProcessingStatus::Failed));
+        assert!(ProcessingStatus::Processing.can_transition_to(ProcessingStatus::Missing));
+    }
+
+    #[test]
+    fn processing_can_retry_after_wait() {
+        assert!(ProcessingStatus::RetryWait.can_transition_to(ProcessingStatus::Processing));
+    }
+
+    #[test]
+    fn processing_cannot_go_done_to_processing() {
+        assert!(!ProcessingStatus::Done.can_transition_to(ProcessingStatus::Processing));
+    }
+
+    #[test]
+    fn processing_cannot_go_failed_to_processing() {
+        assert!(!ProcessingStatus::Failed.can_transition_to(ProcessingStatus::Processing));
+    }
+
+    #[test]
+    fn processing_cannot_go_new_to_done() {
+        assert!(!ProcessingStatus::New.can_transition_to(ProcessingStatus::Done));
+    }
+
+    // Exhaustive processing transition matrix
+    #[test]
+    fn processing_exhaustive_transition_matrix() {
+        let all: [ProcessingStatus; 6] = [
+            ProcessingStatus::New,
+            ProcessingStatus::Processing,
+            ProcessingStatus::Done,
+            ProcessingStatus::RetryWait,
+            ProcessingStatus::Failed,
+            ProcessingStatus::Missing,
+        ];
+        for from in &all {
+            for to in &all {
+                let allowed = from.can_transition_to(*to);
+                let expected = matches!(
+                    (from, to),
+                    (ProcessingStatus::New, ProcessingStatus::Processing)
+                        | (ProcessingStatus::Processing, ProcessingStatus::Done)
+                        | (ProcessingStatus::Processing, ProcessingStatus::RetryWait)
+                        | (ProcessingStatus::Processing, ProcessingStatus::Failed)
+                        | (ProcessingStatus::Processing, ProcessingStatus::Missing)
+                        | (ProcessingStatus::RetryWait, ProcessingStatus::Processing)
+                );
+                assert_eq!(allowed, expected, "transition {from} -> {to}");
+            }
         }
     }
 }
