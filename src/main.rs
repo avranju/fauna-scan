@@ -19,8 +19,9 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Dispatch the selected command.
-    match app::execute(cli.command).await {
+    // Dispatch the selected command, passing the optional global config path.
+    let config_path = cli.config.as_deref();
+    match app::execute(cli.command, config_path).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(

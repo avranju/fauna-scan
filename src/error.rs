@@ -72,6 +72,23 @@ impl AppError {
         }
     }
 
+    /// Create a source-free categorized error with an operation and safe message.
+    ///
+    /// Use this for configuration and validation errors where attaching a
+    /// raw source error could leak secret values or parser diagnostics.
+    pub fn new(
+        category: ErrorCategory,
+        operation: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            category,
+            operation,
+            message: message.into(),
+            source: None,
+        }
+    }
+
     /// Wrap an existing error with operation context and a safe message.
     pub fn with_source(
         category: ErrorCategory,
@@ -137,5 +154,21 @@ mod tests {
             inner,
         );
         assert!(err.source.is_some());
+    }
+
+    #[test]
+    fn new_constructor_is_categorized_and_contextual() {
+        let err = AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            "missing required field",
+        );
+        assert_eq!(err.category, ErrorCategory::Configuration);
+        assert_eq!(err.operation, "load_config");
+        assert!(err.source.is_none());
+        let msg = format!("{err}");
+        assert!(msg.contains("Configuration"));
+        assert!(msg.contains("load_config"));
+        assert!(msg.contains("missing required field"));
     }
 }
