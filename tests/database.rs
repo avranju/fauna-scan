@@ -2296,9 +2296,25 @@ async fn search_window_rollback_on_failure() {
     .await
     .unwrap();
 
-    // Insert one valid image
-    let img1 = DiscoveredImage {
-        image_key: ImageKey::new("key-rollback-1"),
+    // Advance the cursor once so we can detect rollback.
+    let first_window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+    ops.commit_search_window(&first_window, &[]).await.unwrap();
+    let prior_cursor = ops.get_cursor(camera_id).await.unwrap().unwrap();
+    assert_eq!(prior_cursor.last_completed_window_end, Some(future_ts(1)));
+    assert_eq!(prior_cursor.next_search_at, Some(future_ts(2)));
+
+    // A valid image followed by an image referencing a non-existent camera
+    // (foreign-key violation).  The mid-batch failure must roll back the
+    // entire transaction: no newly inserted image and the cursor unchanged.
+    let valid_img = DiscoveredImage {
+        image_key: ImageKey::new("key-rollback-valid"),
         camera_id,
         track_id: TrackId::new("103"),
         capture_start_at: now,
@@ -2311,7 +2327,84 @@ async fn search_window_rollback_on_failure() {
         discovered_at: now,
     };
 
-    let window = SearchWindowCommit {
+    let invalid_img = DiscoveredImage {
+        image_key: ImageKey::new("key-rollback-invalid"),
+        camera_id: CameraId::new(999_999), // no such camera → FK violation
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/2".to_string(),
+        canonical_playback_uri: "http://nvr/pic/2".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let replay_window = SearchWindowCommit {
+        camera_id,
+        window_start: future_ts(1),
+        window_end: future_ts(2),
+        next_search_at: future_ts(3),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    let result = ops
+        .commit_search_window(&replay_window, &[valid_img, invalid_img])
+        .await;
+    assert!(result.is_err(), "mid-batch FK failure must error");
+
+    // No image rows should exist — the valid insert rolled back too.
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
+        .fetch_one(ops.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // The cursor must remain at its prior advanced values.
+    let cursor = ops.get_cursor(camera_id).await.unwrap().unwrap();
+    assert_eq!(cursor.last_completed_window_end, Some(future_ts(1)));
+    assert_eq!(cursor.next_search_at, Some(future_ts(2)));
+}
+
+// ── Stable-key replay idempotency ─────────────────────────────────────────
+
+#[tokio::test]
+async fn replay_same_image_key_is_idempotent_and_preserves_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-replay-stable"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let first_window = SearchWindowCommit {
         camera_id,
         window_start: now,
         window_end: future_ts(1),
@@ -2320,17 +2413,74 @@ async fn search_window_rollback_on_failure() {
         updated_at: now,
     };
 
-    // Single image commit should succeed
-    ops.commit_search_window(&window, &[img1]).await.unwrap();
+    // First commit inserts one row and advances the cursor.
+    let new_count = ops
+        .commit_search_window(&first_window, std::slice::from_ref(&img))
+        .await
+        .unwrap();
+    assert_eq!(new_count, 1);
+
+    // Set mutable work state so we can prove it survives a replay.
+    let claim = ops
+        .claim_next_download(&now, &lease_ts())
+        .await
+        .unwrap()
+        .unwrap();
+    let retry_at = future_ts(1);
+    ops.fail_download(
+        claim.image_id,
+        "connection timeout",
+        DownloadFailureDisposition::RetryWait {
+            next_attempt_at: retry_at,
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let before = ops.get_image(claim.image_id).await.unwrap();
+    assert_eq!(before.download_status, DownloadStatus::RetryWait);
+    assert_eq!(before.download_attempts, 1);
+
+    // Replay the same stable image key under a later window.  This must not
+    // insert a duplicate row, must advance the cursor to the replayed window,
+    // and must not reset mutable download state.
+    let replay_window = SearchWindowCommit {
+        camera_id,
+        window_start: future_ts(1),
+        window_end: future_ts(2),
+        next_search_at: future_ts(3),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    let new_count2 = ops
+        .commit_search_window(&replay_window, std::slice::from_ref(&img))
+        .await
+        .unwrap();
+    assert_eq!(new_count2, 0, "replay must not insert a duplicate row");
+
+    // Exactly one image row exists.
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
         .fetch_one(ops.pool())
         .await
         .unwrap();
     assert_eq!(count, 1);
 
-    // Verify cursor was advanced
+    // The cursor advances to the replayed window bounds.
     let cursor = ops.get_cursor(camera_id).await.unwrap().unwrap();
-    assert!(cursor.last_completed_window_end.is_some());
+    assert_eq!(cursor.last_completed_window_end, Some(future_ts(2)));
+    assert_eq!(cursor.next_search_at, Some(future_ts(3)));
+
+    // Mutable work state is preserved — not reset to defaults.
+    let after = ops.get_image(claim.image_id).await.unwrap();
+    assert_eq!(after.download_status, DownloadStatus::RetryWait);
+    assert_eq!(after.download_attempts, 1);
+    assert_eq!(after.processing_status, ProcessingStatus::New);
+    assert_eq!(
+        after.download_last_error,
+        Some("connection timeout".to_string())
+    );
 }
 
 // ── Downloaded image not re-claimed ───────────────────────────────────────
