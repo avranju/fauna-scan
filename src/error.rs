@@ -57,6 +57,10 @@ pub struct AppError {
     pub operation: &'static str,
     /// A safe, user-facing description of the failure.
     pub message: String,
+    /// Optional numeric HTTP status for transport-level categorization.
+    ///
+    /// Only the numeric status is stored — never a response body or raw URL.
+    pub http_status: Option<u16>,
     /// Optional underlying cause chain.
     pub source: Option<anyhow::Error>,
 }
@@ -68,6 +72,7 @@ impl AppError {
             category: ErrorCategory::Internal,
             operation,
             message: format!("{operation} is not yet implemented in this release"),
+            http_status: None,
             source: None,
         }
     }
@@ -85,6 +90,7 @@ impl AppError {
             category,
             operation,
             message: message.into(),
+            http_status: None,
             source: None,
         }
     }
@@ -100,18 +106,47 @@ impl AppError {
             category,
             operation,
             message: message.into(),
+            http_status: None,
             source: Some(source.into()),
         }
+    }
+
+    /// Attach a numeric HTTP status to an existing error without changing
+    /// the category, operation, or safe message.
+    ///
+    /// This is used to carry status context (e.g. 403, 404) through the
+    /// error chain while keeping the display output safe.
+    pub fn with_http_status(mut self, status: u16) -> Self {
+        self.http_status = Some(status);
+        self
+    }
+
+    /// Return true if this error carries an HTTP status code.
+    pub fn has_http_status(&self) -> bool {
+        self.http_status.is_some()
+    }
+
+    /// Return the HTTP status code if present.
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
     }
 }
 
 impl fmt::Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "[{}] {}: {}",
-            self.category, self.operation, self.message
-        )
+        if let Some(status) = self.http_status {
+            write!(
+                f,
+                "[{}] {}: {} (HTTP {})",
+                self.category, self.operation, self.message, status
+            )
+        } else {
+            write!(
+                f,
+                "[{}] {}: {}",
+                self.category, self.operation, self.message
+            )
+        }
     }
 }
 
@@ -170,5 +205,49 @@ mod tests {
         assert!(msg.contains("Configuration"));
         assert!(msg.contains("load_config"));
         assert!(msg.contains("missing required field"));
+    }
+
+    // ── HTTP status context tests ──────────────────────────────────────────
+
+    #[test]
+    fn http_status_is_none_by_default() {
+        let err = AppError::new(ErrorCategory::Network, "fetch", "connection failed");
+        assert!(!err.has_http_status());
+        assert_eq!(err.http_status(), None);
+    }
+
+    #[test]
+    fn with_http_status_attaches_code() {
+        let err = AppError::new(ErrorCategory::Protocol, "request", "unexpected response")
+            .with_http_status(403);
+        assert!(err.has_http_status());
+        assert_eq!(err.http_status(), Some(403));
+    }
+
+    #[test]
+    fn display_includes_http_status() {
+        let err =
+            AppError::new(ErrorCategory::Protocol, "request", "forbidden").with_http_status(403);
+        let msg = format!("{err}");
+        assert!(msg.contains("403"));
+        assert!(msg.contains("Protocol"));
+        assert!(msg.contains("request"));
+        assert!(msg.contains("forbidden"));
+    }
+
+    #[test]
+    fn display_without_http_status_omits_code() {
+        let err = AppError::new(ErrorCategory::Network, "fetch", "timeout");
+        let msg = format!("{err}");
+        assert!(!msg.contains("HTTP"));
+        assert!(msg.contains("Network"));
+    }
+
+    #[test]
+    fn with_http_status_preserves_category_and_operation() {
+        let err =
+            AppError::new(ErrorCategory::Authentication, "auth", "bad creds").with_http_status(401);
+        assert_eq!(err.category, ErrorCategory::Authentication);
+        assert_eq!(err.operation, "auth");
     }
 }

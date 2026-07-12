@@ -11,6 +11,7 @@ pub mod domain;
 pub mod downloader;
 pub mod error;
 pub mod filesystem;
+pub mod http;
 pub mod logging;
 pub mod nvr;
 pub mod scanner;
