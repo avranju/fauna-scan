@@ -330,6 +330,36 @@ fn build_origin_url(scheme: &str, host: &str, port: u16) -> AppResult<Url> {
     })
 }
 
+// ── Allowlist host check ─────────────────────────────────────────────────
+
+/// Check whether a URL's host is in the allowlist (case-insensitive).
+///
+/// Normalizes both the URL host and allowlist entries to lowercase,
+/// and wraps bare IPv6 literals in brackets so they match the
+/// bracketed representation returned by `url::Url::host_str`.
+fn is_host_in_allowlist(url: &Url, allowlist: &std::collections::BTreeSet<String>) -> bool {
+    let host = match url.host_str() {
+        Some(h) => h,
+        None => return false,
+    };
+    // Normalize the URL host the same way as PlaybackUrlPolicy does.
+    let host_normalized = normalize_allowlist_host_for_transport(host);
+    allowlist.contains(&host_normalized)
+}
+
+/// Normalize a host string for allowlist comparison.
+///
+/// Wraps bare IPv6 literals in brackets so they match `url::Url::host_str`
+/// output. Lowercase is assumed to have been applied at the allowlist
+/// construction site.
+fn normalize_allowlist_host_for_transport(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_lowercase()
+    }
+}
+
 // ── NvrTransport ──────────────────────────────────────────────────────────
 
 /// An authenticated transport for Hikvision NVR ISAPI requests.
@@ -455,6 +485,58 @@ impl NvrTransport {
             ));
         }
 
+        self.send_request_with_auth(request).await
+    }
+
+    /// Execute a playback request that may target an allowlisted host.
+    ///
+    /// Unlike `execute`, this method permits the target host to be either
+    /// the configured NVR origin or a host present in the validated
+    /// allowlist.  Embedded credentials are still rejected and only
+    /// HTTP/HTTPS schemes are allowed.
+    pub async fn execute_playback(
+        &self,
+        request: NvrRequest,
+        allowlist: &std::collections::BTreeSet<String>,
+    ) -> AppResult<reqwest::Response> {
+        let url = request.url().clone();
+
+        // Reject non-HTTP(S) schemes.
+        let scheme = url.scheme();
+        if scheme != "http" && scheme != "https" {
+            return Err(AppError::new(
+                ErrorCategory::Protocol,
+                "nvr_execute_playback",
+                format!("unsupported scheme \"{}\" for playback URL", scheme),
+            ));
+        }
+
+        // Reject URLs with embedded credentials.
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(AppError::new(
+                ErrorCategory::Authorization,
+                "nvr_execute_playback",
+                "playback URL must not contain embedded credentials",
+            ));
+        }
+
+        // Verify same-origin or allowlisted host.
+        let host_allowed = self.origin.matches(&url) || is_host_in_allowlist(&url, allowlist);
+
+        if !host_allowed {
+            return Err(AppError::new(
+                ErrorCategory::Authorization,
+                "nvr_execute_playback",
+                "playback target is not same-origin and not in the allowed host list",
+            ));
+        }
+
+        self.send_request_with_auth(request).await
+    }
+
+    /// Common request-sending + Digest-auth loop used by both execute and
+    /// execute_playback.
+    async fn send_request_with_auth(&self, request: NvrRequest) -> AppResult<reqwest::Response> {
         // ── Strip caller-provided auth headers ───────────────────────────
 
         let mut headers = request.headers().clone();

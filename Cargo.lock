@@ -692,6 +692,8 @@ dependencies = [
  "chrono",
  "clap",
  "digest_auth",
+ "futures",
+ "http",
  "md-5",
  "nix",
  "predicates",

@@ -369,6 +369,10 @@ impl DatabaseOps {
     /// Atomically claim one pending or due-retry download using a single
     /// guarded UPDATE with a subquery and RETURNING.
     ///
+    /// After the guarded atomic UPDATE succeeds, fetches the referenced
+    /// camera's channel number and name to populate the extended
+    /// `DownloadClaim`.
+    ///
     /// Returns None when no eligible rows exist.
     pub async fn claim_next_download(
         &self,
@@ -399,7 +403,8 @@ impl DatabaseOps {
                )
                RETURNING id, image_key, camera_id, track_id,
                          capture_start_at, playback_uri, canonical_playback_uri,
-                         download_attempts, download_lease_until"#,
+                         download_attempts, download_lease_until,
+                         nvr_reported_size"#,
         )
         .bind(&lease_str)
         .bind(&now_str)
@@ -443,6 +448,14 @@ impl DatabaseOps {
                         anyhow::Error::from(e),
                     )
                 })?;
+                let nvr_reported_size: Option<i64> = row
+                    .try_get(9)
+                    .map_err(|e| map_sqlx_error("claim_next_download", e))?;
+
+                // Fetch camera metadata for destination path construction.
+                let (channel_number, camera_name) =
+                    self.fetch_camera_metadata(CameraId::new(camera_id)).await?;
+
                 Ok(Some(DownloadClaim {
                     image_id: ImageId::new(image_id),
                     image_key: ImageKey::new(image_key),
@@ -453,9 +466,38 @@ impl DatabaseOps {
                     canonical_playback_uri,
                     download_attempts,
                     lease_until: lease_until_ts,
+                    camera_channel_number: channel_number,
+                    camera_name,
+                    nvr_reported_size,
                 }))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Fetch a camera's channel number and name by camera ID.
+    ///
+    /// Returns `(channel_number, name)` or an error if the camera row
+    /// cannot be found.
+    async fn fetch_camera_metadata(&self, camera_id: CameraId) -> AppResult<(i64, Option<String>)> {
+        let row = sqlx::query_as::<_, (i64, Option<String>)>(
+            r#"SELECT channel_number, name FROM cameras WHERE id = ?"#,
+        )
+        .bind(camera_id.get())
+        .fetch_optional(&self.0)
+        .await
+        .map_err(|e| map_sqlx_error("fetch_camera_metadata", e))?;
+
+        match row {
+            Some((channel_number, name)) => Ok((channel_number, name)),
+            None => Err(AppError::new(
+                ErrorCategory::Database,
+                "fetch_camera_metadata",
+                format!(
+                    "camera {} not found after successful claim",
+                    camera_id.get()
+                ),
+            )),
         }
     }
 

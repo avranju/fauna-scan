@@ -106,6 +106,10 @@ pub struct NvrDownloadConfig {
     pub verify_jpeg: bool,
     /// Rebase playback URLs to the configured NVR origin.
     pub rebase_playback_urls: bool,
+    /// Bounded download concurrency.
+    pub concurrency: usize,
+    /// Playback-host allowlist for rebasing-disabled mode.
+    pub playback_host_allowlist: Vec<String>,
 }
 
 /// Resolved classifier settings.
@@ -211,6 +215,8 @@ struct RawNvrDownloadConfig {
     maximum_image_size_bytes: Option<u64>,
     verify_jpeg: Option<bool>,
     rebase_playback_urls: Option<bool>,
+    concurrency: Option<usize>,
+    playback_host_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -386,6 +392,10 @@ impl Config {
             maximum_image_size_bytes: download_raw.maximum_image_size_bytes.unwrap_or(25_000_000),
             verify_jpeg: download_raw.verify_jpeg.unwrap_or(true),
             rebase_playback_urls: download_raw.rebase_playback_urls.unwrap_or(true),
+            concurrency: download_raw.concurrency.unwrap_or(2),
+            playback_host_allowlist: resolve_playback_host_allowlist(
+                &download_raw.playback_host_allowlist,
+            )?,
         };
 
         let nvr = NvrConfig {
@@ -804,6 +814,15 @@ fn validate_config(config: &Config) -> AppResult<()> {
             ErrorCategory::Configuration,
             "validate_config",
             "nvr.download.retry_max_delay_seconds must be greater than zero",
+        ));
+    }
+
+    // Download concurrency
+    if config.nvr.download.concurrency == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.concurrency must be greater than zero",
         ));
     }
 
@@ -1230,6 +1249,673 @@ fn toml_line_column(source: &str, byte_offset: usize) -> (usize, usize) {
 /// Strip potentially sensitive details from an io::Error message.
 fn safe_io_message(e: &std::io::Error) -> String {
     e.to_string()
+}
+
+/// Resolve and validate the playback host allowlist.
+///
+/// Each entry must be a bare hostname or canonical IP address:
+/// no scheme, port, path, query, fragment, credentials, backslashes,
+/// percent encoding, or IPv6 brackets.
+fn resolve_playback_host_allowlist(raw: &Option<Vec<String>>) -> AppResult<Vec<String>> {
+    let entries = raw.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+    let mut allowed = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let normalized = validate_playback_host_entry(entry)?;
+        allowed.push(normalized);
+    }
+    allowed.sort();
+    allowed.dedup();
+    Ok(allowed)
+}
+
+/// Validate and normalize a single playback host allowlist entry.
+///
+/// Returns the lowercased normalized entry or an error for invalid input.
+///
+/// Strict IPv4 canonical-form validation: rejects non-canonical forms
+/// (hex, octal, truncated dotted-decimal, leading-zero octets) that
+/// the url crate would silently normalize, ensuring that the stored
+/// allowlist entry matches the URL host representation.
+fn validate_playback_host_entry(entry: &str) -> AppResult<String> {
+    // Reject empty entries.
+    if entry.is_empty() {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must not be empty",
+        ));
+    }
+
+    // Reject any scheme prefix.
+    if entry.contains("://") {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must be bare hostnames or IP addresses, not URLs",
+        ));
+    }
+
+    // Reject embedded credentials.
+    if entry.contains('@') {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must not contain embedded credentials",
+        ));
+    }
+
+    // Reject backslashes.
+    if entry.contains('\\') {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must not contain backslashes",
+        ));
+    }
+
+    // Reject percent encoding.
+    if entry.contains('%') {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must not contain percent-encoded characters",
+        ));
+    }
+
+    // Reject path-like characters.
+    if entry.contains('/') {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must not contain path separators",
+        ));
+    }
+
+    // Reject query/fragment characters.
+    if entry.contains('?') || entry.contains('#') {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must not contain query or fragment characters",
+        ));
+    }
+
+    // Reject IPv6 brackets (the entry must be bare).
+    if entry.starts_with('[') || entry.contains(']') {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must not contain brackets",
+        ));
+    }
+
+    // Validate using the url crate's Host::parse (same as NvrTransport).
+    // Handle bare IPv6 literals by wrapping them in brackets before parsing.
+    // First, check if the entry is a bare IPv6 address (contains colons but
+    // is not a hostname with a port — we distinguish by trying to parse
+    // the entry as an Ipv6Addr).
+    let host_for_parse = if entry.contains(':') && !entry.starts_with('[') {
+        // Try to parse as a bare IPv6 address first.
+        if let Ok(_ipv6) = entry.parse::<std::net::Ipv6Addr>() {
+            // Valid bare IPv6 — wrap in brackets for url::Host::parse.
+            format!("[{entry}]")
+        } else {
+            // Not a valid IPv6 — check if it looks like hostname:port.
+            // If the part after the last colon is all digits, it's likely
+            // a port number (which is not allowed). If it's not all digits,
+            // it could be a hostname with colons (like a domain with port),
+            // but we reject that since ports are not allowed.
+            if let Some(last_colon) = entry.rfind(':') {
+                let after = &entry[last_colon + 1..];
+                if after.chars().all(|c| c.is_ascii_digit()) && !after.is_empty() {
+                    return Err(AppError::new(
+                        ErrorCategory::Configuration,
+                        "validate_config",
+                        "nvr.download.playback_host_allowlist entries must not contain port numbers",
+                    ));
+                }
+            }
+            // Not a valid IPv6 and not a hostname:port — reject.
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "validate_config",
+                "nvr.download.playback_host_allowlist entries must not contain invalid characters or is not a valid hostname/IP",
+            ));
+        }
+    } else {
+        entry.to_string()
+    };
+
+    let parsed_host = url::Host::parse(&host_for_parse).map_err(|_| {
+        AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "nvr.download.playback_host_allowlist entries must not contain invalid characters or is not a valid hostname/IP",
+        )
+    })?;
+
+    // ── Strict IPv4 canonical-form validation ──────────────────────────
+    // url::Host::parse normalizes several legacy IPv4 forms (component-level
+    // hex like "127.0.0x0.1", trailing-dot like "1.2.3.4.", shortened
+    // dotted-decimal, etc.) into canonical dotted-decimal.  We must reject
+    // those non-canonical originals by validating through a typed Ipv4Addr
+    // and comparing the canonical string representation.
+    if let url::Host::Ipv4(addr) = parsed_host {
+        let canonical = addr.to_string();
+        // Reject if the original string differs from the canonical
+        // dotted-decimal representation.  This catches component-level
+        // hexadecimal ("0x7f.0.0.1"), trailing-dot ("1.2.3.4."),
+        // shortened dotted-decimal ("127.0.1"), integer forms, and
+        // any other non-canonical spelling the url crate would normalize.
+        if entry != canonical {
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "validate_config",
+                "nvr.download.playback_host_allowlist entries must use canonical dotted-decimal IPv4 notation",
+            ));
+        }
+        // Return the canonical IPv4 representation.
+        return Ok(canonical.to_lowercase());
+    }
+
+    // ── IPv6 canonical-form normalization ──────────────────────────────
+    // url::Host::parse accepts bare IPv6 with brackets.  If the entry
+    // was a bare IPv6 address, normalize it through the typed Ipv6Addr
+    // so that non-canonical forms (e.g. "2001:0db8::1") become canonical
+    // ("2001:db8::1") matching what url::Url::host_str returns.
+    if entry.contains(':')
+        && !entry.starts_with('[')
+        && let Ok(ipv6) = entry.parse::<std::net::Ipv6Addr>()
+    {
+        return Ok(ipv6.to_string().to_lowercase());
+    }
+
+    // ── Domain name normalization ──────────────────────────────────────
+    // url::Host::parse normalizes internationalized domain names and
+    // other representations.  Return the parsed host's canonical string
+    // representation so stored entries match what URL parsing produces.
+    Ok(parsed_host.to_string().to_lowercase())
+}
+
+// ── Configuration tests for Phase 7 fields ───────────────────────────────
+
+#[cfg(test)]
+mod phase7_tests {
+    use super::*;
+
+    fn write_config(dir: &tempfile::TempDir, content: &str) -> PathBuf {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[allow(dead_code)]
+    fn minimal_with_download(extra: &str) -> &'static str {
+        format!(
+            r#"[general]
+output_directory = "/tmp/fauna-output"
+
+[nvr]
+scheme = "http"
+host = "pigate"
+port = 8080
+username = "admin"
+password = "test-pass"
+start_at = "2026-07-11T00:00:00Z"
+{extra}
+
+[classifier]
+enabled = false
+"#,
+            extra = extra
+        )
+        .leak()
+    }
+
+    #[test]
+    fn download_defaults_include_concurrency_and_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/fauna-output"
+
+[nvr]
+scheme = "http"
+host = "pigate"
+port = 8080
+username = "admin"
+password = "test-pass"
+start_at = "2026-07-11T00:00:00Z"
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.nvr.download.concurrency, 2);
+        assert!(config.nvr.download.playback_host_allowlist.is_empty());
+    }
+
+    #[test]
+    fn download_concurrency_explicit_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/fauna-output"
+
+[nvr]
+scheme = "http"
+host = "pigate"
+port = 8080
+username = "admin"
+password = "test-pass"
+start_at = "2026-07-11T00:00:00Z"
+download = { concurrency = 4, playback_host_allowlist = ["cdn.example.com"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(config.nvr.download.concurrency, 4);
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["cdn.example.com"],
+        );
+    }
+
+    #[test]
+    fn download_zero_concurrency_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/fauna-output"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { concurrency = 0 }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let result = Config::load(Some(&path));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn allowlist_rejects_url_with_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["http://evil.com"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        assert!(Config::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn allowlist_rejects_entry_with_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["cdn.example.com:443"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        assert!(Config::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn allowlist_rejects_embedded_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["user@evil.com"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        assert!(Config::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn allowlist_accepts_valid_hostname() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["cdn.example.com"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["cdn.example.com"],
+        );
+    }
+
+    #[test]
+    fn allowlist_accepts_valid_ipv4() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["10.0.0.50"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["10.0.0.50"],
+        );
+    }
+
+    #[test]
+    fn allowlist_normalized_to_lowercase() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["CDN.Example.COM"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["cdn.example.com"],
+        );
+    }
+
+    #[test]
+    fn allowlist_deduplicates_and_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["b.example.com", "a.example.com", "b.example.com"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["a.example.com", "b.example.com"]
+        );
+    }
+
+    // ── IPv4 canonical-form validation tests ───────────────────────────
+
+    #[test]
+    fn allowlist_accepts_canonical_ipv4() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["192.168.1.50", "127.0.0.1", "10.0.0.1"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["10.0.0.1", "127.0.0.1", "192.168.1.50"]
+        );
+    }
+
+    #[test]
+    fn allowlist_rejects_truncated_ipv4() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["127.1"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        assert!(Config::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn allowlist_rejects_leading_zero_ipv4() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["127.00.0.1"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        assert!(Config::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn allowlist_rejects_hex_ipv4() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["0x7f000001"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        assert!(Config::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn allowlist_rejects_decimal_ipv4() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["2130706433"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        assert!(Config::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn allowlist_accepts_bare_ipv6() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["::1", "2001:db8::1"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        // IPv6 entries are lowercased and sorted lexicographically.
+        // "2001:db8::1" sorts before "::1" because '2' < ':' in ASCII.
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["2001:db8::1", "::1"]
+        );
+    }
+
+    #[test]
+    fn allowlist_canonicalizes_non_canonical_ipv6() {
+        // Non-canonical IPv6 like 2001:0db8::1 should be normalized
+        // to 2001:db8::1 so it matches the canonical form returned
+        // by url::Url::host_str.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["2001:0db8::1"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        // The non-canonical form should be normalized to canonical.
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["2001:db8::1"]
+        );
+    }
+
+    #[test]
+    fn allowlist_canonicalizes_domain_names() {
+        // Domain names should be normalized through url::Host::parse
+        // and lowercased.
+        let dir = tempfile::tempdir().unwrap();
+        let toml = r#"[general]
+output_directory = "/tmp/x"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+download = { playback_host_allowlist = ["CDN.Example.COM"] }
+
+[classifier]
+enabled = false
+"#;
+        let path = write_config(&dir, toml);
+        let config = Config::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.nvr.download.playback_host_allowlist,
+            vec!["cdn.example.com"]
+        );
+    }
 }
 
 /// Parse a log level string into a `LogLevel` value.

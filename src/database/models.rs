@@ -158,6 +158,12 @@ pub struct DownloadClaim {
     pub canonical_playback_uri: String,
     pub download_attempts: i64,
     pub lease_until: Timestamp,
+    /// Camera channel number (for destination path construction).
+    pub camera_channel_number: i64,
+    /// Optional camera name (for destination path construction).
+    pub camera_name: Option<String>,
+    /// NVR-reported size, when available.
+    pub nvr_reported_size: Option<i64>,
 }
 
 /// Data returned by a successful processing claim.
@@ -173,7 +179,7 @@ pub struct ProcessingClaim {
 // ── Failure dispositions ───────────────────────────────────────────────────
 
 /// Disposition for a download failure transition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum DownloadFailureDisposition {
     RetryWait { next_attempt_at: Timestamp },
     Unavailable,

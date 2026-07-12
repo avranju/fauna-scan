@@ -57,6 +57,8 @@ fn make_nvr_config(mock_base: &str) -> NvrConfig {
             maximum_image_size_bytes: 25_000_000,
             verify_jpeg: true,
             rebase_playback_urls: true,
+            concurrency: 2,
+            playback_host_allowlist: vec![],
         },
     }
 }
