@@ -27,6 +27,7 @@ nix = { version = "0.30", default-features = false, features = ["fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli"] }
 digest_auth = "0.3"
 md-5 = "0.10"
+quick-xml = "0.37"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]

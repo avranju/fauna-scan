@@ -220,12 +220,19 @@ fn run_exits_nonzero_with_message() {
 }
 
 #[test]
-fn discover_exits_nonzero_with_message() {
+fn discover_no_longer_not_implemented() {
+    // discover is now operational; without a valid config it fails at
+    // configuration loading, not at the "not implemented" stage.
     cmd()
         .arg("discover")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", "/nonexistent-home-for-test-12345")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("discover"));
+        .stderr(
+            predicate::str::contains("cannot read configuration file")
+                .or(predicate::str::contains("configuration file")),
+        );
 }
 
 #[test]
