@@ -46,6 +46,92 @@ fn lease_ts() -> Timestamp {
 // ── Migration and schema ──────────────────────────────────────────────────
 
 #[tokio::test]
+async fn operational_summary_empty_database_is_all_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    assert_eq!(
+        ops.operational_summary().await.unwrap(),
+        OperationalSummary::default()
+    );
+}
+
+#[tokio::test]
+async fn operational_summary_uses_combined_image_predicates_and_active_cameras() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let observed = now_ts();
+    let records = ops
+        .sync_cameras(
+            &[
+                CameraDiscovery {
+                    channel_number: 1,
+                    primary_track_id: "101".into(),
+                    picture_track_id: "103".into(),
+                    name: None,
+                    raw_discovery_identifier: None,
+                },
+                CameraDiscovery {
+                    channel_number: 2,
+                    primary_track_id: "201".into(),
+                    picture_track_id: "203".into(),
+                    name: None,
+                    raw_discovery_identifier: None,
+                },
+            ],
+            &observed,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE cameras SET enabled = 0 WHERE id = ?")
+        .bind(records[1].id.get())
+        .execute(ops.pool())
+        .await
+        .unwrap();
+
+    let states = [
+        ("pending", "new"),
+        ("downloaded", "new"),
+        ("downloaded", "processing"),
+        ("downloaded", "retry_wait"),
+        ("downloaded", "done"),
+        ("retry_wait", "new"),
+        ("unavailable", "failed"),
+        ("failed", "missing"),
+    ];
+    let timestamp = fauna_scan::database::format_timestamp(&observed);
+    for (index, (download, processing)) in states.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO images (image_key, camera_id, track_id, capture_start_at, playback_uri, canonical_playback_uri, download_status, processing_status, discovered_at, created_at, updated_at) VALUES (?, ?, '103', ?, 'http://nvr/image', 'http://nvr/image', ?, ?, ?, ?, ?)",
+        )
+        .bind(format!("summary-{index}"))
+        .bind(records[0].id.get())
+        .bind(&timestamp)
+        .bind(download)
+        .bind(processing)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .bind(&timestamp)
+        .execute(ops.pool())
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        ops.operational_summary().await.unwrap(),
+        OperationalSummary {
+            cameras_active: 1,
+            images_discovered: 8,
+            images_downloaded: 4,
+            downloads_pending: 1,
+            images_awaiting_classification: 3,
+            classifications_completed: 1,
+            retryable_failures: 2,
+            permanent_failures: 4,
+        }
+    );
+}
+
+#[tokio::test]
 async fn empty_database_applies_migration() {
     let dir = tempfile::tempdir().unwrap();
     let (_path, ops) = open_test_db(&dir).await;

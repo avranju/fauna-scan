@@ -9,24 +9,34 @@ use crate::cli::Command;
 use crate::configuration::Config;
 use crate::database::Database;
 use crate::database::models::ServiceMetadataKey;
-use crate::domain::DownloadStatus;
-use crate::downloader::orchestration::{DownloaderOrchestrator, DownloaderOrchestratorOptions};
+use crate::domain::{DownloadStatus, ProcessingStatus};
+use crate::downloader::orchestration::{
+    CameraSearchFailure, DownloaderOrchestrator, DownloaderOrchestratorOptions,
+};
 use crate::downloader::{DownloadWorker, DownloadWorkerOptions};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::nvr::{CameraDiscoveryClient, ImageDownloadClient, NvrTransport};
 use crate::scanner::{Scanner, ScannerOptions};
+use crate::service_lifecycle::{
+    ServiceLifecycleOptions, ShutdownToken, run_single_pipeline_until_signal, supervise_service,
+    wait_for_shutdown_signal,
+};
 
 /// Execute the selected command.
 ///
 /// `config_path` is the optional `--config` global option value.
 pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<()> {
     match command {
-        Command::Run => Err(AppError::not_implemented("run")),
+        Command::Run => handle_run(config_path)
+            .await
+            .map_err(|error| with_command_context("run", error)),
         Command::CheckConfig => handle_check_config(config_path),
         Command::Discover => handle_discover(config_path).await,
         Command::Download(args) => handle_download(args, config_path).await,
         Command::Scan(args) => handle_scan(args, config_path).await,
-        Command::Status => Err(AppError::not_implemented("status")),
+        Command::Status => handle_status(config_path)
+            .await
+            .map_err(|error| with_command_context("status", error)),
     }
 }
 
@@ -256,9 +266,209 @@ async fn handle_download(
 
         Ok(())
     } else {
-        // Continuous polling loop
-        orchestrator.run_continuous().await
+        // Continuous polling loop with bounded signal shutdown.
+        let shutdown = ShutdownToken::new();
+        let pipeline_shutdown = shutdown.clone();
+        run_single_pipeline_until_signal(
+            "downloader",
+            async move {
+                orchestrator
+                    .run_continuous_with_shutdown(pipeline_shutdown)
+                    .await
+            },
+            shutdown,
+            wait_for_shutdown_signal(),
+            ServiceLifecycleOptions::default().shutdown_timeout,
+        )
+        .await
     }
+}
+
+/// Run the complete service with downloader and scanner under one supervisor.
+async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
+    let config = Config::load(config_path)?;
+    if !config.classifier.enabled {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "run",
+            "classifier is disabled; run requires downloader and scanner pipelines",
+        ));
+    }
+    let scanner_options = ScannerOptions::from_config(&config)?;
+
+    // Startup order: directories, database/migrations, lease recovery and
+    // housekeeping, clients, initial discovery, then primary tasks.
+    create_runtime_directories(&config)?;
+    let database = Database::open(&config.general.database_path).await?;
+    let ops = database.ops();
+    let recovery = ops
+        .recover_expired_leases(&crate::domain::Timestamp::new(chrono::Utc::now()))
+        .await?;
+    let stale_parts_removed =
+        crate::filesystem::remove_stale_part_files(&config.general.output_directory).await?;
+    let transport = Arc::new(NvrTransport::from_config(&config.nvr)?);
+    let download_client = Arc::new(ImageDownloadClient::from_config(
+        transport.clone(),
+        &config.nvr,
+    ));
+    let download_options = DownloadWorkerOptions::from_config(&config)?;
+    let download_worker = DownloadWorker::new(ops.clone(), download_client, download_options);
+    let orchestrator_options = DownloaderOrchestratorOptions::from_config(&config)?;
+    orchestrator_options.validate()?;
+    let mut orchestrator = DownloaderOrchestrator::new(
+        ops.clone(),
+        transport,
+        download_worker,
+        orchestrator_options,
+    )?;
+
+    let now = crate::domain::Timestamp::new(chrono::Utc::now());
+    ops.set_metadata(
+        &ServiceMetadataKey::ApplicationVersion,
+        env!("CARGO_PKG_VERSION"),
+        &now,
+    )
+    .await?;
+    orchestrator.persist_nvr_identity().await?;
+
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        database = %config.general.database_path.display(),
+        output_directory = %config.general.output_directory.display(),
+        "Fauna Scan service starting"
+    );
+    tracing::info!(
+        stale_parts_removed,
+        download_leases_recovered = recovery.downloads,
+        processing_leases_recovered = recovery.processing,
+        "Startup housekeeping completed"
+    );
+    let effective_end = crate::downloader::orchestration::compute_effective_end(
+        now,
+        std::time::Duration::from_secs(config.nvr.search.settlement_delay_seconds),
+    )?;
+    tracing::info!(
+        historical_start = %config.nvr.start_at,
+        historical_end = %effective_end,
+        "Historical backfill range"
+    );
+
+    // HTTP clients are fully constructed before discovery, but no primary
+    // pipeline is spawned until discovery and synchronization finish.
+    let classifier = crate::classifier::ClassifierClient::from_config(&config.classifier)?;
+    let scanner = Scanner::new(ops.clone(), Arc::new(classifier), scanner_options);
+
+    // Discovery is deliberately completed before either task is spawned.
+    match orchestrator.attempt_discovery().await {
+        Ok(cameras) => {
+            let records = orchestrator.sync_cameras(&cameras).await?;
+            tracing::info!(
+                camera_count = records.len(),
+                "Initial camera discovery completed"
+            );
+        }
+        Err(error) if is_recoverable_nvr_error(error.category) => {
+            tracing::warn!(category = %error.category, "Initial camera discovery failed; using persisted active cameras");
+            // Keep the failed attempt visible to the first continuous pass.
+            // In particular, do not update last_successful_camera_refresh:
+            // doing so would suppress the retry for the whole refresh interval.
+            orchestrator.last_discovery_failure = Some(CameraSearchFailure {
+                camera_id: crate::domain::CameraId::new(0),
+                track_id: String::new(),
+                category: error.category,
+                operation: "discovery",
+            });
+            let cameras = orchestrator.reload_active_cameras().await?;
+            tracing::info!(
+                camera_count = cameras.len(),
+                "Loaded persisted active cameras"
+            );
+        }
+        Err(error) => return Err(error),
+    }
+
+    let cameras = orchestrator.active_cameras.len();
+    tracing::info!(
+        camera_count = cameras,
+        "Starting downloader and scanner pipelines"
+    );
+    let shutdown = ShutdownToken::new();
+    let downloader_shutdown = shutdown.clone();
+    let downloader = tokio::spawn(async move {
+        orchestrator
+            .run_continuous_with_shutdown(downloader_shutdown)
+            .await
+    });
+    let scanner_shutdown = shutdown.clone();
+    let scanner_task =
+        tokio::spawn(async move { scanner.run_continuous_with_shutdown(scanner_shutdown).await });
+
+    supervise_service(
+        downloader,
+        scanner_task,
+        shutdown,
+        ops,
+        ServiceLifecycleOptions::default(),
+        wait_for_shutdown_signal(),
+    )
+    .await
+}
+
+/// Print grouped database state in a stable, exhaustive order.
+async fn handle_status(config_path: Option<&Path>) -> AppResult<()> {
+    let config = Config::load(config_path)?;
+    let database = Database::open(&config.general.database_path).await?;
+    let counts = database.ops().status_counts().await?;
+
+    println!("Download status:");
+    for status in [
+        DownloadStatus::Pending,
+        DownloadStatus::Downloading,
+        DownloadStatus::Downloaded,
+        DownloadStatus::RetryWait,
+        DownloadStatus::Unavailable,
+        DownloadStatus::Failed,
+    ] {
+        println!(
+            "{}: {}",
+            status,
+            counts.download.get(&status).copied().unwrap_or(0)
+        );
+    }
+    println!("Processing status:");
+    for status in [
+        ProcessingStatus::New,
+        ProcessingStatus::Processing,
+        ProcessingStatus::Done,
+        ProcessingStatus::RetryWait,
+        ProcessingStatus::Failed,
+        ProcessingStatus::Missing,
+    ] {
+        println!(
+            "{}: {}",
+            status,
+            counts.processing.get(&status).copied().unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
+fn with_command_context(operation: &'static str, error: AppError) -> AppError {
+    AppError::with_source(error.category, operation, error.message.clone(), error)
+}
+
+fn is_recoverable_nvr_error(category: ErrorCategory) -> bool {
+    matches!(
+        category,
+        ErrorCategory::Authentication
+            | ErrorCategory::Authorization
+            | ErrorCategory::Network
+            | ErrorCategory::Timeout
+            | ErrorCategory::Protocol
+            | ErrorCategory::XmlParsing
+            | ErrorCategory::InvalidNvrResponse
+            | ErrorCategory::PlaybackUnavailable
+    )
 }
 
 /// Create runtime directories required by operational commands.
@@ -345,8 +555,21 @@ async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> 
         println!("{report}");
         Ok(())
     } else {
-        // Continuous scanning loop.
-        scanner.run_continuous().await
+        // Continuous scanning loop with bounded signal shutdown.
+        let shutdown = ShutdownToken::new();
+        let pipeline_shutdown = shutdown.clone();
+        run_single_pipeline_until_signal(
+            "scanner",
+            async move {
+                scanner
+                    .run_continuous_with_shutdown(pipeline_shutdown)
+                    .await
+            },
+            shutdown,
+            wait_for_shutdown_signal(),
+            ServiceLifecycleOptions::default().shutdown_timeout,
+        )
+        .await
     }
 }
 

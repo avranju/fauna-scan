@@ -27,6 +27,7 @@ use crate::nvr::{
     CameraDiscoveryClient, ImageSearchClient, NvrTransport, configured_nvr_identity,
     generate_search_windows,
 };
+use crate::service_lifecycle::ShutdownToken;
 
 use super::{DownloadPassReport, DownloadWorker};
 
@@ -428,6 +429,27 @@ impl DownloaderOrchestrator {
         &mut self,
         with_discovery: bool,
     ) -> AppResult<DownloaderPassReport> {
+        self.execute_one_pass_internal(with_discovery, None).await
+    }
+
+    /// Execute one pass with cooperative cancellation boundaries.
+    pub async fn execute_one_pass_with_shutdown(
+        &mut self,
+        with_discovery: bool,
+        shutdown: ShutdownToken,
+    ) -> AppResult<DownloaderPassReport> {
+        self.execute_one_pass_internal(with_discovery, Some(shutdown))
+            .await
+    }
+
+    async fn execute_one_pass_internal(
+        &mut self,
+        with_discovery: bool,
+        shutdown: Option<ShutdownToken>,
+    ) -> AppResult<DownloaderPassReport> {
+        if shutdown.as_ref().is_some_and(ShutdownToken::is_cancelled) {
+            return Ok(DownloaderPassReport::default());
+        }
         let now = chrono::Utc::now();
         let effective_end =
             compute_effective_end(Timestamp::new(now), self.options.settlement_delay)?;
@@ -437,6 +459,9 @@ impl DownloaderOrchestrator {
         let mut cameras_discovered: u64 = 0;
 
         if with_discovery {
+            if shutdown.as_ref().is_some_and(ShutdownToken::is_cancelled) {
+                return Ok(DownloaderPassReport::default());
+            }
             let discovery_result = self.attempt_discovery().await;
             match &discovery_result {
                 Ok(cameras) => {
@@ -496,6 +521,9 @@ impl DownloaderOrchestrator {
             Vec::new();
 
         for cam in &active_cameras {
+            if shutdown.as_ref().is_some_and(ShutdownToken::is_cancelled) {
+                break;
+            }
             let cam_id = cam.id;
             let channel = cam.channel_number;
             let picture_track = cam.picture_track_id.clone();
@@ -509,6 +537,7 @@ impl DownloaderOrchestrator {
 
             let overlap = self.options.poll_overlap;
             let search_semaphore = semaphore.clone();
+            let task_shutdown = shutdown.clone();
 
             let handle = tokio::spawn(async move {
                 // Every camera has a task; the permit bounds only active
@@ -558,6 +587,12 @@ impl DownloaderOrchestrator {
                 };
 
                 for window in &windows {
+                    if task_shutdown
+                        .as_ref()
+                        .is_some_and(ShutdownToken::is_cancelled)
+                    {
+                        break;
+                    }
                     let client = ImageSearchClient {
                         transport: &transport,
                         database: db.clone(),
@@ -691,7 +726,14 @@ impl DownloaderOrchestrator {
 
         // Step 6: Drain downloads before any metadata writes so that
         // successful sibling work is never blocked by metadata errors.
-        let download_pass = match self.download_worker.run_until_idle().await {
+        let download_pass = match match &shutdown {
+            Some(token) => {
+                self.download_worker
+                    .run_until_idle_with_shutdown(token)
+                    .await
+            }
+            None => self.download_worker.run_until_idle().await,
+        } {
             Ok(report) => report,
             Err(e) => {
                 // Download worker database errors are also fatal coordination
@@ -714,6 +756,10 @@ impl DownloaderOrchestrator {
         // already been drained above.
         if let Some(fatal) = first_fatal_error {
             return Err(fatal);
+        }
+
+        if shutdown.as_ref().is_some_and(ShutdownToken::is_cancelled) {
+            return Ok(DownloaderPassReport::default());
         }
 
         // A scheduled refresh failure is carried into this pass after the
@@ -820,6 +866,16 @@ impl DownloaderOrchestrator {
     /// the persisted camera set and are reported by the pass without being
     /// treated as fatal coordination errors.
     pub async fn run_continuous_iteration(&mut self) -> AppResult<DownloaderPassReport> {
+        self.run_continuous_iteration_with_shutdown(None).await
+    }
+
+    async fn run_continuous_iteration_with_shutdown(
+        &mut self,
+        shutdown: Option<ShutdownToken>,
+    ) -> AppResult<DownloaderPassReport> {
+        if shutdown.as_ref().is_some_and(ShutdownToken::is_cancelled) {
+            return Ok(DownloaderPassReport::default());
+        }
         let refresh_due = match &self.last_successful_camera_refresh {
             None => true,
             Some(last_refresh) => {
@@ -834,6 +890,9 @@ impl DownloaderOrchestrator {
         };
 
         if refresh_due {
+            if shutdown.as_ref().is_some_and(ShutdownToken::is_cancelled) {
+                return Ok(DownloaderPassReport::default());
+            }
             match self.attempt_discovery().await {
                 Ok(cameras) => {
                     self.sync_cameras(&cameras).await.map_err(|err| {
@@ -844,6 +903,10 @@ impl DownloaderOrchestrator {
                             err,
                         )
                     })?;
+                    // A successful retry supersedes any recoverable startup
+                    // or scheduled discovery failure carried by the prior
+                    // iteration.
+                    self.last_discovery_failure = None;
                     tracing::info!(
                         camera_count = cameras.len(),
                         "Scheduled camera refresh completed"
@@ -864,7 +927,10 @@ impl DownloaderOrchestrator {
             }
         }
 
-        self.execute_one_pass(false).await
+        match shutdown {
+            Some(token) => self.execute_one_pass_with_shutdown(false, token).await,
+            None => self.execute_one_pass(false).await,
+        }
     }
 
     /// Execute the continuous downloader loop.
@@ -873,15 +939,33 @@ impl DownloaderOrchestrator {
     /// persistence have already been performed by the caller (e.g.
     /// `handle_download`).
     pub async fn run_continuous(&mut self) -> AppResult<()> {
+        self.run_continuous_with_shutdown(ShutdownToken::new())
+            .await
+    }
+
+    /// Execute continuous polling while observing cooperative cancellation.
+    pub async fn run_continuous_with_shutdown(&mut self, shutdown: ShutdownToken) -> AppResult<()> {
         let active = self.reload_active_cameras().await?;
         tracing::info!(
             active_cameras = active.len(),
             "Active cameras loaded for continuous loop"
         );
+        tracing::info!("Entering continuous downloader polling");
 
         loop {
-            self.run_continuous_iteration().await?;
-            tokio::time::sleep(self.options.poll_interval).await;
+            if shutdown.is_cancelled() {
+                tracing::info!("Downloader loop terminated orderly");
+                return Ok(());
+            }
+            self.run_continuous_iteration_with_shutdown(Some(shutdown.clone()))
+                .await?;
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!("Downloader loop terminated orderly");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(self.options.poll_interval) => {}
+            }
         }
     }
 }

@@ -26,6 +26,7 @@ use fauna_scan::downloader::orchestration::{
 use fauna_scan::downloader::{DownloadWorker, DownloadWorkerOptions};
 use fauna_scan::error::{AppResult, ErrorCategory};
 use fauna_scan::nvr::{ImageDownloadClient, NvrTransport, configured_nvr_identity};
+use fauna_scan::service_lifecycle::ShutdownToken;
 use url::Url;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -762,6 +763,164 @@ async fn prepare_server(
     .await;
     mount_playback(&server, cameras).await;
     server
+}
+
+#[tokio::test]
+async fn cancellation_before_pass_prevents_discovery_search_and_claims() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut orchestrator, _nvr) = build_orchestrator(&server.uri(), &temp_dir).await.unwrap();
+    let shutdown = ShutdownToken::new();
+    shutdown.cancel();
+
+    let report = orchestrator
+        .execute_one_pass_with_shutdown(true, shutdown)
+        .await
+        .unwrap();
+    assert_eq!(report.cameras_discovered, 0);
+    assert_eq!(report.windows_completed, 0);
+    assert_eq!(report.download_pass.claimed, 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn cancellation_between_search_windows_preserves_only_committed_cursor() {
+    let server = MockServer::start().await;
+    mount_discovery(&server, 1).await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut orchestrator, _nvr) = build_orchestrator(&server.uri(), &temp_dir).await.unwrap();
+    orchestrator.startup_housekeeping().await.unwrap();
+    orchestrator.options.start_at = Timestamp::new(Utc::now() - chrono::Duration::minutes(5));
+    orchestrator.options.window_minutes = 1;
+    orchestrator.options.settlement_delay = Duration::ZERO;
+    orchestrator.search_config.window_minutes = 1;
+    let shutdown = ShutdownToken::new();
+    let response_shutdown = shutdown.clone();
+    Mock::given(method("POST"))
+        .and(path("/ISAPI/ContentMgmt/search"))
+        .respond_with(move |_request: &Request| {
+            response_shutdown.cancel();
+            ResponseTemplate::new(200).set_body_string(
+                "<CMSearchResult><responseStatus>true</responseStatus><responseStatusStrg>OK</responseStatusStrg><numOfMatches>0</numOfMatches></CMSearchResult>",
+            )
+        })
+        .mount(&server)
+        .await;
+
+    let _report = orchestrator
+        .execute_one_pass_with_shutdown(true, shutdown)
+        .await
+        .unwrap();
+    let camera = orchestrator.database.list_active_cameras().await.unwrap()[0].id;
+    let cursor = orchestrator.database.get_cursor(camera).await.unwrap();
+    assert!(cursor.is_some_and(|cursor| cursor.last_completed_window_end.is_some()));
+    let search_count = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.method.as_str() == "POST")
+        .count();
+    assert_eq!(search_count, 1, "cancellation advanced a skipped window");
+}
+
+#[tokio::test]
+async fn cancellation_during_download_batch_drains_active_tasks_without_new_claims() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (orchestrator, _nvr) = build_orchestrator(&server.uri(), &temp_dir).await.unwrap();
+    let now = Timestamp::new(Utc::now());
+    let camera_id = orchestrator
+        .database
+        .sync_cameras(
+            &[CameraDiscovery {
+                channel_number: 1,
+                primary_track_id: "101".into(),
+                picture_track_id: "103".into(),
+                name: None,
+                raw_discovery_identifier: None,
+            }],
+            &now,
+        )
+        .await
+        .unwrap()[0]
+        .id;
+    for index in 0..3 {
+        orchestrator
+            .database
+            .commit_search_window(
+                &SearchWindowCommit {
+                    camera_id,
+                    window_start: now,
+                    window_end: now,
+                    next_search_at: now,
+                    polled_at: now,
+                    updated_at: now,
+                },
+                &[DiscoveredImage {
+                    image_key: ImageKey::new(format!("download-cancel-{index}")),
+                    camera_id,
+                    track_id: TrackId::new("103"),
+                    capture_start_at: Timestamp::new(
+                        *now.as_datetime() + chrono::Duration::seconds(index as i64),
+                    ),
+                    capture_end_at: None,
+                    playback_uri: format!("{}/picture/103", server.uri()),
+                    canonical_playback_uri: format!("{}/picture/103", server.uri()),
+                    codec_type: Some("jpeg".into()),
+                    content_type: Some("picture".into()),
+                    nvr_reported_size: None,
+                    discovered_at: now,
+                }],
+            )
+            .await
+            .unwrap();
+    }
+    let shutdown = ShutdownToken::new();
+    let response_shutdown = shutdown.clone();
+    Mock::given(method("GET"))
+        .and(path("/picture/103"))
+        .respond_with(move |_request: &Request| {
+            response_shutdown.cancel();
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(20))
+                .set_body_bytes(valid_jpeg())
+        })
+        .mount(&server)
+        .await;
+
+    let report = orchestrator
+        .download_worker
+        .run_until_idle_with_shutdown(&shutdown)
+        .await
+        .unwrap();
+    assert_eq!(report.claimed, 2, "worker claimed beyond its active batch");
+    let counts = orchestrator.database.status_counts().await.unwrap();
+    assert_eq!(counts.download.get(&DownloadStatus::Pending), Some(&1));
+    assert_eq!(counts.download.get(&DownloadStatus::Downloaded), Some(&2));
+}
+
+#[tokio::test]
+async fn cancellation_wakes_downloader_polling_sleep() {
+    let server = MockServer::start().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut orchestrator, _nvr) = build_orchestrator(&server.uri(), &temp_dir).await.unwrap();
+    orchestrator.last_successful_camera_refresh = Some(Timestamp::new(Utc::now()));
+    orchestrator.options.poll_interval = Duration::from_secs(3600);
+    let shutdown = ShutdownToken::new();
+    let task_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        orchestrator
+            .run_continuous_with_shutdown(task_shutdown)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("polling sleep did not observe cancellation")
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]

@@ -1234,6 +1234,64 @@ impl DatabaseOps {
         Ok(counts)
     }
 
+    /// Return aggregate operational counters using durable image predicates.
+    pub async fn operational_summary(&self) -> AppResult<OperationalSummary> {
+        // Validate persisted enum values before aggregating.  SQLite CHECK
+        // constraints protect normal writes, but this keeps diagnostics safe
+        // for databases altered by external tools or older migrations.
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT download_status, processing_status FROM images")
+                .fetch_all(&self.0)
+                .await
+                .map_err(|e| map_sqlx_error("operational_summary_statuses", e))?;
+        for (download, processing) in statuses {
+            download.parse::<DownloadStatus>().map_err(|_| {
+                AppError::new(
+                    ErrorCategory::Database,
+                    "operational_summary",
+                    format!("unknown download_status in operational summary: {download}"),
+                )
+            })?;
+            processing.parse::<ProcessingStatus>().map_err(|_| {
+                AppError::new(
+                    ErrorCategory::Database,
+                    "operational_summary",
+                    format!("unknown processing_status in operational summary: {processing}"),
+                )
+            })?;
+        }
+
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64)>(
+            r#"SELECT
+                (SELECT COUNT(*) FROM cameras WHERE enabled = 1),
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN download_status = 'downloaded' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN download_status = 'pending' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN download_status = 'downloaded'
+                    AND processing_status IN ('new', 'processing', 'retry_wait') THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN processing_status = 'done' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN download_status = 'retry_wait' THEN 1 ELSE 0 END), 0)
+                    + COALESCE(SUM(CASE WHEN processing_status = 'retry_wait' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN download_status IN ('unavailable', 'failed') THEN 1 ELSE 0 END), 0)
+                    + COALESCE(SUM(CASE WHEN processing_status IN ('failed', 'missing') THEN 1 ELSE 0 END), 0)
+             FROM images"#,
+        )
+        .fetch_one(&self.0)
+        .await
+        .map_err(|e| map_sqlx_error("operational_summary", e))?;
+
+        Ok(OperationalSummary {
+            cameras_active: row.0,
+            images_discovered: row.1,
+            images_downloaded: row.2,
+            downloads_pending: row.3,
+            images_awaiting_classification: row.4,
+            classifications_completed: row.5,
+            retryable_failures: row.6,
+            permanent_failures: row.7,
+        })
+    }
+
     // ── Row lookup helpers (for tests) ─────────────────────────────────────
 
     /// Fetch a full image record by ID.

@@ -16,6 +16,7 @@ use fauna_scan::database::models::*;
 use fauna_scan::database::repository::DatabaseOps;
 use fauna_scan::domain::*;
 use fauna_scan::scanner::{Scanner, ScannerOptions, ScannerPassReport, scanner_backoff};
+use fauna_scan::service_lifecycle::ShutdownToken;
 use tempfile::TempDir;
 use url::Url;
 use wiremock::matchers::{method, path};
@@ -258,6 +259,115 @@ async fn sequential_classification_two_images() {
         .unwrap()
         .unwrap();
     assert!(!meta.is_empty());
+}
+
+// ── Cancellation tests ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cancellation_before_pass_claims_no_image_or_success_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock_server = MockServer::start().await;
+    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let shutdown = ShutdownToken::new();
+    shutdown.cancel();
+
+    let report = scanner
+        .clone()
+        .execute_one_pass_with_shutdown(&shutdown)
+        .await
+        .unwrap();
+    assert_eq!(report.claimed, 0);
+    assert!(
+        scanner
+            .database
+            .get_metadata(&ServiceMetadataKey::LastSuccessfulScannerPass)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        scanner
+            .database
+            .get_image(ImageId::new(1))
+            .await
+            .unwrap()
+            .processing_status,
+        ProcessingStatus::New
+    );
+}
+
+#[tokio::test]
+async fn cancellation_after_one_image_prevents_the_next_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock_server = MockServer::start().await;
+    let shutdown = ShutdownToken::new();
+    let response_shutdown = shutdown.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |_request: &wiremock::Request| {
+            response_shutdown.cancel();
+            ResponseTemplate::new(200).set_body_string(valid_openai_response())
+        })
+        .mount(&mock_server)
+        .await;
+    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, 5).await;
+
+    let report = scanner
+        .clone()
+        .execute_one_pass_with_shutdown(&shutdown)
+        .await
+        .unwrap();
+    assert_eq!(report.claimed, 1);
+    assert_eq!(report.completed, 1);
+    assert_eq!(
+        scanner
+            .database
+            .get_image(ImageId::new(1))
+            .await
+            .unwrap()
+            .processing_status,
+        ProcessingStatus::Done
+    );
+    assert_eq!(
+        scanner
+            .database
+            .get_image(ImageId::new(2))
+            .await
+            .unwrap()
+            .processing_status,
+        ProcessingStatus::New
+    );
+    assert!(
+        scanner
+            .database
+            .get_metadata(&ServiceMetadataKey::LastSuccessfulScannerPass)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn cancellation_wakes_scanner_polling_sleep() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock_server = MockServer::start().await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 0, &minimal_jpeg()).await;
+    let mut scanner = build_scanner(ops, &mock_server, 5).await;
+    scanner.options.poll_interval = std::time::Duration::from_secs(3600);
+    let shutdown = ShutdownToken::new();
+    let task_shutdown = shutdown.clone();
+    let task =
+        tokio::spawn(async move { scanner.run_continuous_with_shutdown(task_shutdown).await });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    shutdown.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("scanner polling sleep did not observe cancellation")
+        .unwrap()
+        .unwrap();
+    assert!(output_dir.exists());
 }
 
 // ── Missing file test ─────────────────────────────────────────────────────

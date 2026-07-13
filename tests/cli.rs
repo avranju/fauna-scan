@@ -1,9 +1,8 @@
 //! Process-level integration tests for the fauna-scan CLI.
 //!
-//! Verifies the externally visible Phase 1/2 contract: help, version,
-//! command listing, global options, argument validation, and
-//! not-yet-implemented command results (except check-config which is
-//! now operational in Phase 2).
+//! Verifies the externally visible CLI contract: help, version, command
+//! listing, configuration validation, lifecycle dispatch, and durable status
+//! output.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -75,7 +74,7 @@ fn log_level_option_accepted() {
             .arg(level)
             .arg("run")
             .assert()
-            .failure(); // fails because run is not implemented, not because of the flag
+            .failure(); // no default configuration is installed in this test
     }
 }
 
@@ -369,15 +368,24 @@ enabled = false
     assert_eq!(database.ops().list_active_cameras().await.unwrap().len(), 1);
 }
 
-// ── Other commands (still not-yet-implemented) ────────────────────────────
+// ── Operational commands ──────────────────────────────────────────────────
 
 #[test]
-fn run_exits_nonzero_with_message() {
+fn run_rejects_disabled_classifier_before_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, minimal_valid_config()).unwrap();
+
     cmd()
+        .arg("--config")
+        .arg(&config_path)
         .arg("run")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("run"));
+        .stderr(
+            predicate::str::contains("classifier is disabled")
+                .and(predicate::str::contains("Starting downloader and scanner pipelines").not()),
+        );
 }
 
 #[test]
@@ -499,13 +507,181 @@ prompt_version = "wildlife-v1"
         .stdout(predicate::str::contains("Scanner pass"));
 }
 
-#[test]
-fn status_exits_nonzero_with_message() {
-    cmd()
+#[tokio::test]
+async fn status_empty_database_prints_all_states_and_zeroes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("status.db");
+    let output_dir = dir.path().join("images");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[general]
+database_path = "{}"
+output_directory = "{}"
+
+[nvr]
+scheme = "http"
+host = "127.0.0.1"
+port = 1
+username = "u"
+password = "p"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+enabled = false
+"#,
+            db_path.display(),
+            output_dir.display(),
+        ),
+    )
+    .unwrap();
+    fauna_scan::database::Database::open(&db_path)
+        .await
+        .unwrap();
+
+    let output = cmd()
+        .arg("--config")
+        .arg(&config_path)
         .arg("status")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("status"));
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    for state in [
+        "pending: 0",
+        "downloading: 0",
+        "downloaded: 0",
+        "retry_wait: 0",
+        "unavailable: 0",
+        "failed: 0",
+        "new: 0",
+        "processing: 0",
+        "done: 0",
+        "missing: 0",
+    ] {
+        assert!(output.contains(state), "missing {state} in {output}");
+    }
+    assert!(output.find("pending: 0").unwrap() < output.find("failed: 0").unwrap());
+    assert!(output.find("new: 0").unwrap() < output.find("missing: 0").unwrap());
+}
+
+#[tokio::test]
+async fn status_populated_database_prints_grouped_counts_in_domain_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("status.db");
+    let output_dir = dir.path().join("images");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[general]
+database_path = "{}"
+output_directory = "{}"
+
+[nvr]
+scheme = "http"
+host = "127.0.0.1"
+port = 1
+username = "u"
+password = "p"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+enabled = false
+"#,
+            db_path.display(),
+            output_dir.display(),
+        ),
+    )
+    .unwrap();
+    let database = fauna_scan::database::Database::open(&db_path)
+        .await
+        .unwrap();
+    let timestamp = "2026-01-01T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO cameras (channel_number, primary_track_id, picture_track_id, first_seen_at, last_seen_at, created_at, updated_at) VALUES (1, '101', '103', ?, ?, ?, ?)",
+    )
+    .bind(timestamp)
+    .bind(timestamp)
+    .bind(timestamp)
+    .bind(timestamp)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let download_states = [
+        "pending",
+        "downloading",
+        "downloaded",
+        "retry_wait",
+        "unavailable",
+        "failed",
+    ];
+    let processing_states = [
+        "new",
+        "processing",
+        "done",
+        "retry_wait",
+        "failed",
+        "missing",
+    ];
+    for (index, (download, processing)) in download_states.iter().zip(processing_states).enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO images (image_key, camera_id, track_id, capture_start_at, playback_uri, canonical_playback_uri, download_status, processing_status, discovered_at, created_at, updated_at) VALUES (?, 1, '103', ?, 'http://nvr/image', 'http://nvr/image', ?, ?, ?, ?, ?)",
+        )
+        .bind(format!("key-{index}"))
+        .bind(timestamp)
+        .bind(download)
+        .bind(processing)
+        .bind(timestamp)
+        .bind(timestamp)
+        .bind(timestamp)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+
+    let output = cmd()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("status")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    for state in download_states.iter().chain(processing_states.iter()) {
+        assert!(output.contains(&format!("{state}: 1")));
+    }
+    let order = [
+        "pending: 1",
+        "downloading: 1",
+        "downloaded: 1",
+        "retry_wait: 1",
+        "unavailable: 1",
+        "failed: 1",
+        "new: 1",
+        "processing: 1",
+        "done: 1",
+        "retry_wait: 1",
+        "failed: 1",
+        "missing: 1",
+    ];
+    // The repeated state names are checked within their respective sections.
+    let download_section = output.split("Processing status:").next().unwrap();
+    let processing_section = output.split("Processing status:").nth(1).unwrap();
+    for pair in order[..6].windows(2) {
+        assert!(download_section.find(pair[0]).unwrap() < download_section.find(pair[1]).unwrap());
+    }
+    for pair in order[6..].windows(2) {
+        assert!(
+            processing_section.find(pair[0]).unwrap() < processing_section.find(pair[1]).unwrap()
+        );
+    }
 }
 
 // ── Invalid invocations ───────────────────────────────────────────────────

@@ -20,6 +20,7 @@ use crate::filesystem::{
     self, FilePreparation, image_destination, remove_final_file, safe_io_error,
 };
 use crate::nvr::ImageDownloadClient;
+use crate::service_lifecycle::ShutdownToken;
 
 // ── Phase 8 orchestration submodule ───────────────────────────────────────
 
@@ -182,15 +183,31 @@ impl DownloadWorker {
     /// Recomputes the current time and lease deadline for each claim.
     /// Drains all active tasks before returning, even on error.
     pub async fn run_until_idle(&self) -> AppResult<DownloadPassReport> {
+        self.run_until_idle_with_shutdown(&ShutdownToken::new())
+            .await
+    }
+
+    /// Run until idle while refusing new claims after cancellation.  Existing
+    /// download tasks are always joined before returning.
+    pub async fn run_until_idle_with_shutdown(
+        &self,
+        shutdown: &ShutdownToken,
+    ) -> AppResult<DownloadPassReport> {
         let mut report = DownloadPassReport::default();
         let mut first_error: Option<AppError> = None;
 
         loop {
+            if shutdown.is_cancelled() {
+                break;
+            }
             // Claim work up to current concurrency.
             let mut tasks: Vec<(ImageKey, JoinHandle<AppResult<DownloadOutcome>>)> = Vec::new();
             let mut pass_claims: u64 = 0;
 
             loop {
+                if shutdown.is_cancelled() {
+                    break;
+                }
                 // Check how many tasks are still active.
                 let active_count = tasks.iter().filter(|(_, h)| !h.is_finished()).count();
                 if active_count >= self.options.concurrency {

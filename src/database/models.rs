@@ -463,6 +463,19 @@ pub struct StatusCounts {
     pub processing: BTreeMap<ProcessingStatus, i64>,
 }
 
+/// Compact aggregate values used by the service health summary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperationalSummary {
+    pub cameras_active: i64,
+    pub images_discovered: i64,
+    pub images_downloaded: i64,
+    pub downloads_pending: i64,
+    pub images_awaiting_classification: i64,
+    pub classifications_completed: i64,
+    pub retryable_failures: i64,
+    pub permanent_failures: i64,
+}
+
 // ── Lease recovery ─────────────────────────────────────────────────────────
 
 /// Report of how many expired download and processing claims were recovered.

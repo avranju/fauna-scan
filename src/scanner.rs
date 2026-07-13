@@ -22,6 +22,7 @@ use crate::database::repository::DatabaseOps;
 use crate::domain::ImageId;
 use crate::domain::Timestamp;
 use crate::error::{AppError, AppResult, ErrorCategory};
+use crate::service_lifecycle::ShutdownToken;
 
 #[cfg(test)]
 static FORCE_PARSE_TASK_JOIN_ERROR: AtomicBool = AtomicBool::new(false);
@@ -199,6 +200,18 @@ impl Scanner {
     /// For use in a continuous loop, clone the scanner first:
     /// `scanner.clone().execute_one_pass().await`.
     pub async fn execute_one_pass(self) -> AppResult<ScannerPassReport> {
+        self.execute_one_pass_with_shutdown(&ShutdownToken::new())
+            .await
+    }
+
+    /// Execute a pass while refusing new claims after cancellation.
+    pub async fn execute_one_pass_with_shutdown(
+        self,
+        shutdown: &ShutdownToken,
+    ) -> AppResult<ScannerPassReport> {
+        if shutdown.is_cancelled() {
+            return Ok(ScannerPassReport::default());
+        }
         let mut report = ScannerPassReport::default();
 
         // Recover expired processing leases.
@@ -212,7 +225,12 @@ impl Scanner {
         );
 
         // Drain all currently eligible images.
+        let mut interrupted = false;
         loop {
+            if shutdown.is_cancelled() {
+                interrupted = true;
+                break;
+            }
             // Compute lease deadline using checked arithmetic.  The lease
             // duration was already validated to be Chrono-safe in
             // ScannerOptions::from_config, so this should always succeed.
@@ -232,7 +250,7 @@ impl Scanner {
             );
             let claim = match self
                 .database
-                .claim_next_processing(&now, &lease_until)
+                .claim_next_processing(&Timestamp::new(Utc::now()), &lease_until)
                 .await?
             {
                 Some(claim) => claim,
@@ -255,6 +273,18 @@ impl Scanner {
                     return Err(e);
                 }
             }
+            if shutdown.is_cancelled() {
+                // The current claim has reached a durable outcome, but the
+                // pass did not reach an idle queue and must not be recorded as
+                // a successful scanner pass.
+                interrupted = true;
+                break;
+            }
+        }
+
+        if interrupted {
+            tracing::info!(claimed = report.claimed, "Scanner loop terminated orderly");
+            return Ok(report);
         }
 
         // Update scanner pass metadata.
@@ -285,8 +315,22 @@ impl Scanner {
     /// Repeatedly executes passes separated by the configured poll interval.
     /// Propagates fatal database or internal errors.
     pub async fn run_continuous(self) -> AppResult<()> {
+        self.run_continuous_with_shutdown(ShutdownToken::new())
+            .await
+    }
+
+    /// Run scanner passes and polling sleeps with cooperative cancellation.
+    pub async fn run_continuous_with_shutdown(self, shutdown: ShutdownToken) -> AppResult<()> {
+        tracing::info!("Entering continuous scanner polling");
         loop {
-            let report = self.clone().execute_one_pass().await?;
+            if shutdown.is_cancelled() {
+                tracing::info!("Scanner loop terminated orderly");
+                return Ok(());
+            }
+            let report = self
+                .clone()
+                .execute_one_pass_with_shutdown(&shutdown)
+                .await?;
             tracing::info!(
                 claimed = report.claimed,
                 completed = report.completed,
@@ -297,7 +341,13 @@ impl Scanner {
             );
 
             // Sleep for the poll interval before the next pass.
-            sleep(self.options.poll_interval).await;
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    tracing::info!("Scanner loop terminated orderly");
+                    return Ok(());
+                }
+                _ = sleep(self.options.poll_interval) => {}
+            }
         }
     }
 
