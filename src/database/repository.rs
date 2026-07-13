@@ -31,6 +31,32 @@ impl DatabaseOps {
     }
 }
 
+// ── Active camera enumeration ───────────────────────────────────────────
+
+impl DatabaseOps {
+    /// Return enabled cameras ordered deterministically by channel number then
+    /// picture track ID.
+    pub async fn list_active_cameras(&self) -> AppResult<Vec<CameraRecord>> {
+        let rows: Vec<CameraRow> = sqlx::query_as(
+            r#"SELECT id, channel_number, primary_track_id, picture_track_id,
+                      name, raw_discovery_identifier,
+                      enabled, first_seen_at, last_seen_at, created_at, updated_at
+                 FROM cameras
+                 WHERE enabled = 1
+                 ORDER BY channel_number ASC, id ASC"#,
+        )
+        .fetch_all(&self.0)
+        .await
+        .map_err(|e| map_sqlx_error("list_active_cameras", e))?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            records.push(super::models::camera_row_to_record(row)?);
+        }
+        Ok(records)
+    }
+}
+
 // ── Camera synchronization ────────────────────────────────────────────────
 
 impl DatabaseOps {
@@ -169,9 +195,27 @@ impl DatabaseOps {
                                                last_poll_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?)
                    ON CONFLICT(camera_id) DO UPDATE SET
-                       last_completed_window_start = excluded.last_completed_window_start,
-                       last_completed_window_end = excluded.last_completed_window_end,
-                       next_search_at = excluded.next_search_at,
+                       last_completed_window_start = CASE
+                           WHEN search_cursors.last_completed_window_start IS NULL
+                               THEN excluded.last_completed_window_start
+                           WHEN excluded.last_completed_window_start IS NULL
+                               THEN search_cursors.last_completed_window_start
+                           WHEN excluded.last_completed_window_start > search_cursors.last_completed_window_start
+                               THEN excluded.last_completed_window_start
+                           ELSE search_cursors.last_completed_window_start
+                       END,
+                       last_completed_window_end = CASE
+                           WHEN search_cursors.last_completed_window_end IS NULL
+                               THEN excluded.last_completed_window_end
+                           WHEN excluded.last_completed_window_end IS NULL
+                               THEN search_cursors.last_completed_window_end
+                           WHEN excluded.last_completed_window_end > search_cursors.last_completed_window_end
+                               THEN excluded.last_completed_window_end
+                           ELSE search_cursors.last_completed_window_end
+                       END,
+                       next_search_at = MAX(
+                           COALESCE(search_cursors.next_search_at, '0000-00-00T00:00:00Z'),
+                           excluded.next_search_at),
                        last_poll_at = excluded.last_poll_at,
                        last_error = NULL,
                        updated_at = excluded.updated_at"#,
@@ -300,9 +344,27 @@ impl DatabaseOps {
                                            last_poll_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(camera_id) DO UPDATE SET
-                   last_completed_window_start = excluded.last_completed_window_start,
-                   last_completed_window_end = excluded.last_completed_window_end,
-                   next_search_at = excluded.next_search_at,
+                   last_completed_window_start = CASE
+                       WHEN search_cursors.last_completed_window_start IS NULL
+                           THEN excluded.last_completed_window_start
+                       WHEN excluded.last_completed_window_start IS NULL
+                           THEN search_cursors.last_completed_window_start
+                       WHEN excluded.last_completed_window_start > search_cursors.last_completed_window_start
+                           THEN excluded.last_completed_window_start
+                       ELSE search_cursors.last_completed_window_start
+                   END,
+                   last_completed_window_end = CASE
+                       WHEN search_cursors.last_completed_window_end IS NULL
+                           THEN excluded.last_completed_window_end
+                       WHEN excluded.last_completed_window_end IS NULL
+                           THEN search_cursors.last_completed_window_end
+                       WHEN excluded.last_completed_window_end > search_cursors.last_completed_window_end
+                           THEN excluded.last_completed_window_end
+                       ELSE search_cursors.last_completed_window_end
+                   END,
+                   next_search_at = MAX(
+                       COALESCE(search_cursors.next_search_at, '0000-00-00T00:00:00Z'),
+                       excluded.next_search_at),
                    last_poll_at = excluded.last_poll_at,
                    last_error = NULL,
                    updated_at = excluded.updated_at"#,

@@ -3,13 +3,17 @@
 //! Keeps the process entry point thin and centralizes command routing.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::cli::Command;
 use crate::configuration::Config;
 use crate::database::Database;
 use crate::database::models::ServiceMetadataKey;
+use crate::domain::DownloadStatus;
+use crate::downloader::orchestration::{DownloaderOrchestrator, DownloaderOrchestratorOptions};
+use crate::downloader::{DownloadWorker, DownloadWorkerOptions};
 use crate::error::{AppError, AppResult, ErrorCategory};
-use crate::nvr::{CameraDiscoveryClient, NvrTransport};
+use crate::nvr::{CameraDiscoveryClient, ImageDownloadClient, NvrTransport};
 
 /// Execute the selected command.
 ///
@@ -19,7 +23,7 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
         Command::Run => Err(AppError::not_implemented("run")),
         Command::CheckConfig => handle_check_config(config_path),
         Command::Discover => handle_discover(config_path).await,
-        Command::Download(_) => Err(AppError::not_implemented("download")),
+        Command::Download(args) => handle_download(args, config_path).await,
         Command::Scan(_) => Err(AppError::not_implemented("scan")),
         Command::Status => Err(AppError::not_implemented("status")),
     }
@@ -98,6 +102,156 @@ async fn handle_discover(config_path: Option<&Path>) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+/// Handle the `download` subcommand.
+///
+/// Loads configuration, creates runtime directories, opens/migrates
+/// SQLite, builds the shared NVR transport and download client,
+/// constructs the worker and orchestrator, runs startup housekeeping,
+/// then either executes one finite pass (`--once`) or enters the
+/// continuous polling loop.
+async fn handle_download(
+    args: crate::cli::DownloadArgs,
+    config_path: Option<&Path>,
+) -> AppResult<()> {
+    // Load and validate configuration using the caller-supplied path.
+    let config = Config::load(config_path)?;
+
+    // Create runtime directories (database parent and output directory)
+    create_runtime_directories(&config)?;
+
+    // Open the database (applies migrations)
+    let database = Database::open(&config.general.database_path).await?;
+
+    // Build the NVR transport with Digest authentication
+    let transport = NvrTransport::from_config(&config.nvr)?;
+
+    // Build the image download client (wraps transport in Arc internally)
+    let download_client = Arc::new(ImageDownloadClient::from_config(
+        Arc::new(transport),
+        &config.nvr,
+    ));
+
+    // Build download worker options from the real config
+    let worker_options = DownloadWorkerOptions::from_config(&config)?;
+
+    // Build download worker
+    let download_worker = DownloadWorker::new(
+        database.ops().clone(),
+        download_client.clone(),
+        worker_options,
+    );
+
+    // Build orchestrator options from the real config
+    let orchestrator_options = DownloaderOrchestratorOptions::from_config(&config)?;
+
+    // Validate search concurrency before starting work
+    orchestrator_options.validate()?;
+
+    // Build orchestrator (construction is now fallible — validates concurrency).
+    let mut orchestrator = DownloaderOrchestrator::new(
+        database.ops().clone(),
+        download_client.transport.clone(),
+        download_worker,
+        orchestrator_options,
+    )?;
+
+    // Run startup housekeeping
+    let housekeeping_report = orchestrator.startup_housekeeping().await?;
+    tracing::info!(
+        stale_parts_removed = housekeeping_report.stale_parts_removed,
+        leases_recovered = housekeeping_report.leases_recovered,
+        "Startup housekeeping completed"
+    );
+
+    // Persist NVR identity metadata — fatal because durable identity
+    // tracking may be compromised if the write fails.
+    orchestrator.persist_nvr_identity().await?;
+
+    if args.once {
+        // One finite pass: discovery + search + download drain
+        let report = orchestrator.execute_one_pass(true).await?;
+
+        // Print compact summary with real durable status counts.
+        let pending = report
+            .status_counts
+            .download
+            .get(&DownloadStatus::Pending)
+            .copied()
+            .unwrap_or(0);
+        let retry_wait = report
+            .status_counts
+            .download
+            .get(&DownloadStatus::RetryWait)
+            .copied()
+            .unwrap_or(0);
+        let unavailable = report
+            .status_counts
+            .download
+            .get(&DownloadStatus::Unavailable)
+            .copied()
+            .unwrap_or(0);
+        let failed = report
+            .status_counts
+            .download
+            .get(&DownloadStatus::Failed)
+            .copied()
+            .unwrap_or(0);
+
+        println!(
+            "Downloader pass: {} active camera(s), {} window(s) completed, \
+             {} image(s) discovered, {} downloaded, {} pending, {} retry-wait, \
+             {} unavailable, {} failed",
+            report.cameras_active,
+            report.windows_completed,
+            report.images_discovered,
+            report.download_pass.downloaded,
+            pending,
+            retry_wait,
+            unavailable,
+            failed,
+        );
+
+        // Return non-zero error if discovery or camera searches failed
+        // (after draining work, which has already happened).
+        if report.search_failures > 0 || report.discovery_failure.is_some() {
+            // Prefer a camera failure when one is available so the command's
+            // structured category and message identify the affected camera
+            // and track without exposing request details or response bodies.
+            let first_search_failure = report
+                .camera_reports
+                .iter()
+                .find_map(|camera| camera.failure.as_ref());
+            let first_failure = first_search_failure.or(report.discovery_failure.as_ref());
+
+            if let Some(failure) = first_failure {
+                let track = if failure.track_id.is_empty() {
+                    "none"
+                } else {
+                    failure.track_id.as_str()
+                };
+                return Err(AppError::new(
+                    failure.category,
+                    "download_once",
+                    format!(
+                        "pass completed with {} search failure(s), discovery_failure={}; first failure camera_id={} track_id={} operation={} category={}",
+                        report.search_failures,
+                        report.discovery_failure.is_some(),
+                        failure.camera_id,
+                        track,
+                        failure.operation,
+                        failure.category,
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    } else {
+        // Continuous polling loop
+        orchestrator.run_continuous().await
+    }
 }
 
 /// Create runtime directories required by operational commands.

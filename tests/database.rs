@@ -3741,3 +3741,290 @@ async fn lease_recovery_with_fractional_boundary() {
     assert_eq!(img.download_status, DownloadStatus::RetryWait);
     assert!(img.download_lease_until.is_none());
 }
+
+// ── Phase 8: list_active_cameras and monotonic cursor ──────────────────────
+
+#[tokio::test]
+async fn list_active_cameras_excludes_inactive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+
+    let cameras = vec![
+        CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: Some("Camera One".to_string()),
+            raw_discovery_identifier: None,
+        },
+        CameraDiscovery {
+            channel_number: 2,
+            primary_track_id: "201".to_string(),
+            picture_track_id: "203".to_string(),
+            name: Some("Camera Two".to_string()),
+            raw_discovery_identifier: None,
+        },
+    ];
+    ops.sync_cameras(&cameras, &now).await.unwrap();
+
+    let observed2 = future_ts(1);
+    let cameras2 = vec![CameraDiscovery {
+        channel_number: 1,
+        primary_track_id: "101".to_string(),
+        picture_track_id: "103".to_string(),
+        name: None,
+        raw_discovery_identifier: None,
+    }];
+    ops.sync_cameras(&cameras2, &observed2).await.unwrap();
+
+    let active = ops.list_active_cameras().await.unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].picture_track_id, "103");
+}
+
+#[tokio::test]
+async fn list_active_cameras_ordered_by_channel_and_track() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+
+    let cameras = vec![
+        CameraDiscovery {
+            channel_number: 3,
+            primary_track_id: "301".to_string(),
+            picture_track_id: "303".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        },
+        CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        },
+        CameraDiscovery {
+            channel_number: 2,
+            primary_track_id: "201".to_string(),
+            picture_track_id: "203".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        },
+    ];
+    ops.sync_cameras(&cameras, &now).await.unwrap();
+
+    let active = ops.list_active_cameras().await.unwrap();
+    assert_eq!(active.len(), 3);
+    assert_eq!(active[0].channel_number, 1);
+    assert_eq!(active[1].channel_number, 2);
+    assert_eq!(active[2].channel_number, 3);
+}
+
+#[tokio::test]
+async fn monotonic_cursor_next_search_at_does_not_regress() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img1 = DiscoveredImage {
+        image_key: ImageKey::new("key-monotonic-1"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window1 = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+    ops.commit_search_window(&window1, &[img1]).await.unwrap();
+
+    let cursor1 = ops.get_cursor(camera_id).await.unwrap().unwrap();
+    assert_eq!(cursor1.next_search_at, Some(future_ts(2)));
+
+    let img2 = DiscoveredImage {
+        image_key: ImageKey::new("key-monotonic-2"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: past_ts(1),
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/2".to_string(),
+        canonical_playback_uri: "http://nvr/pic/2".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window2 = SearchWindowCommit {
+        camera_id,
+        window_start: past_ts(2),
+        window_end: future_ts(1),
+        next_search_at: future_ts(1),
+        polled_at: now,
+        updated_at: now,
+    };
+    ops.commit_search_window(&window2, &[img2]).await.unwrap();
+
+    let cursor2 = ops.get_cursor(camera_id).await.unwrap().unwrap();
+    assert_eq!(cursor2.next_search_at, Some(future_ts(2)));
+    assert_eq!(cursor2.last_completed_window_end, Some(future_ts(1)));
+}
+
+#[tokio::test]
+async fn monotonic_completed_window_does_not_regress() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img1 = DiscoveredImage {
+        image_key: ImageKey::new("key-window-regress-1"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window1 = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(2),
+        next_search_at: future_ts(3),
+        polled_at: now,
+        updated_at: now,
+    };
+    ops.commit_search_window(&window1, &[img1]).await.unwrap();
+
+    let cursor1 = ops.get_cursor(camera_id).await.unwrap().unwrap();
+    assert_eq!(cursor1.last_completed_window_end, Some(future_ts(2)));
+
+    let img2 = DiscoveredImage {
+        image_key: ImageKey::new("key-window-regress-2"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: past_ts(1),
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/2".to_string(),
+        canonical_playback_uri: "http://nvr/pic/2".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window2 = SearchWindowCommit {
+        camera_id,
+        window_start: past_ts(2),
+        window_end: past_ts(1),
+        next_search_at: past_ts(1),
+        polled_at: now,
+        updated_at: now,
+    };
+    ops.commit_search_window(&window2, &[img2]).await.unwrap();
+
+    let cursor2 = ops.get_cursor(camera_id).await.unwrap().unwrap();
+    assert_eq!(cursor2.last_completed_window_end, Some(future_ts(2)));
+    assert_eq!(cursor2.next_search_at, Some(future_ts(3)));
+}
+
+#[tokio::test]
+async fn successful_overlap_replay_clears_cursor_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    ops.record_cursor_error(camera_id, "previous error", &now)
+        .await
+        .unwrap();
+
+    let cursor_before = ops.get_cursor(camera_id).await.unwrap().unwrap();
+    assert_eq!(cursor_before.last_error, Some("previous error".to_string()));
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-clear-error"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    let cursor_after = ops.get_cursor(camera_id).await.unwrap().unwrap();
+    assert!(cursor_after.last_error.is_none());
+    assert!(cursor_after.next_search_at.is_some());
+}

@@ -1,11 +1,9 @@
-//! Download worker: bounded-concurrency image download with retry,
-//! adoption, and crash recovery.
+//! Download worker and orchestrator.
 //!
-//! Implemented in Phase 7.
-//!
-//! Provides `DownloadWorker` which coordinates atomic claims, concurrent
-//! external work, retry decisions, and durable completion/failure
-//! transitions.  Phase 8 will later add discovery/search orchestration.
+//! - `mod.rs` (Phase 7): `DownloadWorker` — bounded-concurrency image
+//!   download with retry, adoption, and crash recovery.
+//! - `orchestration.rs` (Phase 8): `DownloaderOrchestrator` — discovery,
+//!   cursor-based search, download draining, and continuous polling.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +20,14 @@ use crate::filesystem::{
     self, FilePreparation, image_destination, remove_final_file, safe_io_error,
 };
 use crate::nvr::ImageDownloadClient;
+
+// ── Phase 8 orchestration submodule ───────────────────────────────────────
+
+pub mod orchestration;
+pub use orchestration::{
+    CameraSearchFailure, CameraSearchReport, DownloaderOrchestrator, DownloaderOrchestratorOptions,
+    DownloaderPassReport,
+};
 
 // ── DownloadWorkerOptions ─────────────────────────────────────────────────
 

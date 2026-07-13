@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 // ── Identifiers ────────────────────────────────────────────────────────────
 
 /// Internal database identifier for a camera.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub struct CameraId(i64);
 
 impl CameraId {

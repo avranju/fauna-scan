@@ -7,6 +7,8 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn cmd() -> Command {
     let mut cmd = Command::cargo_bin("fauna-scan").unwrap();
@@ -208,6 +210,83 @@ enabled = false
     );
 }
 
+#[tokio::test]
+async fn download_once_honors_explicit_config_path_and_reaches_dispatch() {
+    const DIGEST_CHALLENGE: &str = "Digest realm=\"Hikvision\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", algorithm=MD5, qop=\"auth\"";
+    let server = MockServer::start().await;
+    let discovery = r#"<StreamingChannelList xmlns="http://www.hikvision.com/ver20/XMLSchema"><StreamingChannel><id>ch1</id><trackID>101</trackID></StreamingChannel></StreamingChannelList>"#;
+    Mock::given(method("GET"))
+        .and(path("/ISAPI/Streaming/channels"))
+        .respond_with(move |request: &wiremock::Request| {
+            if request.headers.contains_key("authorization") {
+                ResponseTemplate::new(200).set_body_string(discovery)
+            } else {
+                ResponseTemplate::new(401).insert_header("WWW-Authenticate", DIGEST_CHALLENGE)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("selected.sqlite3");
+    let output_dir = dir.path().join("images");
+    let config_path = dir.path().join("selected.toml");
+    let url = url::Url::parse(&server.uri()).unwrap();
+    let config = format!(
+        r#"[general]
+database_path = "{}"
+output_directory = "{}"
+log_level = "error"
+
+[nvr]
+scheme = "{}"
+host = "{}"
+port = {}
+username = "admin"
+password = "correct-pass"
+start_at = "{}"
+
+[nvr.search]
+window_minutes = 60
+max_results = 50
+poll_interval_seconds = 1
+poll_overlap_seconds = 1
+camera_refresh_interval_seconds = 60
+settlement_delay_seconds = 1
+
+[classifier]
+enabled = false
+"#,
+        db_path.display(),
+        output_dir.display(),
+        url.scheme(),
+        url.host_str().unwrap(),
+        url.port().unwrap(),
+        (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    // No search response is mounted intentionally: discovery succeeds and
+    // the command reaches operational search dispatch before failing.
+    cmd()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("download")
+        .arg("--once")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("cannot read configuration file")
+                .not()
+                .and(predicate::str::contains("search")),
+        );
+
+    let database = fauna_scan::database::Database::open(&db_path)
+        .await
+        .unwrap();
+    assert_eq!(database.ops().list_active_cameras().await.unwrap().len(), 1);
+}
+
 // ── Other commands (still not-yet-implemented) ────────────────────────────
 
 #[test]
@@ -237,12 +316,19 @@ fn discover_no_longer_not_implemented() {
 
 #[test]
 fn download_once_exits_nonzero_with_message() {
+    // download --once is now operational; without a valid config it
+    // fails at configuration loading, not at the "not implemented" stage.
     cmd()
         .arg("download")
         .arg("--once")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", "/nonexistent-home-for-test-12345")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("download"));
+        .stderr(
+            predicate::str::contains("cannot read configuration file")
+                .or(predicate::str::contains("configuration file")),
+        );
 }
 
 #[test]
