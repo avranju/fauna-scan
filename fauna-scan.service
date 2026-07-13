@@ -1,0 +1,24 @@
+[Unit]
+Description=Fauna Scan Hikvision wildlife image classifier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Install the binary at %h/.local/bin/fauna-scan and adjust the config path if needed.
+ExecStart=%h/.local/bin/fauna-scan --config %h/.config/fauna-scan/config.toml run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# These paths must match general.database_path and general.output_directory.
+# Edit both directives when the example configuration uses different locations.
+ReadWritePaths=%h/.local/state/fauna-scan
+ReadWritePaths=%h/Pictures/fauna-scan
+
+[Install]
+WantedBy=default.target

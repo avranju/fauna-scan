@@ -1,0 +1,62 @@
+# Fauna Scan example configuration. Replace every /home/user path and create
+# the referenced secret files before running `fauna-scan check-config`.
+# For each secret, use exactly one of literal, *_file, or *_env; file-backed
+# secrets are recommended for production and must never be committed.
+
+[general]
+database_path = "/home/user/.local/state/fauna-scan/fauna-scan.sqlite3"
+output_directory = "/home/user/Pictures/fauna-scan"
+log_level = "info"
+
+[nvr]
+scheme = "http"
+host = "pigate"
+port = 8080
+username = "admin"
+password_file = "/home/user/.config/fauna-scan/nvr-password"
+# password, password_file, and password_env are mutually exclusive.
+start_at = "2026-07-11T00:00:00+05:30"
+request_timeout_seconds = 30
+connect_timeout_seconds = 10
+allow_invalid_tls_certificates = false
+
+[nvr.search]
+window_minutes = 60
+max_results = 50
+poll_interval_seconds = 60
+poll_overlap_seconds = 120
+camera_refresh_interval_seconds = 3600
+settlement_delay_seconds = 10
+
+[nvr.download]
+retry_limit = 10
+retry_initial_delay_seconds = 5
+retry_max_delay_seconds = 300
+maximum_image_size_bytes = 25000000
+verify_jpeg = true
+rebase_playback_urls = true
+concurrency = 2
+# Only needed when rebase_playback_urls = false.
+playback_host_allowlist = []
+
+[classifier]
+enabled = true
+base_url = "http://localhost:8081/v1"
+endpoint = "/chat/completions"
+model = "vision-model"
+api_key_file = "/home/user/.config/fauna-scan/classifier-api-key"
+# api_key, api_key_file, and api_key_env are mutually exclusive.
+username = ""
+# Set password_file (or password/password_env) only when Basic authentication is used.
+# password, password_file, and password_env are mutually exclusive.
+request_timeout_seconds = 120
+poll_interval_seconds = 10
+retry_limit = 5
+retry_initial_delay_seconds = 10
+retry_max_delay_seconds = 300
+processing_lease_seconds = 600
+prompt_version = "wildlife-v1"
+
+[classifier.generation]
+temperature = 0.1
+max_tokens = 1000
