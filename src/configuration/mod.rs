@@ -971,6 +971,43 @@ fn validate_config(config: &Config) -> AppResult<()> {
                 "classifier.retry_initial_delay_seconds must not exceed retry_max_delay_seconds",
             ));
         }
+
+        // Processing lease must exceed the classifier request timeout so that
+        // the lease does not expire while a classification request is still
+        // in flight.  The lease begins when work is claimed (before file
+        // loading and request construction), while the HTTP timeout begins
+        // later; the lease must provide headroom to prevent concurrent
+        // classification of the same image.
+        if config.classifier.processing_lease_seconds <= config.classifier.request_timeout_seconds {
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "validate_config",
+                format!(
+                    "classifier.processing_lease_seconds ({}) must be greater than \
+                     classifier.request_timeout_seconds ({}) to provide lease headroom",
+                    config.classifier.processing_lease_seconds,
+                    config.classifier.request_timeout_seconds
+                ),
+            ));
+        }
+
+        // Reject leases so large that adding them to a DateTime<Utc> could
+        // overflow Chrono's bounds.  Chrono's DateTime<Utc> wraps at year
+        // 262143, so any lease that would push a year-2000 date past that
+        // bound is rejected.  We conservatively reject anything over
+        // 100 years (3_155_760_000 s).
+        const MAX_LEASE_SECS: u64 = 3_155_760_000;
+        if config.classifier.processing_lease_seconds > MAX_LEASE_SECS {
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "validate_config",
+                format!(
+                    "classifier.processing_lease_seconds ({}) exceeds \
+                     maximum supported duration ({MAX_LEASE_SECS} seconds, ~100 years)",
+                    config.classifier.processing_lease_seconds
+                ),
+            ));
+        }
     }
 
     Ok(())

@@ -109,7 +109,12 @@ pub struct DiscoveredImage {
 }
 
 /// Full durable image row including download and processing state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// This type intentionally does NOT derive `Debug` because
+/// `processing_last_raw_response` may contain classifier output that
+/// must never appear in logs or debug output.  A manual `Debug` impl
+/// reports only the presence/length of the raw response.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ImageRecord {
     pub id: ImageId,
     pub image_key: ImageKey,
@@ -136,12 +141,63 @@ pub struct ImageRecord {
     pub processing_started_at: Option<Timestamp>,
     pub processing_completed_at: Option<Timestamp>,
     pub processing_last_error: Option<String>,
+    /// Latest available raw classifier response for failed processing attempts.
+    ///
+    /// Stored only for diagnostic purposes — never logged.
+    pub processing_last_raw_response: Option<String>,
+    pub processing_generation: i64,
     pub processing_next_attempt_at: Option<Timestamp>,
     pub processing_lease_until: Option<Timestamp>,
 
     pub discovered_at: Timestamp,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+// Manual Debug for ImageRecord — omits the raw classifier response body
+// to prevent accidental logging of diagnostic payload data.
+impl std::fmt::Debug for ImageRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageRecord")
+            .field("id", &self.id)
+            .field("image_key", &self.image_key)
+            .field("camera_id", &self.camera_id)
+            .field("track_id", &self.track_id)
+            .field("capture_start_at", &self.capture_start_at)
+            .field("capture_end_at", &self.capture_end_at)
+            .field("local_path", &self.local_path)
+            .field("download_status", &self.download_status)
+            .field("download_attempts", &self.download_attempts)
+            .field("downloaded_at", &self.downloaded_at)
+            .field("download_last_error", &self.download_last_error)
+            .field("download_next_attempt_at", &self.download_next_attempt_at)
+            .field("download_lease_until", &self.download_lease_until)
+            .field("processing_status", &self.processing_status)
+            .field("processing_attempts", &self.processing_attempts)
+            .field("processing_started_at", &self.processing_started_at)
+            .field("processing_completed_at", &self.processing_completed_at)
+            .field("processing_last_error", &self.processing_last_error)
+            .field(
+                "processing_last_raw_response",
+                &format!(
+                    "{} bytes",
+                    self.processing_last_raw_response
+                        .as_ref()
+                        .map(|s| s.len())
+                        .unwrap_or(0)
+                ),
+            )
+            .field("processing_generation", &self.processing_generation)
+            .field(
+                "processing_next_attempt_at",
+                &self.processing_next_attempt_at,
+            )
+            .field("processing_lease_until", &self.processing_lease_until)
+            .field("discovered_at", &self.discovered_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 // ── Work claims ────────────────────────────────────────────────────────────
@@ -173,6 +229,7 @@ pub struct ProcessingClaim {
     pub image_key: ImageKey,
     pub local_path: PathBuf,
     pub processing_attempts: i64,
+    pub generation: i64,
     pub lease_until: Timestamp,
 }
 
@@ -197,7 +254,10 @@ pub enum ProcessingFailureDisposition {
 // ── Classification ─────────────────────────────────────────────────────────
 
 /// Validated classifier result carried into the atomic completion transaction.
-#[derive(Debug, Clone)]
+///
+/// Manual Debug impl omits `raw_response` to prevent accidental logging
+/// of classifier output data.
+#[derive(Clone)]
 pub struct ClassificationInput {
     pub model: String,
     pub prompt_version: String,
@@ -213,7 +273,10 @@ pub struct ClassificationInput {
 }
 
 /// Persisted classification result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Manual Debug impl omits `raw_response` to prevent accidental logging
+/// of classifier output data.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ClassificationRecord {
     pub id: ClassificationId,
     pub image_id: ImageId,
@@ -229,6 +292,65 @@ pub struct ClassificationRecord {
     pub request_started_at: Timestamp,
     pub request_completed_at: Timestamp,
     pub created_at: Timestamp,
+}
+
+// Manual Debug for ClassificationInput — omits raw_response.
+impl std::fmt::Debug for ClassificationInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassificationInput")
+            .field("model", &self.model)
+            .field("prompt_version", &self.prompt_version)
+            .field("contains_wildlife", &self.contains_wildlife)
+            .field("is_interesting", &self.is_interesting)
+            .field("summary", &self.summary)
+            .field(
+                "species_json_len",
+                &self.species_json.as_ref().map(|s| s.len()),
+            )
+            .field("confidence", &self.confidence)
+            .field(
+                "classification_json_len",
+                &self.classification_json.as_ref().map(|s| s.len()),
+            )
+            .field(
+                "raw_response_len",
+                &self.raw_response.as_ref().map(|s| s.len()),
+            )
+            .field("request_started_at", &self.request_started_at)
+            .field("request_completed_at", &self.request_completed_at)
+            .finish()
+    }
+}
+
+// Manual Debug for ClassificationRecord — omits raw_response.
+impl std::fmt::Debug for ClassificationRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassificationRecord")
+            .field("id", &self.id)
+            .field("image_id", &self.image_id)
+            .field("model", &self.model)
+            .field("prompt_version", &self.prompt_version)
+            .field("contains_wildlife", &self.contains_wildlife)
+            .field("is_interesting", &self.is_interesting)
+            .field("summary", &self.summary)
+            .field(
+                "species_json_len",
+                &self.species_json.as_ref().map(|s| s.len()),
+            )
+            .field("confidence", &self.confidence)
+            .field(
+                "classification_json_len",
+                &self.classification_json.as_ref().map(|s| s.len()),
+            )
+            .field(
+                "raw_response_len",
+                &self.raw_response.as_ref().map(|s| s.len()),
+            )
+            .field("request_started_at", &self.request_started_at)
+            .field("request_completed_at", &self.request_completed_at)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 // ── Search cursor ──────────────────────────────────────────────────────────
@@ -356,3 +478,178 @@ pub struct LeaseRecoveryCounts {
 // cursor_row_to_record.  The old parse_ts_or_panic helper has been removed
 // so that malformed timestamps are reported as database errors rather than
 // panicking.
+
+// ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{DownloadStatus, ProcessingStatus, Timestamp};
+    use chrono::Utc;
+
+    fn sample_image_record(raw_response: Option<String>) -> ImageRecord {
+        ImageRecord {
+            id: ImageId::new(1),
+            image_key: ImageKey::new("sentinel-key"),
+            camera_id: CameraId::new(1),
+            track_id: TrackId::new("103"),
+            capture_start_at: Timestamp::new(Utc::now()),
+            capture_end_at: None,
+            playback_uri: "http://nvr/pic/1".to_string(),
+            canonical_playback_uri: "http://nvr/pic/1".to_string(),
+            codec_type: Some("jpeg".to_string()),
+            content_type: Some("picture".to_string()),
+            nvr_reported_size: Some(1000),
+            local_path: Some(PathBuf::from("/tmp/test.jpg")),
+            download_status: DownloadStatus::Downloaded,
+            download_attempts: 1,
+            downloaded_at: Some(Timestamp::new(Utc::now())),
+            download_last_error: None,
+            download_next_attempt_at: None,
+            download_lease_until: None,
+            processing_status: ProcessingStatus::Processing,
+            processing_attempts: 1,
+            processing_started_at: Some(Timestamp::new(Utc::now())),
+            processing_completed_at: None,
+            processing_last_error: Some("test error".to_string()),
+            processing_last_raw_response: raw_response,
+            processing_generation: 1,
+            processing_next_attempt_at: None,
+            processing_lease_until: Some(Timestamp::new(Utc::now())),
+            discovered_at: Timestamp::new(Utc::now()),
+            created_at: Timestamp::new(Utc::now()),
+            updated_at: Timestamp::new(Utc::now()),
+        }
+    }
+
+    #[test]
+    fn image_record_debug_omits_raw_response() {
+        let record = sample_image_record(Some(
+            "{\"model_output\": \"SENTINEL-CLASSIFIER-OUTPUT\"}".to_string(),
+        ));
+        let debug_str = format!("{record:?}");
+        // The raw response body must NOT appear in Debug output.
+        assert!(
+            !debug_str.contains("SENTINEL-CLASSIFIER-OUTPUT"),
+            "Debug output leaked raw response body: {debug_str}"
+        );
+        // But the length should be reported.
+        assert!(
+            debug_str.contains("bytes"),
+            "Debug output should report raw response length: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn image_record_debug_no_raw_response() {
+        let record = sample_image_record(None);
+        let debug_str = format!("{record:?}");
+        assert!(debug_str.contains("0 bytes"));
+    }
+
+    // ── ClassificationInput Debug ─────────────────────────────────────────
+
+    #[test]
+    fn classification_input_debug_omits_raw_response() {
+        let input = ClassificationInput {
+            model: "vision-v1".to_string(),
+            prompt_version: "wildlife-v1".to_string(),
+            contains_wildlife: true,
+            is_interesting: true,
+            summary: Some("A deer".to_string()),
+            species_json: Some(r#"[{"name":"deer","confidence":0.9}]"#.to_string()),
+            confidence: Some(0.9),
+            classification_json: None,
+            raw_response: Some("SENTINEL-CLASSIFIER-RAW-RESPONSE".to_string()),
+            request_started_at: Timestamp::new(Utc::now()),
+            request_completed_at: Timestamp::new(Utc::now()),
+        };
+        let debug_str = format!("{input:?}");
+        // The raw response body must NOT appear.
+        assert!(
+            !debug_str.contains("SENTINEL-CLASSIFIER-RAW-RESPONSE"),
+            "Debug output leaked raw response: {debug_str}"
+        );
+        // But length should be reported.
+        assert!(
+            debug_str.contains("raw_response_len"),
+            "Debug should report raw_response_len: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn classification_input_debug_no_raw_response() {
+        let input = ClassificationInput {
+            model: "vision-v1".to_string(),
+            prompt_version: "wildlife-v1".to_string(),
+            contains_wildlife: false,
+            is_interesting: false,
+            summary: None,
+            species_json: None,
+            confidence: None,
+            classification_json: None,
+            raw_response: None,
+            request_started_at: Timestamp::new(Utc::now()),
+            request_completed_at: Timestamp::new(Utc::now()),
+        };
+        let debug_str = format!("{input:?}");
+        assert!(debug_str.contains("raw_response_len"));
+        assert!(debug_str.contains("None"));
+    }
+
+    // ── ClassificationRecord Debug ────────────────────────────────────────
+
+    #[test]
+    fn classification_record_debug_omits_raw_response() {
+        let record = ClassificationRecord {
+            id: ClassificationId::new(1),
+            image_id: ImageId::new(1),
+            model: "vision-v1".to_string(),
+            prompt_version: "wildlife-v1".to_string(),
+            contains_wildlife: true,
+            is_interesting: true,
+            summary: Some("A deer".to_string()),
+            species_json: Some(r#"[{"name":"deer","confidence":0.9}]"#.to_string()),
+            confidence: Some(0.9),
+            classification_json: None,
+            raw_response: Some("SENTINEL-CLASSIFIER-RAW-RESPONSE".to_string()),
+            request_started_at: Timestamp::new(Utc::now()),
+            request_completed_at: Timestamp::new(Utc::now()),
+            created_at: Timestamp::new(Utc::now()),
+        };
+        let debug_str = format!("{record:?}");
+        // The raw response body must NOT appear.
+        assert!(
+            !debug_str.contains("SENTINEL-CLASSIFIER-RAW-RESPONSE"),
+            "Debug output leaked raw response: {debug_str}"
+        );
+        // But length should be reported.
+        assert!(
+            debug_str.contains("raw_response_len"),
+            "Debug should report raw_response_len: {debug_str}"
+        );
+    }
+
+    #[test]
+    fn classification_record_debug_no_raw_response() {
+        let record = ClassificationRecord {
+            id: ClassificationId::new(1),
+            image_id: ImageId::new(1),
+            model: "vision-v1".to_string(),
+            prompt_version: "wildlife-v1".to_string(),
+            contains_wildlife: false,
+            is_interesting: false,
+            summary: None,
+            species_json: None,
+            confidence: None,
+            classification_json: None,
+            raw_response: None,
+            request_started_at: Timestamp::new(Utc::now()),
+            request_completed_at: Timestamp::new(Utc::now()),
+            created_at: Timestamp::new(Utc::now()),
+        };
+        let debug_str = format!("{record:?}");
+        assert!(debug_str.contains("raw_response_len"));
+        assert!(debug_str.contains("None"));
+    }
+}

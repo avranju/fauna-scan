@@ -14,6 +14,7 @@ use crate::downloader::orchestration::{DownloaderOrchestrator, DownloaderOrchest
 use crate::downloader::{DownloadWorker, DownloadWorkerOptions};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::nvr::{CameraDiscoveryClient, ImageDownloadClient, NvrTransport};
+use crate::scanner::{Scanner, ScannerOptions};
 
 /// Execute the selected command.
 ///
@@ -24,7 +25,7 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
         Command::CheckConfig => handle_check_config(config_path),
         Command::Discover => handle_discover(config_path).await,
         Command::Download(args) => handle_download(args, config_path).await,
-        Command::Scan(_) => Err(AppError::not_implemented("scan")),
+        Command::Scan(args) => handle_scan(args, config_path).await,
         Command::Status => Err(AppError::not_implemented("status")),
     }
 }
@@ -32,7 +33,13 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
 /// Handle the `check-config` command.
 ///
 /// Loads, resolves, and validates the configuration without contacting
-/// external services or creating directories.
+/// external services or creating directories.  Scanner-specific policy
+/// (disabled classifier, lease relationships, maximum duration) is
+/// validated during `Config::load` via `validate_config` for shared
+/// classifier settings, and in `ScannerOptions::from_config` for
+/// scanner-only checks.  This allows `check-config` to accept a
+/// disabled classifier (valid for other commands) while still
+/// rejecting invalid lease configurations.
 fn handle_check_config(config_path: Option<&Path>) -> AppResult<()> {
     let config = Config::load(config_path)?;
 
@@ -298,6 +305,49 @@ fn create_runtime_directories(config: &Config) -> AppResult<()> {
     })?;
 
     Ok(())
+}
+
+/// Handle the `scan` subcommand.
+///
+/// Loads configuration, rejects a disabled classifier **before** creating
+/// directories or opening the database (so the classifier-disabled error
+/// is always the first and clearest failure), then constructs
+/// ClassifierClient and ScannerOptions, and either executes one finite
+/// pass (`--once`) or enters continuous polling.
+async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> AppResult<()> {
+    // Load and validate configuration.
+    let config = Config::load(config_path)?;
+
+    // Reject a disabled classifier immediately — before any filesystem
+    // mutation or database open.  This guarantees the classifier-disabled
+    // error is never masked by downstream errors and that a disabled
+    // invocation has no side effects.
+    ScannerOptions::from_config(&config)?;
+
+    // Create runtime directories (database parent and output directory).
+    create_runtime_directories(&config)?;
+
+    // Open the database (applies migrations).
+    let database = Database::open(&config.general.database_path).await?;
+
+    // Build the classifier client — also rejects disabled classifier.
+    let classifier = crate::classifier::ClassifierClient::from_config(&config.classifier)?;
+
+    // Build scanner options from config (also rejects disabled classifier).
+    let options = ScannerOptions::from_config(&config)?;
+
+    // Build scanner.
+    let scanner = Scanner::new(database.ops(), Arc::new(classifier), options);
+
+    if args.once {
+        // One finite pass: drain all currently eligible images.
+        let report = scanner.execute_one_pass().await?;
+        println!("{report}");
+        Ok(())
+    } else {
+        // Continuous scanning loop.
+        scanner.run_continuous().await
+    }
 }
 
 /// Strip potentially sensitive details from an io::Error message.

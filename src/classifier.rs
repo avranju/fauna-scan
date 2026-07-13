@@ -8,6 +8,7 @@
 use std::fmt;
 
 use base64::Engine;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
@@ -79,6 +80,15 @@ pub struct ClassifierError {
 
 // ── ClassifierClient ───────────────────────────────────────────────────────
 
+/// A prepared (but not yet sent) classification HTTP request.
+///
+/// Created by `build_classification_request` so that callers can renew
+/// their processing lease between preparation and submission.
+pub struct PreparedClassificationRequest {
+    /// The built HTTP request ready to be sent.
+    request: reqwest::RequestBuilder,
+}
+
 /// Configured OpenAI-compatible vision classifier client.
 #[derive(Debug)]
 pub struct ClassifierClient {
@@ -100,6 +110,78 @@ pub struct ClassifierClient {
     max_tokens: u32,
     /// Version identifier for the prompts.
     prompt_version: String,
+}
+
+/// Read a `reqwest::Response` body incrementally, rejecting once
+/// `MAX_RESPONSE_BYTES + 1` bytes are observed.
+///
+/// Uses the chunk-based streaming API so that even a fast oversized
+/// response cannot consume arbitrary memory.  `Content-Length` is
+/// checked first as an early shortcut, but the chunk-level guard is
+/// the authoritative enforcement.
+async fn read_response_body_bounded(
+    response: &mut reqwest::Response,
+    status: u16,
+) -> Result<Bytes, ClassifierError> {
+    let mut total = 0u64;
+    let limit = ClassifierClient::MAX_RESPONSE_BYTES;
+
+    // Use a Vec<u8> to collect chunks, then convert to Bytes.
+    // This avoids allocating a separate Bytes for each chunk.
+    let mut buf = Vec::new();
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                total = match total.checked_add(chunk.len() as u64) {
+                    Some(n) => n,
+                    None => {
+                        // Overflow — body is definitely too large.
+                        let app_err = AppError::new(
+                            ErrorCategory::ClassifierTransport,
+                            "get_raw_response",
+                            "classifier response body exceeds maximum allowed size",
+                        );
+                        return Err(ClassifierError {
+                            error: app_err,
+                            disposition: oversized_response_disposition(status),
+                            raw_response: None,
+                        });
+                    }
+                };
+                if total > limit {
+                    let app_err = AppError::new(
+                        classify_status_category(status),
+                        "get_raw_response",
+                        "classifier response body exceeds maximum allowed size",
+                    )
+                    .with_http_status(status);
+                    return Err(ClassifierError {
+                        error: app_err,
+                        disposition: oversized_response_disposition(status),
+                        raw_response: None,
+                    });
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_e) => {
+                let app_err = AppError::new(
+                    ErrorCategory::ClassifierTransport,
+                    "get_raw_response",
+                    "failed to read classifier response body chunk",
+                );
+                return Err(ClassifierError {
+                    error: app_err,
+                    disposition: RetryDisposition::Retryable,
+                    raw_response: None,
+                });
+            }
+        }
+    }
+
+    // Convert the collected Vec to Bytes.
+    Ok(Bytes::from(buf))
 }
 
 impl ClassifierClient {
@@ -149,14 +231,19 @@ impl ClassifierClient {
         })
     }
 
-    /// Submit a JPEG image for wildlife classification.
+    /// Encode a JPEG image into a prepared HTTP request body.
     ///
-    /// Encodes the JPEG as a Base64 data URL, builds the chat-completions
-    /// request, applies authentication headers, and returns the validated
-    /// classification or a categorized error.
-    pub async fn classify_jpeg(&self, jpeg: &[u8]) -> Result<ClassifierOutput, ClassifierError> {
-        let operation = "classify_jpeg";
-
+    /// This is the synchronous preparation phase that converts the JPEG
+    /// into a Base64 data URL and builds the chat-completions request.
+    /// It does NOT send the HTTP request.
+    ///
+    /// Callers should renew their processing lease after calling this
+    /// method and before calling `submit_classification` so that the
+    /// HTTP request is bounded by the lease duration.
+    pub fn build_classification_request(
+        &self,
+        jpeg: &[u8],
+    ) -> Result<PreparedClassificationRequest, ClassifierError> {
         // Encode JPEG as Base64 data URL.
         let encoded = base64::engine::general_purpose::STANDARD.encode(jpeg);
         let image_url = format!("data:image/jpeg;base64,{encoded}");
@@ -175,7 +262,7 @@ impl ClassifierClient {
             raw_response: None,
         })?;
 
-        // Build the HTTP request.
+        // Build the HTTP request (but do not send it).
         let request = build_request(
             &self.http,
             &self.endpoint_url,
@@ -190,15 +277,46 @@ impl ClassifierClient {
             raw_response: None,
         })?;
 
+        Ok(PreparedClassificationRequest { request })
+    }
+
+    /// Maximum classifier response body size (10 MB).
+    ///
+    /// Applied incrementally during body transfer so that a fast oversized
+    /// response cannot consume arbitrary memory, for both successful and
+    /// non-success statuses.
+    const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+
+    /// Send a prepared classification request and return the raw HTTP response
+    /// bytes.
+    ///
+    /// This method handles the HTTP transport phase only — it sends the
+    /// request, reads the response body incrementally, and returns the raw
+    /// bytes.  It does NOT perform UTF-8 conversion, JSON parsing, extraction,
+    /// or validation.
+    ///
+    /// **Incremental body reading:** The response body is read in chunks and
+    /// rejected as soon as `MAX_RESPONSE_BYTES + 1` bytes are observed, for
+    /// both successful and non-success statuses.  `Content-Length` is used as
+    /// an early check when available, but the incremental guard is the
+    /// authoritative enforcement.
+    ///
+    /// Callers should renew their processing lease immediately after calling
+    /// this method (before any CPU-heavy response processing) so that the
+    /// lease does not expire during classification parsing.
+    ///
+    /// Returns `ClassifierError` for transport failures, oversized bodies,
+    /// invalid UTF-8, non-success HTTP status, and body transfer failures.
+    pub async fn get_raw_response(
+        &self,
+        prepared: PreparedClassificationRequest,
+    ) -> Result<Bytes, ClassifierError> {
+        let operation = "get_raw_response";
+
         // Send the request.
-        let response = match request.send().await {
+        let mut response = match prepared.request.send().await {
             Ok(resp) => resp,
             Err(e) => {
-                // Map the reqwest error to a ClassifierTransport failure.
-                // This ensures that timeout, DNS, connection, and other
-                // transport failures are all consistently categorized as
-                // ClassifierTransport rather than leaking Timeout or Network
-                // categories from the shared HTTP layer.
                 let app_err = map_classifier_transport_error(operation, e);
                 return Err(ClassifierError {
                     error: app_err,
@@ -209,31 +327,94 @@ impl ClassifierClient {
         };
 
         let status = response.status().as_u16();
-        let category = classify_status_category(status);
-        let disposition = classify_status_disposition(status);
 
-        // Read the response body as raw bytes, then convert with strict UTF-8.
-        let raw_bytes = match response.bytes().await {
-            Ok(bytes) => bytes.to_vec(),
-            Err(_e) => {
-                // Body transfer failure — retryable.
-                let app_err = AppError::new(
-                    ErrorCategory::ClassifierTransport,
-                    operation,
-                    "failed to read classifier response body",
-                );
-                return Err(ClassifierError {
-                    error: app_err,
-                    disposition: RetryDisposition::Retryable,
-                    raw_response: None,
-                });
-            }
+        // Early Content-Length check — if the header is present and already
+        // exceeds the limit, reject immediately without reading the body.
+        // Preserve the HTTP status disposition for oversized non-success
+        // responses: authentication/authorization and other permanent HTTP
+        // failures must not consume retry attempts.  Successful responses
+        // remain retryable classifier-response failures.
+        if let Some(content_length) = response.content_length()
+            && content_length > Self::MAX_RESPONSE_BYTES
+        {
+            let category = classify_status_category(status);
+            let app_err = AppError::new(
+                category,
+                operation,
+                "classifier response Content-Length exceeds maximum allowed size",
+            )
+            .with_http_status(status);
+            // Do not call `bytes()` here: Content-Length is untrusted and
+            // the body may be arbitrarily large. Dropping the response is
+            // preferable to buffering it after the early rejection.
+            return Err(ClassifierError {
+                error: app_err,
+                disposition: oversized_response_disposition(status),
+                raw_response: None,
+            });
+        }
+
+        // Read the response body incrementally, enforcing the size limit at
+        // the byte-stream level.  This prevents a fast oversized response
+        // from consuming arbitrary memory, for both 2xx and non-2xx statuses.
+        let raw_bytes = match read_response_body_bounded(&mut response, status).await {
+            Ok(bytes) => bytes,
+            Err(classifier_err) => return Err(classifier_err),
         };
 
-        let raw_response = match String::from_utf8(raw_bytes) {
+        // Non-success HTTP status — convert body to String in a blocking
+        // thread to prevent a large error body from blocking the async
+        // runtime.  The body size is already bounded by the incremental
+        // reader, so we only need to clamp the conversion for safety.
+        if !(200..300).contains(&status) {
+            let status_for_fn = status;
+            let body_for_fn = raw_bytes;
+            let raw_response = tokio::task::spawn_blocking(move || {
+                let len = body_for_fn.len().min(Self::MAX_RESPONSE_BYTES as usize);
+                match String::from_utf8(body_for_fn[..len].to_vec()) {
+                    Ok(text) => text,
+                    Err(_e) => "<non-UTF-8 response body>".to_string(),
+                }
+            })
+            .await
+            .unwrap_or_else(|_| "<conversion panicked>".to_string());
+
+            let category = classify_status_category(status_for_fn);
+            let disposition = classify_status_disposition(status_for_fn);
+            let app_err = AppError::new(
+                category,
+                operation,
+                "classifier returned non-success status",
+            )
+            .with_http_status(status_for_fn);
+            return Err(ClassifierError {
+                error: app_err,
+                disposition,
+                raw_response: Some(raw_response),
+            });
+        }
+
+        // Successful status — return Bytes directly without cloning or
+        // UTF-8 conversion so the async worker is not blocked on CPU work.
+        Ok(raw_bytes)
+    }
+
+    /// Parse raw classifier response bytes into a validated `ClassifierOutput`.
+    ///
+    /// This method performs UTF-8 conversion, JSON parsing, classification
+    /// extraction, and validation.  It is CPU-heavy and should be called
+    /// AFTER the processing lease has been renewed.
+    ///
+    /// `raw_bytes` must be the raw HTTP response bytes returned by
+    /// `get_raw_response`.
+    pub fn parse_response(&self, raw_bytes: Bytes) -> Result<ClassifierOutput, ClassifierError> {
+        let operation = "parse_response";
+
+        // UTF-8 conversion — done here (in spawn_blocking) so the async
+        // worker is not blocked on CPU work.
+        let raw_response = match String::from_utf8(raw_bytes.to_vec()) {
             Ok(text) => text,
             Err(_e) => {
-                // Invalid UTF-8 is a retryable response error.
                 let app_err = AppError::new(
                     ErrorCategory::ClassifierResponse,
                     operation,
@@ -247,22 +428,7 @@ impl ClassifierClient {
             }
         };
 
-        // Non-success HTTP status — return before JSON extraction.
-        if !(200..300).contains(&status) {
-            let app_err = AppError::new(
-                category,
-                operation,
-                "classifier returned non-success status",
-            )
-            .with_http_status(status);
-            return Err(ClassifierError {
-                error: app_err,
-                disposition,
-                raw_response: Some(raw_response),
-            });
-        }
-
-        // Successful response — extract and validate classification.
+        // Parse JSON.
         let root = match serde_json::from_str::<Value>(&raw_response) {
             Ok(v) => v,
             Err(_) => {
@@ -279,6 +445,7 @@ impl ClassifierClient {
             }
         };
 
+        // Extract classification.
         let classification_value = match extract_classification_value(root) {
             Ok(v) => v,
             Err(e) => {
@@ -290,6 +457,7 @@ impl ClassifierClient {
             }
         };
 
+        // Validate classification.
         let (classification, classification_json) =
             match validate_classification(classification_value) {
                 Ok(pair) => pair,
@@ -307,6 +475,37 @@ impl ClassifierClient {
             classification_json,
             raw_response,
         })
+    }
+
+    /// Send a prepared classification request and return the validated result.
+    ///
+    /// This is the async HTTP submission phase.  Callers must have renewed
+    /// their processing lease immediately before calling this method so that
+    /// the request is bounded by the lease duration.
+    ///
+    /// Internally uses `get_raw_response` + `parse_response` to allow
+    /// callers to renew the lease between HTTP response and CPU-heavy parsing.
+    ///
+    /// `get_raw_response` returns `Bytes` directly for successful statuses
+    /// without cloning or UTF-8 conversion, so the async worker is not
+    /// blocked on CPU work during response-body handling.
+    pub async fn submit_classification(
+        &self,
+        prepared: PreparedClassificationRequest,
+    ) -> Result<ClassifierOutput, ClassifierError> {
+        let raw_bytes = self.get_raw_response(prepared).await?;
+        self.parse_response(raw_bytes)
+    }
+
+    /// Submit a JPEG image for wildlife classification.
+    ///
+    /// Convenience method that combines `build_classification_request` and
+    /// `submit_classification` into a single call.  Callers that need to
+    /// renew their processing lease between preparation and submission
+    /// should use the split methods directly.
+    pub async fn classify_jpeg(&self, jpeg: &[u8]) -> Result<ClassifierOutput, ClassifierError> {
+        let prepared = self.build_classification_request(jpeg)?;
+        self.submit_classification(prepared).await
     }
 
     /// Return the assembled endpoint URL for testing.
@@ -1410,9 +1609,32 @@ fn classify_status_disposition(status: u16) -> RetryDisposition {
     }
 }
 
+/// Oversized successful responses are retryable response failures, while an
+/// oversized non-success response keeps the disposition of its HTTP status.
+fn oversized_response_disposition(status: u16) -> RetryDisposition {
+    if (200..300).contains(&status) {
+        RetryDisposition::Retryable
+    } else {
+        classify_status_disposition(status)
+    }
+}
+
 // ── ClassifierError Display/Debug ──────────────────────────────────────────
 
 impl ClassifierError {
+    /// Create a new ClassifierError.
+    pub fn new(
+        error: AppError,
+        disposition: RetryDisposition,
+        raw_response: Option<String>,
+    ) -> Self {
+        Self {
+            error,
+            disposition,
+            raw_response,
+        }
+    }
+
     /// Return the underlying error category.
     pub fn category(&self) -> ErrorCategory {
         self.error.category
@@ -1426,6 +1648,11 @@ impl ClassifierError {
     /// Return true if the failure may be retried.
     pub fn is_retryable(&self) -> bool {
         self.disposition == RetryDisposition::Retryable
+    }
+
+    /// Return the HTTP status code if present.
+    pub fn http_status(&self) -> Option<u16> {
+        self.error.http_status()
     }
 
     /// Return the raw response if available.

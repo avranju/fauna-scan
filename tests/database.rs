@@ -1200,7 +1200,7 @@ async fn classification_completes_processing_and_inserts_classification() {
     };
 
     let class_id = ops
-        .complete_classification(claim.image_id, &classification, &now)
+        .complete_classification(claim.image_id, &classification, claim.generation, &now)
         .await
         .unwrap();
 
@@ -1212,6 +1212,12 @@ async fn classification_completes_processing_and_inserts_classification() {
     assert_eq!(stored.id, class_id);
     assert!(stored.contains_wildlife);
     assert!(stored.is_interesting);
+
+    // Verify persisted timestamps are ordered: started <= completed.
+    assert!(
+        stored.request_started_at <= stored.request_completed_at,
+        "request_started_at must be <= request_completed_at"
+    );
 
     // Verify processing status is done
     let img = ops.get_image(claim.image_id).await.unwrap();
@@ -1279,7 +1285,7 @@ async fn classification_fails_if_not_processing() {
     };
 
     let result = ops
-        .complete_classification(ImageId::new(1), &classification, &now)
+        .complete_classification(ImageId::new(1), &classification, 0, &now)
         .await;
     assert!(result.is_err());
 }
@@ -1364,7 +1370,7 @@ async fn classification_uniqueness_rollback() {
         request_completed_at: now,
     };
 
-    ops.complete_classification(claim.image_id, &classification, &now)
+    ops.complete_classification(claim.image_id, &classification, claim.generation, &now)
         .await
         .unwrap();
 
@@ -1374,7 +1380,7 @@ async fn classification_uniqueness_rollback() {
 
     // Try duplicate classification — should fail and processing should remain done
     let result = ops
-        .complete_classification(claim.image_id, &classification, &now)
+        .complete_classification(claim.image_id, &classification, claim.generation, &now)
         .await;
     assert!(result.is_err());
 
@@ -1452,6 +1458,8 @@ async fn processing_failure_sets_retry_wait_atomically() {
     ops.fail_processing(
         proc_claim.image_id,
         "classification error",
+        None,
+        proc_claim.generation,
         ProcessingFailureDisposition::RetryWait {
             next_attempt_at: retry_at,
         },
@@ -1525,6 +1533,8 @@ async fn processing_invalid_failure_transition_unchanged() {
         .fail_processing(
             ImageId::new(1),
             "error",
+            None,
+            0,
             ProcessingFailureDisposition::RetryWait {
                 next_attempt_at: future_ts(1),
             },
@@ -1942,9 +1952,14 @@ async fn recovery_preserves_downloaded_and_done_rows() {
         request_started_at: now,
         request_completed_at: now,
     };
-    ops.complete_classification(proc_claim.image_id, &classification, &now)
-        .await
-        .unwrap();
+    ops.complete_classification(
+        proc_claim.image_id,
+        &classification,
+        proc_claim.generation,
+        &now,
+    )
+    .await
+    .unwrap();
 
     // Recover — should find nothing
     let counts = ops.recover_expired_leases(&now).await.unwrap();
@@ -2032,6 +2047,8 @@ async fn processing_missing_preserves_download_state() {
     ops.fail_processing(
         proc_claim.image_id,
         "local file not found",
+        None,
+        proc_claim.generation,
         ProcessingFailureDisposition::Missing,
         &now,
     )
@@ -2135,9 +2152,14 @@ async fn status_counts_returns_typed_maps() {
         request_started_at: now,
         request_completed_at: now,
     };
-    ops.complete_classification(proc_claim.image_id, &classification, &now)
-        .await
-        .unwrap();
+    ops.complete_classification(
+        proc_claim.image_id,
+        &classification,
+        proc_claim.generation,
+        &now,
+    )
+    .await
+    .unwrap();
 
     let counts = ops.status_counts().await.unwrap();
     assert_eq!(counts.download.get(&DownloadStatus::Pending), Some(&1));
@@ -3129,9 +3151,14 @@ async fn updated_at_refreshed_on_classification_complete() {
         request_started_at: now,
         request_completed_at: now,
     };
-    ops.complete_classification(proc_claim.image_id, &classification, &later)
-        .await
-        .unwrap();
+    ops.complete_classification(
+        proc_claim.image_id,
+        &classification,
+        proc_claim.generation,
+        &later,
+    )
+    .await
+    .unwrap();
 
     let img_after = ops.get_image(proc_claim.image_id).await.unwrap();
     assert!(
@@ -4027,4 +4054,1075 @@ async fn successful_overlap_replay_clears_cursor_error() {
     let cursor_after = ops.get_cursor(camera_id).await.unwrap().unwrap();
     assert!(cursor_after.last_error.is_none());
     assert!(cursor_after.next_search_at.is_some());
+}
+
+// ── Phase 10: processing failure diagnostic response ────────────────────────
+
+#[tokio::test]
+async fn fail_processing_persists_raw_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-raw-resp"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let proc_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Fail processing with a raw response
+    let raw_body = r#"{"error":{"message":"model not found"}}"#.to_string();
+    ops.fail_processing(
+        proc_claim.image_id,
+        "classifier ClassifierTransport (HTTP 404)",
+        Some(raw_body.clone()),
+        proc_claim.generation,
+        ProcessingFailureDisposition::Failed,
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = ops.get_image(proc_claim.image_id).await.unwrap();
+    assert_eq!(img.processing_status, ProcessingStatus::Failed);
+    assert_eq!(
+        img.processing_last_error,
+        Some("classifier ClassifierTransport (HTTP 404)".to_string())
+    );
+    assert_eq!(img.processing_last_raw_response, Some(raw_body));
+}
+
+#[tokio::test]
+async fn fail_processing_coalesce_preserves_prior_raw_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-coalesce"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let proc_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // First failure: a retryable classifier failure with a raw response.
+    let first_raw = r#"{"error":{"message":"rate limited"}}"#.to_string();
+    ops.fail_processing(
+        proc_claim.image_id,
+        "classifier ClassifierTransport (HTTP 429)",
+        Some(first_raw.clone()),
+        proc_claim.generation,
+        ProcessingFailureDisposition::RetryWait {
+            next_attempt_at: past_ts(1),
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Verify the raw response was stored.
+    let img = ops.get_image(proc_claim.image_id).await.unwrap();
+    assert_eq!(img.processing_last_raw_response, Some(first_raw.clone()));
+
+    // Re-claim processing after the retry_wait transition so the image
+    // is back in processing state for the second failure.
+    let proc_claim2 = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Second failure: a transient filesystem error with no raw response.
+    // COALESCE should preserve the prior raw response.
+    ops.fail_processing(
+        proc_claim2.image_id,
+        "classifier ClassifierTransport",
+        None,
+        proc_claim2.generation,
+        ProcessingFailureDisposition::RetryWait {
+            next_attempt_at: past_ts(2),
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // The prior raw response should still be present.
+    let img = ops.get_image(proc_claim2.image_id).await.unwrap();
+    assert_eq!(img.processing_last_raw_response, Some(first_raw));
+}
+
+#[tokio::test]
+async fn complete_classification_clears_raw_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-clear-raw"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let proc_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Introduce a failure with a raw response.
+    let raw_body = r#"{"error":{"message":"internal error"}}"#.to_string();
+    ops.fail_processing(
+        proc_claim.image_id,
+        "classifier ClassifierTransport (HTTP 500)",
+        Some(raw_body.clone()),
+        proc_claim.generation,
+        ProcessingFailureDisposition::RetryWait {
+            next_attempt_at: past_ts(1),
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Verify raw response is stored.
+    let img = ops.get_image(proc_claim.image_id).await.unwrap();
+    assert_eq!(img.processing_last_raw_response, Some(raw_body.clone()));
+
+    // Re-claim processing after the retry_wait transition so the image
+    // is back in processing state for the successful completion.
+    let proc_claim2 = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Now complete the classification successfully.
+    let classification = ClassificationInput {
+        model: "vision-v1".to_string(),
+        prompt_version: "wildlife-v1".to_string(),
+        contains_wildlife: true,
+        is_interesting: true,
+        summary: Some("A deer in the field".to_string()),
+        species_json: Some(r#"[{"name":"deer","confidence":0.9}]"#.to_string()),
+        confidence: Some(0.9),
+        classification_json: None,
+        raw_response: None,
+        request_started_at: past_ts(1),
+        request_completed_at: now,
+    };
+
+    ops.complete_classification(
+        proc_claim2.image_id,
+        &classification,
+        proc_claim2.generation,
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Verify raw response was cleared.
+    let img = ops.get_image(proc_claim2.image_id).await.unwrap();
+    assert_eq!(img.processing_status, ProcessingStatus::Done);
+    assert!(img.processing_last_raw_response.is_none());
+    assert!(img.processing_last_error.is_none());
+}
+
+// ── Empty response preserves prior diagnostic ────────────────────────────
+
+#[tokio::test]
+async fn empty_response_preserves_prior_diagnostic() {
+    // An empty-body classifier failure (Some("")) must not overwrite a
+    // prior diagnostic response.  The SQL uses COALESCE(NULLIF(?, ''),
+    // ...) so that an empty string is treated as absent.
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-empty-raw"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let proc_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // First failure: classifier returns a body with diagnostic info.
+    let prior_body = r#"{"error":{"code":500,"message":"upstream timeout"}}"#.to_string();
+    ops.fail_processing(
+        proc_claim.image_id,
+        "classifier ClassifierTransport (HTTP 500)",
+        Some(prior_body.clone()),
+        proc_claim.generation,
+        ProcessingFailureDisposition::RetryWait {
+            next_attempt_at: past_ts(1),
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = ops.get_image(proc_claim.image_id).await.unwrap();
+    assert_eq!(img.processing_last_raw_response, Some(prior_body.clone()));
+
+    // Re-claim so the image is back in processing state.
+    let proc_claim2 = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Second failure: classifier returns an empty body (Some("")).
+    // This must NOT overwrite the prior diagnostic.
+    ops.fail_processing(
+        proc_claim2.image_id,
+        "classifier ClassifierTransport (HTTP 500)",
+        Some("".to_string()), // empty body
+        proc_claim2.generation,
+        ProcessingFailureDisposition::RetryWait {
+            next_attempt_at: past_ts(1),
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // The prior diagnostic must still be present.
+    let img = ops.get_image(proc_claim2.image_id).await.unwrap();
+    assert_eq!(img.processing_last_raw_response, Some(prior_body.clone()));
+
+    // A third failure with None should also preserve the diagnostic.
+    let proc_claim3 = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.fail_processing(
+        proc_claim3.image_id,
+        "classifier ClassifierTransport",
+        None, // no response at all
+        proc_claim3.generation,
+        ProcessingFailureDisposition::Failed,
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = ops.get_image(proc_claim3.image_id).await.unwrap();
+    assert_eq!(img.processing_status, ProcessingStatus::Failed);
+    assert_eq!(img.processing_last_raw_response, Some(prior_body.clone()));
+}
+
+// ── Concurrent lease recovery prevents stale completion ──────────────────
+
+#[tokio::test]
+async fn concurrent_processing_lease_recovery_prevents_stale_completion() {
+    // Two workers hold cloned DatabaseOps for the same pool.  Worker A
+    // claims an image, then Worker B recovers the (simulated expired)
+    // lease and re-claims it.  Worker A must detect that it no longer
+    // owns the claim via generation-token checks on renewal, verification,
+    // completion, and failure — all must fail while Worker B's processing
+    // state remains unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("concurrent_lease_recovery.db");
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    let db = Database::open(&db_path).await.unwrap();
+    let ops = db.ops();
+
+    // Setup: sync camera and insert image
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-concurrent-lease"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    // Complete the download so the image is claimable for processing.
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Worker A claims the processing work (generation = 1).
+    let ops_a = db.clone().ops();
+    let claim_a = ops_a
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation_a = claim_a.generation;
+
+    // Verify Worker A owns the claim.
+    ops_a
+        .verify_processing_ownership(claim_a.image_id, generation_a)
+        .await
+        .unwrap();
+
+    // Simulate lease expiry: set lease_until to the past so recovery
+    // considers it expired.
+    let past_lease = past_ts(1);
+    let past_lease_str = fauna_scan::database::format_timestamp(&past_lease);
+    sqlx::query("UPDATE images SET processing_lease_until = ?")
+        .bind(&past_lease_str)
+        .execute(ops.pool())
+        .await
+        .unwrap();
+
+    // Worker B recovers the expired lease (generation reset to 0).
+    let ops_b = db.clone().ops();
+    let recovery = ops_b.recover_expired_leases(&now).await.unwrap();
+    assert_eq!(
+        recovery.processing, 1,
+        "Worker B should recover 1 processing lease"
+    );
+
+    // Worker B re-claims the image (generation = 1 again, but different row state).
+    let claim_b = ops_b
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation_b = claim_b.generation;
+
+    // Verify Worker B owns its claim.
+    ops_b
+        .verify_processing_ownership(claim_b.image_id, generation_b)
+        .await
+        .unwrap();
+
+    // Worker A's renewal must fail (generation mismatch).
+    let renewal_result = ops_a
+        .renew_processing_lease(claim_a.image_id, generation_a, &lease, &now)
+        .await;
+    assert!(
+        renewal_result.is_err(),
+        "renew_processing_lease should fail after Worker B re-claimed"
+    );
+
+    // Worker A's ownership check must fail (generation mismatch).
+    let verify_result = ops_a
+        .verify_processing_ownership(claim_a.image_id, generation_a)
+        .await;
+    assert!(
+        verify_result.is_err(),
+        "verify_processing_ownership should fail after Worker B re-claimed"
+    );
+    let err = verify_result.unwrap_err();
+    assert_eq!(err.category, ErrorCategory::Database);
+    assert!(err.message.contains("ownership lost"));
+
+    // Worker A must not be able to complete the classification.
+    let classification = ClassificationInput {
+        model: "vision-v1".to_string(),
+        prompt_version: "wildlife-v1".to_string(),
+        contains_wildlife: true,
+        is_interesting: true,
+        summary: None,
+        species_json: None,
+        confidence: None,
+        classification_json: None,
+        raw_response: None,
+        request_started_at: now,
+        request_completed_at: now,
+    };
+    let complete_result = ops_a
+        .complete_classification(claim_a.image_id, &classification, generation_a, &now)
+        .await;
+    assert!(
+        complete_result.is_err(),
+        "complete_classification should fail after Worker B re-claimed"
+    );
+
+    // Worker A must not be able to fail the processing either.
+    let fail_result = ops_a
+        .fail_processing(
+            claim_a.image_id,
+            "stale worker error",
+            None,
+            generation_a,
+            ProcessingFailureDisposition::Failed,
+            &now,
+        )
+        .await;
+    assert!(
+        fail_result.is_err(),
+        "fail_processing should fail after Worker B re-claimed"
+    );
+
+    // Verify Worker B's processing state is unchanged (still processing).
+    let img_b = ops_b.get_image(claim_b.image_id).await.unwrap();
+    assert_eq!(img_b.processing_status, ProcessingStatus::Processing);
+    assert_eq!(img_b.processing_generation, generation_b);
+    assert_eq!(img_b.download_status, DownloadStatus::Downloaded);
+
+    // Worker A's image is no longer in processing state.
+    let img_a = ops_a.get_image(claim_a.image_id).await.unwrap();
+    assert_eq!(img_a.processing_status, ProcessingStatus::Processing);
+    assert_eq!(img_a.processing_generation, generation_b);
+}
+
+// ── Renewal timestamp test ────────────────────────────────────────────────
+
+/// renew_processing_lease records the renewal instant in updated_at, not
+/// the future lease deadline.
+#[tokio::test]
+async fn renewal_updates_updated_at_to_renewal_instant() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-renew-ts"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    // Complete the download then claim processing.
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let proc_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation = proc_claim.generation;
+
+    // Record the updated_at before renewal.
+    let img_before = ops.get_image(proc_claim.image_id).await.unwrap();
+    let _updated_before = img_before.updated_at;
+
+    // Renew the lease with a future deadline but the current time as renewal.
+    let future_lease = future_ts(1);
+    ops.renew_processing_lease(proc_claim.image_id, generation, &future_lease, &now)
+        .await
+        .unwrap();
+
+    // Verify updated_at equals the renewal instant (now), not the future deadline.
+    let img_after = ops.get_image(proc_claim.image_id).await.unwrap();
+    assert_eq!(
+        img_after.updated_at, now,
+        "updated_at must equal the renewal instant, not the future lease deadline"
+    );
+    // The lease_until should be the future value.
+    assert_eq!(
+        img_after.processing_lease_until,
+        Some(future_lease),
+        "processing_lease_until should be the future deadline"
+    );
+}
+
+// ── Raw response diagnostic tests ─────────────────────────────────────────
+
+/// Retryable failures retain the raw response, and successful completion
+/// clears it.
+#[tokio::test]
+async fn retryable_failure_retains_raw_response_and_success_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-raw-diag"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    // Complete download and claim processing.
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let proc_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation = proc_claim.generation;
+
+    // Simulate a retryable failure with raw response.
+    // Use past_ts so the image is immediately claimable for re-processing.
+    let retry_at = past_ts(1);
+    let diagnostic_response = "this is the diagnostic classifier output".to_string();
+    ops.fail_processing(
+        proc_claim.image_id,
+        "classifier ClassifierTransport (HTTP 500)",
+        Some(diagnostic_response.clone()),
+        generation,
+        ProcessingFailureDisposition::RetryWait {
+            next_attempt_at: retry_at,
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Verify raw response is retained.
+    let img = ops.get_image(proc_claim.image_id).await.unwrap();
+    assert_eq!(
+        img.processing_last_raw_response,
+        Some(diagnostic_response.clone()),
+        "raw diagnostic response should be retained"
+    );
+
+    // Now complete the classification successfully.
+    let classification = ClassificationInput {
+        model: "vision-v1".to_string(),
+        prompt_version: "wildlife-v1".to_string(),
+        contains_wildlife: true,
+        is_interesting: true,
+        summary: Some("A deer".to_string()),
+        species_json: Some(r#"[{"name":"deer","confidence":0.9}]"#.to_string()),
+        confidence: Some(0.9),
+        classification_json: None,
+        raw_response: None,
+        request_started_at: now,
+        request_completed_at: now,
+    };
+
+    // Re-claim processing first (since it's in retry_wait now).
+    let proc_claim2 = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation2 = proc_claim2.generation;
+
+    ops.complete_classification(proc_claim2.image_id, &classification, generation2, &now)
+        .await
+        .unwrap();
+
+    // Verify raw response was cleared.
+    let img = ops.get_image(proc_claim2.image_id).await.unwrap();
+    assert!(
+        img.processing_last_raw_response.is_none(),
+        "raw diagnostic response should be cleared on success"
+    );
+}
+
+/// Permanent failure retains the raw response.
+#[tokio::test]
+async fn permanent_failure_retains_raw_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-perm-raw"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let proc_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation = proc_claim.generation;
+
+    // Simulate a permanent failure with raw response.
+    let diagnostic_response = "401 Unauthorized body".to_string();
+    ops.fail_processing(
+        proc_claim.image_id,
+        "classifier Authentication (HTTP 401)",
+        Some(diagnostic_response.clone()),
+        generation,
+        ProcessingFailureDisposition::Failed,
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = ops.get_image(proc_claim.image_id).await.unwrap();
+    assert_eq!(
+        img.processing_last_raw_response,
+        Some(diagnostic_response),
+        "raw diagnostic response should be retained on permanent failure"
+    );
+}
+
+/// When a later failure has no response body, the prior diagnostic response
+/// is retained (COALESCE guard).
+#[tokio::test]
+async fn failure_without_response_retains_prior_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let camera_id = CameraId::new(1);
+    let lease = lease_ts();
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let img = DiscoveredImage {
+        image_key: ImageKey::new("key-coalesce"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/1".to_string(),
+        canonical_playback_uri: "http://nvr/pic/1".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+
+    ops.commit_search_window(&window, &[img]).await.unwrap();
+
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let proc_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation = proc_claim.generation;
+
+    // First failure with raw response.
+    // Use past_ts so the image is immediately claimable for re-processing.
+    let first_response = "first diagnostic response".to_string();
+    let retry_at = past_ts(1);
+    ops.fail_processing(
+        proc_claim.image_id,
+        "error 1",
+        Some(first_response.clone()),
+        generation,
+        ProcessingFailureDisposition::RetryWait {
+            next_attempt_at: retry_at,
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // Re-claim and fail again without a response body.
+    let proc_claim2 = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    let generation2 = proc_claim2.generation;
+    let retry_at2 = past_ts(2);
+    ops.fail_processing(
+        proc_claim2.image_id,
+        "error 2",
+        None, // no response body this time
+        generation2,
+        ProcessingFailureDisposition::RetryWait {
+            next_attempt_at: retry_at2,
+        },
+        &now,
+    )
+    .await
+    .unwrap();
+
+    // The first diagnostic response should still be retained.
+    let img = ops.get_image(proc_claim2.image_id).await.unwrap();
+    assert_eq!(
+        img.processing_last_raw_response,
+        Some(first_response),
+        "prior diagnostic response should be retained when new failure has no body"
+    );
 }

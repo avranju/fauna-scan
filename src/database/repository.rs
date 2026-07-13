@@ -661,6 +661,11 @@ impl DatabaseOps {
 
     /// Atomically claim one downloaded image with a local path for processing
     /// using a single guarded UPDATE with a subquery and RETURNING.
+    ///
+    /// Increments `processing_generation` to produce a durable claim token
+    /// that is returned in `ProcessingClaim`.  Renewal, failure, and
+    /// completion operations verify this token to prevent stale workers
+    /// from mutating a row that has been re-claimed by another scanner.
     pub async fn claim_next_processing(
         &self,
         now: &Timestamp,
@@ -674,6 +679,7 @@ impl DatabaseOps {
             r#"UPDATE images
                SET processing_status = 'processing',
                    processing_attempts = processing_attempts + 1,
+                   processing_generation = processing_generation + 1,
                    processing_started_at = ?,
                    processing_lease_until = ?,
                    updated_at = ?
@@ -689,7 +695,8 @@ impl DatabaseOps {
                    ORDER BY id ASC
                    LIMIT 1
                )
-               RETURNING id, image_key, local_path, processing_attempts, processing_lease_until"#,
+               RETURNING id, image_key, local_path, processing_attempts,
+                         processing_generation, processing_lease_until"#,
         )
         .bind(&now_str)
         .bind(&lease_str)
@@ -713,8 +720,11 @@ impl DatabaseOps {
                 let processing_attempts: i64 = row
                     .try_get(3)
                     .map_err(|e| map_sqlx_error("claim_next_processing", e))?;
-                let lease_until_str: String = row
+                let generation: i64 = row
                     .try_get(4)
+                    .map_err(|e| map_sqlx_error("claim_next_processing", e))?;
+                let lease_until_str: String = row
+                    .try_get(5)
                     .map_err(|e| map_sqlx_error("claim_next_processing", e))?;
                 let lease_until_ts = lease_until_str.parse::<Timestamp>().map_err(|e| {
                     AppError::with_source(
@@ -729,6 +739,7 @@ impl DatabaseOps {
                     image_key: ImageKey::new(image_key),
                     local_path: PathBuf::from(local_path),
                     processing_attempts,
+                    generation,
                     lease_until: lease_until_ts,
                 }))
             }
@@ -737,10 +748,18 @@ impl DatabaseOps {
     }
 
     /// Guard a processing failure transition in a single guarded UPDATE.
+    ///
+    /// Persists the latest available raw classifier response (if provided)
+    /// for diagnostic purposes while keeping the safe error message separate.
+    ///
+    /// Verifies the generation token to prevent stale workers from mutating
+    /// a row that has been re-claimed by another scanner.
     pub async fn fail_processing(
         &self,
         image_id: ImageId,
         error: &str,
+        raw_response: Option<String>,
+        generation: i64,
         disposition: ProcessingFailureDisposition,
         now: &Timestamp,
     ) -> AppResult<()> {
@@ -755,25 +774,37 @@ impl DatabaseOps {
         let next_attempt_str = next_attempt_at.map(super::format_timestamp);
         let updated_at = super::format_timestamp(now);
 
-        // Single UPDATE: status, error, lease cleared, next-attempt set, updated_at refreshed.
+        // Single UPDATE: status, error, raw response (coalesced with
+        // existing to preserve prior diagnostic data), lease cleared,
+        // next-attempt set, updated_at refreshed.
+        //
+        // COALESCE(NULLIF(?, ''), ...) preserves the existing value when
+        // raw_response is None or an empty string.  An empty response from
+        // the classifier is treated as absent — it does not overwrite a
+        // prior diagnostic response.
         let result = sqlx::query(
             r#"UPDATE images SET
                    processing_status = ?,
                    processing_last_error = ?,
+                   processing_last_raw_response = COALESCE(NULLIF(?, ''),
+                                                          processing_last_raw_response),
                    processing_lease_until = NULL,
                    processing_next_attempt_at = CASE ?
                        WHEN 'retry_wait' THEN ?
                        ELSE NULL
                    END,
                    updated_at = ?
-               WHERE id = ? AND processing_status = 'processing'"#,
+               WHERE id = ? AND processing_status = 'processing'
+                 AND processing_generation = ?"#,
         )
         .bind(status)
         .bind(error)
+        .bind(&raw_response)
         .bind(status)
         .bind(&next_attempt_str)
         .bind(&updated_at)
         .bind(image_id.get())
+        .bind(generation)
         .execute(&self.0)
         .await
         .map_err(|e| map_sqlx_error("fail_processing", e))?;
@@ -782,7 +813,10 @@ impl DatabaseOps {
             return Err(AppError::new(
                 ErrorCategory::Database,
                 "fail_processing",
-                format!("image {} is not in processing state", image_id.get()),
+                format!(
+                    "image {} is not in processing state or generation mismatch",
+                    image_id.get()
+                ),
             ));
         }
         Ok(())
@@ -792,10 +826,14 @@ impl DatabaseOps {
     ///
     /// If the insert fails (e.g. uniqueness conflict) or the state update
     /// fails, neither the classification nor the state change survives.
+    /// The guarded done update verifies exactly one row is affected and
+    /// that the generation token matches to prevent stale workers from
+    /// completing a row that has been re-claimed by another scanner.
     pub async fn complete_classification(
         &self,
         image_id: ImageId,
         classification: &ClassificationInput,
+        generation: i64,
         completed_at: &Timestamp,
     ) -> AppResult<ClassificationId> {
         let mut tx = self
@@ -804,13 +842,19 @@ impl DatabaseOps {
             .await
             .map_err(|e| map_sqlx_error("complete_classification", e))?;
 
-        // Verify the image is currently processing
-        let current_status: String =
-            sqlx::query_scalar("SELECT processing_status FROM images WHERE id = ?")
-                .bind(image_id.get())
-                .fetch_one(tx.as_mut())
-                .await
-                .map_err(|e| map_sqlx_error("complete_classification_check", e))?;
+        // Verify the image is currently processing with the matching generation
+        let row = sqlx::query(
+            r#"SELECT processing_status, processing_generation
+                 FROM images WHERE id = ?"#,
+        )
+        .bind(image_id.get())
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("complete_classification_check", e))?;
+
+        let current_status: String = row
+            .try_get(0)
+            .map_err(|e| map_sqlx_error("complete_classification_check", e))?;
 
         if current_status != "processing" {
             return Err(AppError::new(
@@ -820,6 +864,23 @@ impl DatabaseOps {
                     "image {} is not in processing state (is '{}')",
                     image_id.get(),
                     current_status
+                ),
+            ));
+        }
+
+        let current_generation: i64 = row
+            .try_get(1)
+            .map_err(|e| map_sqlx_error("complete_classification_check", e))?;
+
+        if current_generation != generation {
+            return Err(AppError::new(
+                ErrorCategory::Database,
+                "complete_classification",
+                format!(
+                    "image {} generation mismatch (expected {}, got {})",
+                    image_id.get(),
+                    generation,
+                    current_generation
                 ),
             ));
         }
@@ -855,24 +916,40 @@ impl DatabaseOps {
         .await
         .map_err(|e| map_sqlx_error("complete_classification_insert", e))?;
 
-        // Update processing status to done, clearing lease/retry/error and updating timestamp.
-        sqlx::query(
+        // Update processing status to done, clearing lease/retry/error/raw-response
+        // and updating timestamp. Guard: exactly one row must be affected and
+        // generation must match to prevent stale completion.
+        let update_result = sqlx::query(
             r#"UPDATE images SET
                    processing_status = 'done',
                    processing_completed_at = ?,
                    processing_lease_until = NULL,
                    processing_next_attempt_at = NULL,
                    processing_last_error = NULL,
+                   processing_last_raw_response = NULL,
                    updated_at = ?
-               WHERE id = ? AND processing_status = 'processing'"#,
+               WHERE id = ? AND processing_status = 'processing'
+                 AND processing_generation = ?"#,
         )
         .bind(&completed_str)
         .bind(updated_at)
         .bind(image_id.get())
+        .bind(generation)
         .execute(tx.as_mut())
         .await
-        .map_err(|e| map_sqlx_error("complete_classification_update", e))?
-        .rows_affected();
+        .map_err(|e| map_sqlx_error("complete_classification_update", e))?;
+
+        if update_result.rows_affected() != 1 {
+            return Err(AppError::new(
+                ErrorCategory::Database,
+                "complete_classification",
+                format!(
+                    "image {} did not transition to done (rows affected: {})",
+                    image_id.get(),
+                    update_result.rows_affected()
+                ),
+            ));
+        }
 
         // Fetch the classification id
         let class_id: i64 = sqlx::query_scalar(
@@ -889,6 +966,132 @@ impl DatabaseOps {
             .await
             .map_err(|e| map_sqlx_error("complete_classification_commit", e))?;
         Ok(ClassificationId::new(class_id))
+    }
+
+    // ── Lease renewal and ownership ───────────────────────────────────────
+
+    /// Renew the processing lease for a row that is currently being processed.
+    ///
+    /// Extends the lease deadline by the given duration so that a long-running
+    /// classification cannot be interrupted by lease recovery.  Only succeeds
+    /// when the row is still in `processing` status **and** the generation
+    /// matches the one held by the claiming worker — if another scanner has
+    /// already recovered and re-claimed the row, this update affects zero
+    /// rows and returns an ownership error.
+    ///
+    /// `new_lease_until` must be in the future (typically `now + lease_duration`).
+    /// `renewal_at` records the actual instant of this renewal and is persisted
+    /// in `updated_at` so the timestamp reflects the real mutation time rather
+    /// than the future lease deadline.
+    pub async fn renew_processing_lease(
+        &self,
+        image_id: ImageId,
+        generation: i64,
+        new_lease_until: &Timestamp,
+        renewal_at: &Timestamp,
+    ) -> AppResult<()> {
+        let lease_str = super::format_timestamp(new_lease_until);
+        let updated_at = super::format_timestamp(renewal_at);
+
+        let result = sqlx::query(
+            r#"UPDATE images SET
+                   processing_lease_until = ?,
+                   updated_at = ?
+               WHERE id = ? AND processing_status = 'processing'
+                 AND processing_generation = ?"#,
+        )
+        .bind(&lease_str)
+        .bind(&updated_at)
+        .bind(image_id.get())
+        .bind(generation)
+        .execute(&self.0)
+        .await
+        .map_err(|e| map_sqlx_error("renew_processing_lease", e))?;
+
+        if result.rows_affected() == 0 {
+            return Err(AppError::new(
+                ErrorCategory::Database,
+                "renew_processing_lease",
+                format!(
+                    "image {} is no longer in processing state or generation mismatch (lease may have been recovered)",
+                    image_id.get()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify that the image is still in processing status with an unexpired
+    /// lease and a matching generation token.
+    ///
+    /// Returns `OwnershipLost` when the row has been recovered by another scanner
+    /// (status changed, lease expired, lease cleared, or generation changed).
+    /// This check is performed before attempting to complete or fail a claim
+    /// to prevent a stale worker from mutating a row that another worker has
+    /// already reclaimed.
+    pub async fn verify_processing_ownership(
+        &self,
+        image_id: ImageId,
+        generation: i64,
+    ) -> AppResult<()> {
+        let row = sqlx::query(
+            r#"SELECT processing_status, processing_lease_until, processing_generation
+                 FROM images WHERE id = ?"#,
+        )
+        .bind(image_id.get())
+        .fetch_one(&self.0)
+        .await
+        .map_err(|e| map_sqlx_error("verify_processing_ownership", e))?;
+
+        let status: String = row
+            .try_get(0)
+            .map_err(|e| map_sqlx_error("verify_processing_ownership", e))?;
+
+        if status != "processing" {
+            return Err(AppError::new(
+                ErrorCategory::Database,
+                "verify_processing_ownership",
+                format!(
+                    "image {} ownership lost: processing_status is '{}'",
+                    image_id.get(),
+                    status
+                ),
+            ));
+        }
+
+        let lease_until: Option<String> = row
+            .try_get(1)
+            .map_err(|e| map_sqlx_error("verify_processing_ownership", e))?;
+
+        if lease_until.is_none() {
+            return Err(AppError::new(
+                ErrorCategory::Database,
+                "verify_processing_ownership",
+                format!(
+                    "image {} ownership lost: processing_lease_until is NULL",
+                    image_id.get()
+                ),
+            ));
+        }
+
+        let current_generation: i64 = row
+            .try_get(2)
+            .map_err(|e| map_sqlx_error("verify_processing_ownership", e))?;
+
+        if current_generation != generation {
+            return Err(AppError::new(
+                ErrorCategory::Database,
+                "verify_processing_ownership",
+                format!(
+                    "image {} ownership lost: generation mismatch (expected {}, got {})",
+                    image_id.get(),
+                    generation,
+                    current_generation
+                ),
+            ));
+        }
+
+        Ok(())
     }
 
     // ── Lease recovery ─────────────────────────────────────────────────────
@@ -920,6 +1123,10 @@ impl DatabaseOps {
         .map_err(|e| map_sqlx_error("recover_expired_leases_download", e))?;
 
         // Recover expired processing leases (lease_until <= now is expired).
+        // Do NOT reset generation — it is a monotonically increasing token
+        // that distinguishes claims.  On recovery the generation is preserved
+        // so that the next claim increments it further, ensuring that stale
+        // workers with an old generation value are rejected.
         // Refresh updated_at so recovery is visible in audit trails.
         let processing_changes = sqlx::query(
             r#"UPDATE images SET
@@ -1040,6 +1247,7 @@ impl DatabaseOps {
                       download_last_error, download_next_attempt_at, download_lease_until,
                       processing_status, processing_attempts, processing_started_at,
                       processing_completed_at, processing_last_error,
+                      processing_last_raw_response, processing_generation,
                       processing_next_attempt_at, processing_lease_until,
                       discovered_at, created_at, updated_at
                  FROM images WHERE id = ?"#,
@@ -1153,8 +1361,14 @@ impl DatabaseOps {
         let processing_last_error: Option<String> = row
             .try_get(22)
             .map_err(|e| map_sqlx_error("get_image", e))?;
+        let processing_last_raw_response: Option<String> = row
+            .try_get(23)
+            .map_err(|e| map_sqlx_error("get_image", e))?;
+        let processing_generation: i64 = row
+            .try_get(24)
+            .map_err(|e| map_sqlx_error("get_image", e))?;
         let processing_next_attempt_at: Option<Timestamp> = match row
-            .try_get::<Option<String>, _>(23)
+            .try_get::<Option<String>, _>(25)
             .map_err(|e| map_sqlx_error("get_image", e))?
         {
             Some(s) => Some(s.parse().map_err(|e| {
@@ -1168,7 +1382,7 @@ impl DatabaseOps {
             None => None,
         };
         let processing_lease_until: Option<Timestamp> = match row
-            .try_get::<Option<String>, _>(24)
+            .try_get::<Option<String>, _>(26)
             .map_err(|e| {
             map_sqlx_error("get_image", e)
         })? {
@@ -1182,9 +1396,9 @@ impl DatabaseOps {
             })?),
             None => None,
         };
-        let discovered_at = parse_timestamp_col(&row, 25)?;
-        let created_at = parse_timestamp_col(&row, 26)?;
-        let updated_at = parse_timestamp_col(&row, 27)?;
+        let discovered_at = parse_timestamp_col(&row, 27)?;
+        let created_at = parse_timestamp_col(&row, 28)?;
+        let updated_at = parse_timestamp_col(&row, 29)?;
 
         Ok(ImageRecord {
             id: ImageId::new(id),
@@ -1210,6 +1424,8 @@ impl DatabaseOps {
             processing_started_at,
             processing_completed_at,
             processing_last_error,
+            processing_last_raw_response,
+            processing_generation,
             processing_next_attempt_at,
             processing_lease_until,
             discovered_at,

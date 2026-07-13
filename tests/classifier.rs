@@ -851,3 +851,71 @@ async fn request_body_shape() {
     let result = client.classify_jpeg(&minimal_jpeg()).await;
     assert!(result.is_ok(), "should succeed: {result:?}");
 }
+
+// ── Oversized response tests ──────────────────────────────────────────────
+
+/// A 2xx response that exceeds MAX_RESPONSE_BYTES is rejected with a
+/// retryable oversized-body error, not a successful classification.
+#[tokio::test]
+async fn oversized_2xx_response_is_rejected() {
+    let mock_server = MockServer::start().await;
+
+    // Build a response body that exceeds 10 MB.
+    let large_body = "x".repeat(10 * 1024 * 1024 + 1);
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(large_body))
+        .mount(&mock_server)
+        .await;
+
+    let config = make_classifier_config(&mock_server.uri());
+    let client = ClassifierClient::from_config(&config).unwrap();
+
+    let result = client.classify_jpeg(&minimal_jpeg()).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        err.is_retryable(),
+        "oversized 2xx response should be retryable, got: {:?}",
+        err
+    );
+    // The underlying error message should mention the size limit.
+    let display = format!("{err}");
+    assert!(
+        display.contains("exceeds maximum") || display.contains("oversized"),
+        "error should mention size limit: {display}"
+    );
+}
+
+/// Oversized non-success responses preserve their HTTP status disposition:
+/// authentication and authorization failures are permanent, while a server
+/// error remains retryable.
+#[tokio::test]
+async fn oversized_non_2xx_response_preserves_status_disposition() {
+    let mock_server = MockServer::start().await;
+    let large_body = "Error: ".to_string() + &"x".repeat(10 * 1024 * 1024 + 1);
+
+    for (status, category, retryable) in [
+        (401, ErrorCategory::Authentication, false),
+        (403, ErrorCategory::Authorization, false),
+        (500, ErrorCategory::ClassifierTransport, true),
+    ] {
+        mock_server.reset().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(large_body.clone()))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_classifier_config(&mock_server.uri());
+        let client = ClassifierClient::from_config(&config).unwrap();
+        let err = client
+            .classify_jpeg(&minimal_jpeg())
+            .await
+            .expect_err("oversized response must be rejected");
+
+        assert_eq!(err.category(), category, "status {status}");
+        assert_eq!(err.http_status(), Some(status), "status {status}");
+        assert_eq!(err.is_retryable(), retryable, "status {status}");
+    }
+}

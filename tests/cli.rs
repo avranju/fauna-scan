@@ -210,6 +210,88 @@ enabled = false
     );
 }
 
+#[test]
+fn check_config_rejects_lease_not_exceeding_timeout() {
+    // check-config must reject a processing lease that does not exceed
+    // the classifier request timeout — the same validation that scan
+    // performs via ScannerOptions::from_config.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"[general]
+output_directory = "/tmp/fauna-scan-test-output"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+enabled = true
+base_url = "http://localhost:8081/v1"
+endpoint = "/chat/completions"
+model = "test-model"
+request_timeout_seconds = 120
+processing_lease_seconds = 60
+prompt_version = "wildlife-v1"
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all("/tmp/fauna-scan-test-output").ok();
+
+    cmd()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("lease"));
+}
+
+#[test]
+fn check_config_rejects_lease_equal_to_timeout() {
+    // Lease equal to request timeout must also be rejected.
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        r#"[general]
+output_directory = "/tmp/fauna-scan-test-output"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+enabled = true
+base_url = "http://localhost:8081/v1"
+endpoint = "/chat/completions"
+model = "test-model"
+request_timeout_seconds = 120
+processing_lease_seconds = 120
+prompt_version = "wildlife-v1"
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all("/tmp/fauna-scan-test-output").ok();
+
+    cmd()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("check-config")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("lease"));
+}
+
 #[tokio::test]
 async fn download_once_honors_explicit_config_path_and_reaches_dispatch() {
     const DIGEST_CHALLENGE: &str = "Digest realm=\"Hikvision\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", algorithm=MD5, qop=\"auth\"";
@@ -332,13 +414,89 @@ fn download_once_exits_nonzero_with_message() {
 }
 
 #[test]
-fn scan_once_exits_nonzero_with_message() {
+fn scan_once_exits_nonzero_with_disabled_classifier() {
+    // scan --once with classifier.enabled=false should fail at
+    // configuration validation (scanner_from_config rejects disabled).
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        minimal_valid_config(), // classifier.enabled = false
+    )
+    .unwrap();
+    std::fs::create_dir_all("/tmp/fauna-scan-test-output").ok();
+
     cmd()
+        .arg("--config")
+        .arg(&config_path)
         .arg("scan")
         .arg("--once")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("scan"));
+        .stderr(predicate::str::contains("classifier is disabled"));
+}
+
+#[test]
+fn scan_once_without_config_exits_nonzero() {
+    cmd()
+        .arg("scan")
+        .arg("--once")
+        .env_remove("XDG_CONFIG_HOME")
+        .env("HOME", "/nonexistent-home-for-scan-test-12345")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot read configuration file"));
+}
+
+#[test]
+fn scan_once_enabled_classifier_empty_queue_succeeds() {
+    // scan --once with an enabled classifier and no eligible images
+    // should exit successfully and print a scanner-pass summary.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fauna-scan.sqlite3");
+    let output_dir = dir.path().join("output");
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[general]
+database_path = "{}"
+output_directory = "{}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+enabled = true
+base_url = "http://localhost:8081/v1"
+endpoint = "/chat/completions"
+model = "test-model"
+poll_interval_seconds = 10
+retry_limit = 3
+retry_initial_delay_seconds = 5
+retry_max_delay_seconds = 300
+processing_lease_seconds = 600
+prompt_version = "wildlife-v1"
+"#,
+            db_path.display(),
+            output_dir.display(),
+        ),
+    )
+    .unwrap();
+
+    cmd()
+        .arg("--config")
+        .arg(&config_path)
+        .arg("scan")
+        .arg("--once")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Scanner pass"));
 }
 
 #[test]
