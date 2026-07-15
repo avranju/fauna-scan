@@ -596,12 +596,18 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
         BTreeMap::new();
 
     for raw in channels {
+        // Prefer the explicit <trackID> element; fall back to <id> when
+        // <trackID> is absent (some Hikvision NVR firmwares embed the
+        // track ID directly in <id> and omit <trackID> entirely).
         let track_id = match raw.track_id {
             Some(tid) => tid,
-            None => {
-                tracing::warn!("camera_discovery: skipping channel entry with missing track ID");
-                continue;
-            }
+            None => match &raw.raw_identifier {
+                Some(id) => id.clone(),
+                None => {
+                    tracing::warn!("camera_discovery: skipping channel entry with missing track ID");
+                    continue;
+                }
+            },
         };
 
         let mapping = match derive_camera_mapping(&track_id) {
@@ -2438,5 +2444,76 @@ Gate</name>
         assert_eq!(result.len(), 1);
         // "Front" + " " + "Gate" → trimmed to "Front Gate"
         assert_eq!(result[0].name, Some("Front Gate".to_string()));
+    }
+
+    /// Regression test: when <trackID> is absent, fall back to <id> as
+    /// the track ID.  Some Hikvision NVR firmwares embed the track ID
+    /// directly in <id> and omit <trackID> entirely.
+    #[test]
+    fn parse_fallback_id_to_track_id() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<StreamingChannelList>
+  <StreamingChannel>
+    <id>101</id>
+    <channelName>Camera One</channelName>
+  </StreamingChannel>
+  <StreamingChannel>
+    <id>201</id>
+    <channelName>Camera Two</channelName>
+  </StreamingChannel>
+  <StreamingChannel>
+    <id>102</id>
+    <channelName>Sub-stream</channelName>
+  </StreamingChannel>
+</StreamingChannelList>"#;
+        let result = parse_camera_discovery_xml(xml.as_bytes()).unwrap();
+        // Only primary tracks (..01) should be kept; 102 is a sub-stream.
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].channel_number, 1);
+        assert_eq!(result[0].primary_track_id, "101");
+        assert_eq!(result[0].picture_track_id, "103");
+        assert_eq!(result[0].name, Some("Camera One".to_string()));
+        assert_eq!(result[0].raw_discovery_identifier, Some("101".to_string()));
+        assert_eq!(result[1].channel_number, 2);
+        assert_eq!(result[1].primary_track_id, "201");
+        assert_eq!(result[1].picture_track_id, "203");
+        assert_eq!(result[1].name, Some("Camera Two".to_string()));
+        assert_eq!(result[1].raw_discovery_identifier, Some("201".to_string()));
+    }
+
+    /// When both <trackID> and <id> are present, <trackID> takes
+    /// precedence as the track ID while <id> is used as the raw
+    /// discovery identifier.
+    #[test]
+    fn parse_trackid_takes_precedence_over_id() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<StreamingChannelList>
+  <StreamingChannel>
+    <id>ch1</id>
+    <trackID>101</trackID>
+    <name>Camera</name>
+  </StreamingChannel>
+</StreamingChannelList>"#;
+        let result = parse_camera_discovery_xml(xml.as_bytes()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].primary_track_id, "101");
+        assert_eq!(result[0].raw_discovery_identifier, Some("ch1".to_string()));
+    }
+
+    /// When <id> contains a non-track-ID value (e.g. "ch1"), it should
+    /// NOT be used as a fallback track ID since derive_camera_mapping
+    /// rejects it.
+    #[test]
+    fn parse_id_fallback_rejected_when_not_numeric_track() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<StreamingChannelList>
+  <StreamingChannel>
+    <id>ch1</id>
+    <name>No Track ID</name>
+  </StreamingChannel>
+</StreamingChannelList>"#;
+        let result = parse_camera_discovery_xml(xml.as_bytes()).unwrap();
+        // "ch1" is not a valid track ID pattern, so the channel is skipped.
+        assert!(result.is_empty());
     }
 }
