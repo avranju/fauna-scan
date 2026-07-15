@@ -374,7 +374,7 @@ The implementation shall accept search IDs in responses with or without surround
 
 ### 7.3 Time format
 
-Search times shall be sent to the NVR as UTC RFC 3339 timestamps using the `Z` suffix:
+Search times shall be sent to the NVR as whole-second UTC RFC 3339 timestamps using the `Z` suffix. Fractional seconds are not accepted by the NVR:
 
 ```text
 2026-07-11T02:00:00Z

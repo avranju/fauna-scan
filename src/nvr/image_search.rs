@@ -108,9 +108,9 @@ fn escape_xml(s: &str) -> String {
 
 /// Serialize a CMSearchDescription XML request for one page.
 ///
-/// Emits the exact `searchResultPostion` spelling, UTC Z timestamps with
-/// fractional precision, metadata content type, the allPic descriptor,
-/// and a freshly generated UUID v4 searchID.
+/// Emits the exact `searchResultPostion` spelling, whole-second UTC Z
+/// timestamps required by the NVR, metadata content type, the allPic
+/// descriptor, and a freshly generated UUID v4 searchID.
 fn serialize_search_request(
     track_id: &TrackId,
     window: &SearchWindow,
@@ -118,15 +118,15 @@ fn serialize_search_request(
     max_results: u64,
 ) -> AppResult<SearchRequestDocument> {
     let search_id = Uuid::new_v4();
-    // Use nanosecond precision so fractional window boundaries are preserved.
+    // This NVR rejects fractional RFC 3339 seconds in search requests.
     let start_str = window
         .start
         .as_datetime()
-        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let end_str = window
         .end
         .as_datetime()
-        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
@@ -866,9 +866,9 @@ pub fn parse_image_search_xml(xml: &[u8], expected_search_id: Uuid) -> AppResult
     }
 
     match response_status_string.as_str() {
-        // Hikvision commonly uses OK for a terminal successful page; retain
-        // Success for firmware compatibility and MORE for pagination.
-        "OK" | "Success" | "MORE" => {}
+        // Hikvision uses OK, Success, and NO MATCHES for terminal successful
+        // pages; MORE indicates that another page is available.
+        "OK" | "Success" | "NO MATCHES" | "MORE" => {}
         "Failure" => {
             return Err(AppError::new(
                 ErrorCategory::InvalidNvrResponse,
@@ -1837,16 +1837,17 @@ mod tests {
     }
 
     #[test]
-    fn serialize_uses_fractional_precision() {
+    fn serialize_uses_whole_second_precision() {
         let window = SearchWindow {
             start: ts_frac(2026, 7, 11, 0, 0, 0, 123_456_789),
             end: ts_frac(2026, 7, 11, 1, 0, 0, 987_654_321),
         };
         let doc = serialize_search_request(&TrackId::new("103"), &window, 0, 50).unwrap();
         let xml = String::from_utf8_lossy(&doc.xml);
-        // Should contain fractional seconds
-        assert!(xml.contains(".123456789Z"));
-        assert!(xml.contains(".987654321Z"));
+        assert!(xml.contains("2026-07-11T00:00:00Z"));
+        assert!(xml.contains("2026-07-11T01:00:00Z"));
+        assert!(!xml.contains(".123456789Z"));
+        assert!(!xml.contains(".987654321Z"));
     }
 
     #[test]
@@ -1930,6 +1931,25 @@ mod tests {
         let response = parse_image_search_xml(xml.as_bytes(), id).unwrap();
         assert_eq!(response.response_status_string, "OK");
         assert_eq!(response.raw_item_count, 1);
+    }
+
+    #[test]
+    fn parse_no_matches_terminal_status() {
+        let id = Uuid::new_v4();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<CMSearchResult version="1.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
+  <searchID>{{{id}}}</searchID>
+  <responseStatus>true</responseStatus>
+  <responseStatusStrg>NO MATCHES</responseStatusStrg>
+  <numOfMatches>0</numOfMatches>
+</CMSearchResult>"#
+        );
+
+        let response = parse_image_search_xml(xml.as_bytes(), id).unwrap();
+        assert_eq!(response.response_status_string, "NO MATCHES");
+        assert_eq!(response.num_of_matches, Some(0));
+        assert!(response.items.is_empty());
     }
 
     #[test]
