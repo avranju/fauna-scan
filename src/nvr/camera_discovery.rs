@@ -604,7 +604,9 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
             None => match &raw.raw_identifier {
                 Some(id) => id.clone(),
                 None => {
-                    tracing::warn!("camera_discovery: skipping channel entry with missing track ID");
+                    tracing::warn!(
+                        "camera_discovery: skipping channel entry with missing track ID"
+                    );
                     continue;
                 }
             },
