@@ -1,0 +1,43 @@
+name: Build Docker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Docker image tag to build and push
+        required: true
+        type: string
+
+env:
+  REGISTRY: git.nerdworks.dev
+  REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
+  IMAGE_NAME: avranju/fauna-scan
+  IMAGE_TAG: ${{ inputs.tag }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate image tag
+        run: |
+          if ! printf '%s' "$IMAGE_TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+            echo "Invalid Docker image tag: $IMAGE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Log in to Gitea container registry
+        run: |
+          printf '%s' "${{ secrets.PACKAGE_TOKEN }}" \
+            | docker login "$REGISTRY" \
+              --username "$REGISTRY_USERNAME" \
+              --password-stdin
+
+      - name: Build Docker image
+        run: docker build -t "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG" .
+
+      - name: Push Docker image
+        run: docker push "$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
