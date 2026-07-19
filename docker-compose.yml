@@ -1,0 +1,29 @@
+services:
+  fauna-scan:
+    image: git.nerdworks.dev/avranju/fauna-scan:latest
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./config.toml:/etc/fauna-scan/config.toml:ro
+      - fauna-scan-state:/var/lib/fauna-scan
+      - fauna-scan-images:/var/lib/fauna-scan/images
+    secrets:
+      - nvr_password
+      - classifier_api_key
+
+volumes:
+  fauna-scan-state:
+  fauna-scan-images:
+
+secrets:
+  nvr_password:
+    file: ./secrets/nvr-password
+  classifier_api_key:
+    file: ./secrets/classifier-api-key

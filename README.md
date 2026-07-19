@@ -75,6 +75,37 @@ network or classifier failures remain durable for retry, and expired leases are
 recovered on restart. Completed downloads are not redownloaded, even if their
 local file is later deleted.
 
+## Docker Compose deployment
+
+The Compose deployment pulls `git.nerdworks.dev/avranju/fauna-scan:latest` from
+the registry. Log in first if the registry requires authentication, then prepare
+the container-specific configuration and secret files:
+
+```bash
+docker login git.nerdworks.dev
+cp config.docker.example.toml config.toml
+mkdir -p secrets
+install -m 600 /dev/null secrets/nvr-password
+install -m 600 /dev/null secrets/classifier-api-key
+${EDITOR:-vi} config.toml
+${EDITOR:-vi} secrets/nvr-password
+${EDITOR:-vi} secrets/classifier-api-key
+docker compose config
+docker compose pull
+docker compose up -d
+docker compose logs -f fauna-scan
+```
+
+Set `general.database_path` and `general.output_directory` to the container
+paths already used by `config.docker.example.toml`. Compose persists those paths
+in the `fauna-scan-state` and `fauna-scan-images` named volumes. Classifier and
+NVR hostnames must be reachable from the container; `localhost` inside the
+container refers to Fauna Scan itself.
+
+To deploy a newly published image, run `docker compose pull` followed by
+`docker compose up -d`. Compose stops the old container with a 30-second grace
+period and reuses the persistent volumes.
+
 ## User systemd service
 
 The repository's `fauna-scan.service` is a user-level example. Its
