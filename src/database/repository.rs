@@ -836,9 +836,15 @@ impl DatabaseOps {
         generation: i64,
         completed_at: &Timestamp,
     ) -> AppResult<ClassificationId> {
+        // Acquire SQLite's writer reservation before reading the image row.
+        // A deferred transaction would first establish a read snapshot below
+        // and could then fail immediately with SQLITE_BUSY when upgrading to a
+        // writer while a downloader completion is active. BEGIN IMMEDIATE
+        // instead waits according to the configured busy timeout before the
+        // snapshot is established, making downloader/scanner contention safe.
         let mut tx = self
             .0
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| map_sqlx_error("complete_classification", e))?;
 

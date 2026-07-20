@@ -670,13 +670,6 @@ impl Scanner {
                     );
                     return Err(e);
                 }
-                tracing::info!(
-                    image_id = image_id.get(),
-                    image_key = image_key_short,
-                    attempt,
-                    generation,
-                    "Classification successful"
-                );
                 // Verify ownership before persisting — if another scanner
                 // recovered and completed this claim, abort.
                 if let Err(e) = self
@@ -692,14 +685,23 @@ impl Scanner {
                     );
                     return Err(e);
                 }
-                self.handle_classification_success(
-                    image_id,
-                    output,
+                let outcome = self
+                    .handle_classification_success(
+                        image_id,
+                        output,
+                        generation,
+                        &request_started_at,
+                        &request_completed_at,
+                    )
+                    .await?;
+                tracing::info!(
+                    image_id = image_id.get(),
+                    image_key = image_key_short,
+                    attempt,
                     generation,
-                    &request_started_at,
-                    &request_completed_at,
-                )
-                .await
+                    "Classification successful"
+                );
+                Ok(outcome)
             }
             Ok(Err(classifier_err)) => {
                 if let Some(e) = shutdown_error {

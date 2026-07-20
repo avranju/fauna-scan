@@ -1311,6 +1311,123 @@ async fn classification_completes_processing_and_inserts_classification() {
 }
 
 #[tokio::test]
+async fn classification_completion_waits_for_concurrent_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+    let now = now_ts();
+    let lease = lease_ts();
+    let camera_id = CameraId::new(1);
+
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now,
+    )
+    .await
+    .unwrap();
+
+    let image = DiscoveredImage {
+        image_key: ImageKey::new("key-class-concurrent-writer"),
+        camera_id,
+        track_id: TrackId::new("103"),
+        capture_start_at: now,
+        capture_end_at: None,
+        playback_uri: "http://nvr/pic/concurrent".to_string(),
+        canonical_playback_uri: "http://nvr/pic/concurrent".to_string(),
+        codec_type: Some("jpeg".to_string()),
+        content_type: Some("picture".to_string()),
+        nvr_reported_size: None,
+        discovered_at: now,
+    };
+    let window = SearchWindowCommit {
+        camera_id,
+        window_start: now,
+        window_end: future_ts(1),
+        next_search_at: future_ts(2),
+        polled_at: now,
+        updated_at: now,
+    };
+    ops.commit_search_window(&window, &[image]).await.unwrap();
+
+    let download_claim = ops
+        .claim_next_download(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+    ops.complete_download(
+        download_claim.image_id,
+        &PathBuf::from("/tmp/test-concurrent.jpg"),
+        &now,
+    )
+    .await
+    .unwrap();
+    let processing_claim = ops
+        .claim_next_processing(&now, &lease)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Model an in-flight downloader completion holding SQLite's single-writer
+    // reservation. Classification completion must wait rather than creating a
+    // read snapshot and then failing its write upgrade with SQLITE_BUSY.
+    let mut writer = ops.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("INSERT INTO service_metadata (key, value, updated_at) VALUES (?, ?, ?)")
+        .bind("concurrent_writer")
+        .bind("active")
+        .bind(fauna_scan::database::format_timestamp(&now))
+        .execute(writer.as_mut())
+        .await
+        .unwrap();
+
+    let classification = ClassificationInput {
+        model: "vision-v1".to_string(),
+        prompt_version: "wildlife-v1".to_string(),
+        contains_wildlife: true,
+        is_interesting: true,
+        summary: Some("Concurrent writer test".to_string()),
+        species_json: Some("[]".to_string()),
+        confidence: Some(0.9),
+        classification_json: None,
+        raw_response: None,
+        request_started_at: past_ts(1),
+        request_completed_at: now,
+    };
+    let completion_ops = ops.clone();
+    let completion = tokio::spawn(async move {
+        completion_ops
+            .complete_classification(
+                processing_claim.image_id,
+                &classification,
+                processing_claim.generation,
+                &now,
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !completion.is_finished(),
+        "classification completion should wait for the active writer"
+    );
+
+    writer.commit().await.unwrap();
+    let classification_id = tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+        .await
+        .expect("classification completion timed out")
+        .expect("classification completion task panicked")
+        .expect("classification completion failed after writer released lock");
+    assert!(classification_id.get() > 0);
+
+    let image = ops.get_image(processing_claim.image_id).await.unwrap();
+    assert_eq!(image.processing_status, ProcessingStatus::Done);
+}
+
+#[tokio::test]
 async fn classification_fails_if_not_processing() {
     let dir = tempfile::tempdir().unwrap();
     let (_path, ops) = open_test_db(&dir).await;
