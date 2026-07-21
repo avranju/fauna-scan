@@ -5,7 +5,9 @@
 //! timeout behavior.
 
 use fauna_scan::classifier::ClassifierClient;
-use fauna_scan::configuration::{ClassifierConfig, ClassifierGenerationConfig, Secret};
+use fauna_scan::configuration::{
+    ClassifierConfig, ClassifierEndpointConfig, ClassifierGenerationConfig, Secret,
+};
 use fauna_scan::error::ErrorCategory;
 
 use url::Url;
@@ -21,31 +23,33 @@ fn make_classifier_config(mock_base: &str) -> ClassifierConfig {
     let scheme = url.scheme();
 
     ClassifierConfig {
-        enabled: true,
-        base_url: Url::parse(&format!("{scheme}://{}:{}", url.host_str().unwrap(), port)).unwrap(),
-        endpoint: "/chat/completions".to_string(),
-        model: "test-model".to_string(),
-        api_key: None,
-        username: String::new(),
-        password: None,
-        request_timeout_seconds: 10,
+        endpoints: vec![ClassifierEndpointConfig {
+            base_url: Url::parse(&format!("{scheme}://{}:{}", url.host_str().unwrap(), port))
+                .unwrap(),
+            endpoint: "/chat/completions".to_string(),
+            model: "test-model".to_string(),
+            api_key: None,
+            username: String::new(),
+            password: None,
+            request_timeout_seconds: 10,
+            prompt_version: "wildlife-v1".to_string(),
+            generation: ClassifierGenerationConfig {
+                temperature: 0.1,
+                max_tokens: 1000,
+            },
+        }],
         poll_interval_seconds: 10,
         retry_limit: 5,
         retry_initial_delay_seconds: 10,
         retry_max_delay_seconds: 300,
         processing_lease_seconds: 600,
-        prompt_version: "wildlife-v1".to_string(),
-        generation: ClassifierGenerationConfig {
-            temperature: 0.1,
-            max_tokens: 1000,
-        },
     }
 }
 
 /// Build a ClassifierConfig with Bearer API key authentication.
 fn make_classifier_config_with_api_key(mock_base: &str, api_key: &str) -> ClassifierConfig {
     let mut config = make_classifier_config(mock_base);
-    config.api_key = Some(Secret::new(api_key.to_string()));
+    config.endpoints[0].api_key = Some(Secret::new(api_key.to_string()));
     config
 }
 
@@ -56,8 +60,8 @@ fn make_classifier_config_with_basic(
     password: &str,
 ) -> ClassifierConfig {
     let mut config = make_classifier_config(mock_base);
-    config.username = username.to_string();
-    config.password = Some(Secret::new(password.to_string()));
+    config.endpoints[0].username = username.to_string();
+    config.endpoints[0].password = Some(Secret::new(password.to_string()));
     config
 }
 
@@ -69,9 +73,9 @@ fn make_classifier_config_combined(
     password: &str,
 ) -> ClassifierConfig {
     let mut config = make_classifier_config(mock_base);
-    config.api_key = Some(Secret::new(api_key.to_string()));
-    config.username = username.to_string();
-    config.password = Some(Secret::new(password.to_string()));
+    config.endpoints[0].api_key = Some(Secret::new(api_key.to_string()));
+    config.endpoints[0].username = username.to_string();
+    config.endpoints[0].password = Some(Secret::new(password.to_string()));
     config
 }
 
@@ -690,11 +694,8 @@ async fn delayed_response_is_timeout() {
         .mount(&mock_server)
         .await;
 
-    let config = make_classifier_config(&mock_server.uri());
-    let config = ClassifierConfig {
-        request_timeout_seconds: 1,
-        ..config
-    };
+    let mut config = make_classifier_config(&mock_server.uri());
+    config.endpoints[0].request_timeout_seconds = 1;
     let client = ClassifierClient::from_config(&config).unwrap();
 
     let result = client.classify_jpeg(&minimal_jpeg()).await;
@@ -724,8 +725,8 @@ async fn endpoint_path_assembled_correctly() {
 
     let mut config = make_classifier_config(&mock_server.uri());
     // Set a base URL with a path segment.
-    config.base_url = Url::parse(&format!("{}/v1", mock_server.uri())).unwrap();
-    config.endpoint = "/chat/completions".to_string();
+    config.endpoints[0].base_url = Url::parse(&format!("{}/v1", mock_server.uri())).unwrap();
+    config.endpoints[0].endpoint = "/chat/completions".to_string();
 
     let client = ClassifierClient::from_config(&config).unwrap();
     assert!(

@@ -4,8 +4,8 @@
 use chrono::Utc;
 use fauna_scan::classifier::ClassifierClient;
 use fauna_scan::configuration::{
-    ClassifierConfig, ClassifierGenerationConfig, Config, GeneralConfig, NvrConfig,
-    NvrDownloadConfig, NvrSearchConfig, Secret,
+    ClassifierConfig, ClassifierEndpointConfig, ClassifierGenerationConfig, Config, GeneralConfig,
+    NvrConfig, NvrDownloadConfig, NvrSearchConfig, Secret,
 };
 use fauna_scan::database::Database;
 use fauna_scan::domain::{DownloadStatus, ProcessingStatus, Timestamp};
@@ -254,24 +254,25 @@ fn build_test_config(server: &MockServer, root: &Path, start_at: Timestamp) -> C
             },
         },
         classifier: ClassifierConfig {
-            enabled: true,
-            base_url: Url::parse(&format!("{}/v1", server.uri())).expect("classifier URI"),
-            endpoint: "/chat/completions".to_string(),
-            model: "phase12-model".to_string(),
-            api_key: None,
-            username: String::new(),
-            password: None,
-            request_timeout_seconds: 5,
+            endpoints: vec![ClassifierEndpointConfig {
+                base_url: Url::parse(&format!("{}/v1", server.uri())).expect("classifier URI"),
+                endpoint: "/chat/completions".to_string(),
+                model: "phase12-model".to_string(),
+                api_key: None,
+                username: String::new(),
+                password: None,
+                request_timeout_seconds: 5,
+                prompt_version: "phase12-test".to_string(),
+                generation: ClassifierGenerationConfig {
+                    temperature: 0.0,
+                    max_tokens: 100,
+                },
+            }],
             poll_interval_seconds: 1,
             retry_limit: 2,
             retry_initial_delay_seconds: 1,
             retry_max_delay_seconds: 2,
             processing_lease_seconds: 60,
-            prompt_version: "phase12-test".to_string(),
-            generation: ClassifierGenerationConfig {
-                temperature: 0.0,
-                max_tokens: 100,
-            },
         },
         source_path: root.join("config.toml"),
     }

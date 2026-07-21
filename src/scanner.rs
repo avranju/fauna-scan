@@ -1,10 +1,8 @@
-//! Scanner pipeline: sequential classification of downloaded images.
+//! Scanner pipeline: concurrent classification across configured endpoints.
 //!
-//! Implemented in Phase 10.
-//!
-//! The scanner claims one downloaded image at a time, validates the local
-//! file, submits it to the classifier, and persists exactly one durable
-//! outcome before returning to claim the next eligible image.
+//! Each endpoint owns one worker. Workers claim images atomically from the
+//! shared database, so available classifier capacity is used concurrently
+//! without assigning the same image to more than one endpoint.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,6 +11,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use tokio::sync::{Notify, mpsc};
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use crate::classifier::{ClassifierClient, ClassifierError, ClassifierOutput, RetryDisposition};
@@ -35,10 +34,6 @@ static FORCE_PARSE_TASK_JOIN_ERROR: AtomicBool = AtomicBool::new(false);
 /// transport configuration are carried separately by `ClassifierClient`.
 #[derive(Debug, Clone)]
 pub struct ScannerOptions {
-    /// Classifier model name.
-    pub model: String,
-    /// Classifier prompt version.
-    pub prompt_version: String,
     /// Idle polling interval between scanner passes.
     pub poll_interval: Duration,
     /// Maximum total processing attempts before the image is marked failed.
@@ -56,13 +51,13 @@ pub struct ScannerOptions {
 impl ScannerOptions {
     /// Build scanner options from configuration.
     ///
-    /// Rejects a disabled classifier or zero/invalid durations.
+    /// Rejects an empty endpoint list or zero/invalid durations.
     pub fn from_config(config: &Config) -> AppResult<Self> {
-        if !config.classifier.enabled {
+        if config.classifier.endpoints.is_empty() {
             return Err(AppError::new(
                 ErrorCategory::Configuration,
                 "scanner_from_config",
-                "classifier is disabled; scan cannot operate",
+                "no classifier endpoints are configured; scan cannot operate",
             ));
         }
 
@@ -103,23 +98,22 @@ impl ScannerOptions {
             ));
         }
 
-        // Validate lease relationship with request timeout.
-        // This check is also in validate_config (called by Config::load)
-        // so that check-config rejects invalid leases.  We duplicate it
-        // here because tests construct Config directly without calling
-        // Config::load.
-        let request_timeout = Duration::from_secs(config.classifier.request_timeout_seconds);
-        if lease <= request_timeout {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "scanner_from_config",
-                format!(
-                    "classifier.processing_lease_seconds ({}) must be greater than \
-                     classifier.request_timeout_seconds ({}) to provide lease headroom",
-                    config.classifier.processing_lease_seconds,
-                    config.classifier.request_timeout_seconds
-                ),
-            ));
+        // This check is also in validate_config (called by Config::load),
+        // but tests and library callers may construct Config directly.
+        for (index, endpoint) in config.classifier.endpoints.iter().enumerate() {
+            if config.classifier.processing_lease_seconds <= endpoint.request_timeout_seconds {
+                return Err(AppError::new(
+                    ErrorCategory::Configuration,
+                    "scanner_from_config",
+                    format!(
+                        "classifier.processing_lease_seconds ({}) must be greater than \
+                         classifier.endpoints[{index}].request_timeout_seconds ({}) \
+                         to provide lease headroom",
+                        config.classifier.processing_lease_seconds,
+                        endpoint.request_timeout_seconds,
+                    ),
+                ));
+            }
         }
 
         // Reject leases so large that adding them to a DateTime<Utc> could
@@ -146,8 +140,6 @@ impl ScannerOptions {
         }
 
         Ok(Self {
-            model: config.classifier.model.clone(),
-            prompt_version: config.classifier.prompt_version.clone(),
             poll_interval,
             retry_limit: config.classifier.retry_limit,
             retry_initial_delay: retry_initial,
@@ -168,8 +160,8 @@ impl ScannerOptions {
 pub struct Scanner {
     /// Database operations.
     pub database: DatabaseOps,
-    /// Classifier client for submitting JPEG images.
-    pub classifier: Arc<ClassifierClient>,
+    /// Classifier clients, each served by an independent worker.
+    pub classifiers: Vec<Arc<ClassifierClient>>,
     /// Validated scanner policy.
     pub options: ScannerOptions,
 }
@@ -183,7 +175,26 @@ impl Scanner {
     ) -> Self {
         Self {
             database,
-            classifier,
+            classifiers: vec![classifier],
+            options,
+        }
+    }
+
+    /// Create a scanner with one worker per supplied classifier endpoint.
+    ///
+    /// The endpoint list must contain at least one endpoint.
+    pub fn with_classifiers(
+        database: DatabaseOps,
+        classifiers: Vec<Arc<ClassifierClient>>,
+        options: ScannerOptions,
+    ) -> Self {
+        assert!(
+            !classifiers.is_empty(),
+            "a scanner requires at least one classifier endpoint"
+        );
+        Self {
+            database,
+            classifiers,
             options,
         }
     }
@@ -224,65 +235,47 @@ impl Scanner {
             "Scanner pass: recovered expired leases"
         );
 
-        // Drain all currently eligible images.
-        let mut interrupted = false;
-        loop {
-            if shutdown.is_cancelled() {
-                interrupted = true;
-                break;
-            }
-            // Compute lease deadline using checked arithmetic.  The lease
-            // duration was already validated to be Chrono-safe in
-            // ScannerOptions::from_config, so this should always succeed.
-            let lease_until = Timestamp::new(
-                Utc::now()
-                    .checked_add_signed(
-                        chrono::Duration::from_std(self.options.processing_lease_duration)
-                            .expect("lease duration fits in chrono::Duration"),
-                    )
-                    .ok_or_else(|| {
-                        AppError::new(
-                            ErrorCategory::Internal,
-                            "execute_one_pass",
-                            "lease deadline computation overflowed Chrono bounds",
-                        )
-                    })?,
-            );
-            let claim = match self
-                .database
-                .claim_next_processing(&Timestamp::new(Utc::now()), &lease_until)
-                .await?
-            {
-                Some(claim) => claim,
-                None => break, // No eligible images
-            };
-
-            report.claimed += 1;
-
-            // Process this claim.
-            match self.process_claim(&claim).await {
-                Ok(outcome) => match outcome {
-                    ScannerOutcome::Completed => report.completed += 1,
-                    ScannerOutcome::RetryScheduled => report.retry_scheduled += 1,
-                    ScannerOutcome::Failed => report.failed += 1,
-                    ScannerOutcome::Missing => report.missing += 1,
-                },
-                Err(e) => {
-                    // Fatal database or internal error — stop the pass.
-                    tracing::error!(error = %e, "Scanner pass: fatal error processing claim");
-                    return Err(e);
-                }
-            }
-            if shutdown.is_cancelled() {
-                // The current claim has reached a durable outcome, but the
-                // pass did not reach an idle queue and must not be recorded as
-                // a successful scanner pass.
-                interrupted = true;
-                break;
-            }
+        // Run one worker per endpoint.  Claims are atomic database operations,
+        // so workers naturally distribute work according to endpoint capacity.
+        let worker_stop = ShutdownToken::new();
+        let mut workers = JoinSet::new();
+        for classifier in self.classifiers.iter().cloned() {
+            let scanner = self.clone();
+            let shutdown = shutdown.clone();
+            let worker_stop = worker_stop.clone();
+            workers.spawn(async move {
+                scanner
+                    .drain_claims(classifier, &shutdown, &worker_stop)
+                    .await
+            });
         }
 
-        if interrupted {
+        let mut worker_error = None;
+        while let Some(result) = workers.join_next().await {
+            match result {
+                Ok(Ok(worker_report)) => merge_scanner_report(&mut report, worker_report),
+                Ok(Err(error)) => {
+                    worker_stop.cancel();
+                    worker_error = Some(error);
+                    break;
+                }
+                Err(join_error) => {
+                    worker_stop.cancel();
+                    worker_error = Some(AppError::new(
+                        ErrorCategory::Internal,
+                        "execute_one_pass",
+                        format!("classifier worker task failed: {join_error}"),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(error) = worker_error {
+            while workers.join_next().await.is_some() {}
+            return Err(error);
+        }
+
+        if shutdown.is_cancelled() {
             tracing::info!(claimed = report.claimed, "Scanner loop terminated orderly");
             return Ok(report);
         }
@@ -351,6 +344,51 @@ impl Scanner {
         }
     }
 
+    /// Claim and process work for one classifier endpoint until no eligible
+    /// images remain or either shutdown token is cancelled.
+    async fn drain_claims(
+        &self,
+        classifier: Arc<ClassifierClient>,
+        shutdown: &ShutdownToken,
+        worker_stop: &ShutdownToken,
+    ) -> AppResult<ScannerPassReport> {
+        let mut report = ScannerPassReport::default();
+        loop {
+            if shutdown.is_cancelled() || worker_stop.is_cancelled() {
+                return Ok(report);
+            }
+            let lease_until = Timestamp::new(
+                Utc::now()
+                    .checked_add_signed(
+                        chrono::Duration::from_std(self.options.processing_lease_duration)
+                            .expect("lease duration fits in chrono::Duration"),
+                    )
+                    .ok_or_else(|| {
+                        AppError::new(
+                            ErrorCategory::Internal,
+                            "drain_claims",
+                            "lease deadline computation overflowed Chrono bounds",
+                        )
+                    })?,
+            );
+            let claim = match self
+                .database
+                .claim_next_processing(&Timestamp::new(Utc::now()), &lease_until)
+                .await?
+            {
+                Some(claim) => claim,
+                None => return Ok(report),
+            };
+            report.claimed += 1;
+            match self.process_claim(&claim, classifier.clone()).await? {
+                ScannerOutcome::Completed => report.completed += 1,
+                ScannerOutcome::RetryScheduled => report.retry_scheduled += 1,
+                ScannerOutcome::Failed => report.failed += 1,
+                ScannerOutcome::Missing => report.missing += 1,
+            }
+        }
+    }
+
     /// Process a single processing claim: validate the local file, call the
     /// classifier, and persist exactly one durable outcome.
     ///
@@ -358,7 +396,11 @@ impl Scanner {
     /// communicates errors via a channel, and the main task races processing
     /// against renewal failure using `tokio::select!`.  On every exit path
     /// the renewer is cleanly stopped.
-    async fn process_claim(&self, claim: &ProcessingClaim) -> AppResult<ScannerOutcome> {
+    async fn process_claim(
+        &self,
+        claim: &ProcessingClaim,
+        classifier: Arc<ClassifierClient>,
+    ) -> AppResult<ScannerOutcome> {
         let image_id = claim.image_id;
         let generation = claim.generation;
         let image_key_short = &claim.image_key.as_str()[..claim.image_key.as_str().len().min(12)];
@@ -450,7 +492,7 @@ impl Scanner {
         // request construction).  This phase can be slow for large images,
         // so we renew the lease right before the HTTP submission to ensure
         // the request is bounded by the lease duration.
-        let prepared = match self.classifier.build_classification_request(&jpeg_data) {
+        let prepared = match classifier.build_classification_request(&jpeg_data) {
             Ok(prepared) => prepared,
             Err(e) => {
                 // Build failures are permanent — the request body was invalid.
@@ -543,7 +585,7 @@ impl Scanner {
                 ).await.err();
                 return Err(shutdown_error.unwrap_or(renewal_error));
             }
-            raw_bytes = self.classifier.get_raw_response(prepared) => {
+            raw_bytes = classifier.get_raw_response(prepared) => {
                 match raw_bytes {
                     Ok(bytes) => bytes,
                     Err(classifier_err) => {
@@ -574,7 +616,7 @@ impl Scanner {
         // `raw_bytes` was produced by the supervised HTTP branch above.
 
         // Spawn the CPU-heavy parsing task while the renewer remains active.
-        let classifier_for_parse = self.classifier.clone();
+        let classifier_for_parse = classifier.clone();
         let mut parse_handle = tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             if FORCE_PARSE_TASK_JOIN_ERROR.load(Ordering::SeqCst) {
@@ -690,6 +732,7 @@ impl Scanner {
                         image_id,
                         output,
                         generation,
+                        &classifier,
                         &request_started_at,
                         &request_completed_at,
                     )
@@ -734,12 +777,14 @@ impl Scanner {
         image_id: ImageId,
         output: ClassifierOutput,
         generation: i64,
+        classifier: &ClassifierClient,
         request_started_at: &Timestamp,
         request_completed_at: &Timestamp,
     ) -> AppResult<ScannerOutcome> {
         let classification = classification_input(
             output,
-            &self.options,
+            classifier.model(),
+            classifier.prompt_version(),
             request_started_at,
             request_completed_at,
         )?;
@@ -907,6 +952,14 @@ pub struct ScannerPassReport {
 }
 
 /// Display a compact summary of the scanner pass report.
+fn merge_scanner_report(total: &mut ScannerPassReport, worker: ScannerPassReport) {
+    total.claimed += worker.claimed;
+    total.completed += worker.completed;
+    total.retry_scheduled += worker.retry_scheduled;
+    total.failed += worker.failed;
+    total.missing += worker.missing;
+}
+
 impl std::fmt::Display for ScannerPassReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -1103,7 +1156,8 @@ pub async fn load_and_validate_jpeg(
 /// Convert validated classifier output into the repository's atomic completion input.
 pub fn classification_input(
     output: ClassifierOutput,
-    options: &ScannerOptions,
+    model: &str,
+    prompt_version: &str,
     started_at: &Timestamp,
     completed_at: &Timestamp,
 ) -> AppResult<ClassificationInput> {
@@ -1118,8 +1172,8 @@ pub fn classification_input(
     })?;
 
     Ok(ClassificationInput {
-        model: options.model.clone(),
-        prompt_version: options.prompt_version.clone(),
+        model: model.to_string(),
+        prompt_version: prompt_version.to_string(),
         contains_wildlife: output.classification.contains_wildlife,
         is_interesting: output.classification.is_interesting,
         summary: Some(output.classification.summary),
@@ -1310,7 +1364,7 @@ mod tests {
     // ── Option construction tests ───────────────────────────────────────
 
     #[test]
-    fn scanner_options_from_config_requires_enabled_classifier() {
+    fn scanner_options_from_config_requires_an_endpoint() {
         let config = Config {
             general: crate::configuration::GeneralConfig {
                 database_path: PathBuf::from("/tmp/test.db"),
@@ -1347,24 +1401,12 @@ mod tests {
                 },
             },
             classifier: crate::configuration::ClassifierConfig {
-                enabled: false,
-                base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
-                endpoint: "/chat/completions".to_string(),
-                model: "test".to_string(),
-                api_key: None,
-                username: String::new(),
-                password: None,
-                request_timeout_seconds: 120,
+                endpoints: Vec::new(),
                 poll_interval_seconds: 10,
                 retry_limit: 5,
                 retry_initial_delay_seconds: 10,
                 retry_max_delay_seconds: 300,
                 processing_lease_seconds: 600,
-                prompt_version: "wildlife-v1".to_string(),
-                generation: crate::configuration::ClassifierGenerationConfig {
-                    temperature: 0.1,
-                    max_tokens: 1000,
-                },
             },
             source_path: PathBuf::from("/tmp/test.toml"),
         };
@@ -1372,7 +1414,7 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err.category, ErrorCategory::Configuration);
-        assert!(err.message.contains("disabled"));
+        assert!(err.message.contains("no classifier endpoints"));
     }
 
     // ── Exponential backoff tests ───────────────────────────────────────
@@ -1450,8 +1492,6 @@ mod tests {
     #[test]
     fn lease_deadline_is_future() {
         let options = ScannerOptions {
-            model: "test".to_string(),
-            prompt_version: "v1".to_string(),
             poll_interval: Duration::from_secs(10),
             retry_limit: 5,
             retry_initial_delay: Duration::from_secs(10),
@@ -1572,29 +1612,28 @@ mod tests {
             .mount(&server)
             .await;
         let classifier_config = crate::configuration::ClassifierConfig {
-            enabled: true,
-            base_url: url::Url::parse(&server.uri()).unwrap(),
-            endpoint: "/chat/completions".to_string(),
-            model: "test-model".to_string(),
-            api_key: None,
-            username: String::new(),
-            password: None,
-            request_timeout_seconds: 10,
+            endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                base_url: url::Url::parse(&server.uri()).unwrap(),
+                endpoint: "/chat/completions".to_string(),
+                model: "test-model".to_string(),
+                api_key: None,
+                username: String::new(),
+                password: None,
+                request_timeout_seconds: 10,
+                prompt_version: "test-v1".to_string(),
+                generation: ClassifierGenerationConfig {
+                    temperature: 0.1,
+                    max_tokens: 100,
+                },
+            }],
             poll_interval_seconds: 10,
             retry_limit: 3,
             retry_initial_delay_seconds: 1,
             retry_max_delay_seconds: 30,
             processing_lease_seconds: 60,
-            prompt_version: "test-v1".to_string(),
-            generation: ClassifierGenerationConfig {
-                temperature: 0.1,
-                max_tokens: 100,
-            },
         };
         let classifier = Arc::new(ClassifierClient::from_config(&classifier_config).unwrap());
         let options = ScannerOptions {
-            model: "test-model".to_string(),
-            prompt_version: "test-v1".to_string(),
             poll_interval: Duration::from_secs(10),
             retry_limit: 3,
             retry_initial_delay: Duration::from_secs(1),
@@ -1663,24 +1702,25 @@ mod tests {
                 },
             },
             classifier: crate::configuration::ClassifierConfig {
-                enabled: true,
-                base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
-                endpoint: "/chat/completions".to_string(),
-                model: "test".to_string(),
-                api_key: None,
-                username: String::new(),
-                password: None,
-                request_timeout_seconds: 120,
+                endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                    base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
+                    endpoint: "/chat/completions".to_string(),
+                    model: "test".to_string(),
+                    api_key: None,
+                    username: String::new(),
+                    password: None,
+                    request_timeout_seconds: 120,
+                    prompt_version: "wildlife-v1".to_string(),
+                    generation: crate::configuration::ClassifierGenerationConfig {
+                        temperature: 0.1,
+                        max_tokens: 1000,
+                    },
+                }],
                 poll_interval_seconds: 10,
                 retry_limit: 5,
                 retry_initial_delay_seconds: 10,
                 retry_max_delay_seconds: 300,
-                processing_lease_seconds: 60, // less than request_timeout of 120
-                prompt_version: "wildlife-v1".to_string(),
-                generation: crate::configuration::ClassifierGenerationConfig {
-                    temperature: 0.1,
-                    max_tokens: 1000,
-                },
+                processing_lease_seconds: 60,
             },
             source_path: PathBuf::from("/tmp/test.toml"),
         };
@@ -1731,24 +1771,25 @@ mod tests {
                 },
             },
             classifier: crate::configuration::ClassifierConfig {
-                enabled: true,
-                base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
-                endpoint: "/chat/completions".to_string(),
-                model: "test".to_string(),
-                api_key: None,
-                username: String::new(),
-                password: None,
-                request_timeout_seconds: 30,
+                endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                    base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
+                    endpoint: "/chat/completions".to_string(),
+                    model: "test".to_string(),
+                    api_key: None,
+                    username: String::new(),
+                    password: None,
+                    request_timeout_seconds: 30,
+                    prompt_version: "wildlife-v1".to_string(),
+                    generation: crate::configuration::ClassifierGenerationConfig {
+                        temperature: 0.1,
+                        max_tokens: 1000,
+                    },
+                }],
                 poll_interval_seconds: 10,
                 retry_limit: 5,
                 retry_initial_delay_seconds: 10,
                 retry_max_delay_seconds: 300,
-                processing_lease_seconds: 10_000_000_000, // way too large
-                prompt_version: "wildlife-v1".to_string(),
-                generation: crate::configuration::ClassifierGenerationConfig {
-                    temperature: 0.1,
-                    max_tokens: 1000,
-                },
+                processing_lease_seconds: 10_000_000_000,
             },
             source_path: PathBuf::from("/tmp/test.toml"),
         };
@@ -1798,24 +1839,25 @@ mod tests {
                 },
             },
             classifier: crate::configuration::ClassifierConfig {
-                enabled: true,
-                base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
-                endpoint: "/chat/completions".to_string(),
-                model: "test".to_string(),
-                api_key: None,
-                username: String::new(),
-                password: None,
-                request_timeout_seconds: 120,
+                endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                    base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
+                    endpoint: "/chat/completions".to_string(),
+                    model: "test".to_string(),
+                    api_key: None,
+                    username: String::new(),
+                    password: None,
+                    request_timeout_seconds: 120,
+                    prompt_version: "wildlife-v1".to_string(),
+                    generation: crate::configuration::ClassifierGenerationConfig {
+                        temperature: 0.1,
+                        max_tokens: 1000,
+                    },
+                }],
                 poll_interval_seconds: 10,
                 retry_limit: 5,
                 retry_initial_delay_seconds: 10,
                 retry_max_delay_seconds: 300,
-                processing_lease_seconds: 120, // equal to request timeout
-                prompt_version: "wildlife-v1".to_string(),
-                generation: crate::configuration::ClassifierGenerationConfig {
-                    temperature: 0.1,
-                    max_tokens: 1000,
-                },
+                processing_lease_seconds: 120,
             },
             source_path: PathBuf::from("/tmp/test.toml"),
         };
@@ -1866,24 +1908,25 @@ mod tests {
                 },
             },
             classifier: crate::configuration::ClassifierConfig {
-                enabled: true,
-                base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
-                endpoint: "/chat/completions".to_string(),
-                model: "test".to_string(),
-                api_key: None,
-                username: String::new(),
-                password: None,
-                request_timeout_seconds: 120,
+                endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                    base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
+                    endpoint: "/chat/completions".to_string(),
+                    model: "test".to_string(),
+                    api_key: None,
+                    username: String::new(),
+                    password: None,
+                    request_timeout_seconds: 120,
+                    prompt_version: "wildlife-v1".to_string(),
+                    generation: crate::configuration::ClassifierGenerationConfig {
+                        temperature: 0.1,
+                        max_tokens: 1000,
+                    },
+                }],
                 poll_interval_seconds: 10,
                 retry_limit: 5,
                 retry_initial_delay_seconds: 10,
                 retry_max_delay_seconds: 300,
-                processing_lease_seconds: 121, // one second above timeout
-                prompt_version: "wildlife-v1".to_string(),
-                generation: crate::configuration::ClassifierGenerationConfig {
-                    temperature: 0.1,
-                    max_tokens: 1000,
-                },
+                processing_lease_seconds: 121,
             },
             source_path: PathBuf::from("/tmp/test.toml"),
         };

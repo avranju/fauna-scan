@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use assert_cmd::prelude::*;
+use fauna_scan::configuration::Config;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -54,7 +55,6 @@ password = "literal-password"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -82,7 +82,6 @@ password_file = "{secret}"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
         secret = secret_path.display(),
@@ -110,7 +109,6 @@ password_env = "FAUNA_SCAN_NVR_PASSWORD"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -145,14 +143,15 @@ password = "nvr-pass"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test-model"
 api_key_file = "{api_key}"
 username = "cls-user"
 password_file = "{pass}"
 
-[classifier.generation]
+[classifier.endpoints.generation]
 temperature = 0.5
 max_tokens = 500
 "#,
@@ -165,12 +164,10 @@ max_tokens = 500
 }
 
 #[test]
-fn classifier_disabled_bypasses_url_and_secret_validation() {
+fn classifier_endpoints_are_resolved_independently() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("output");
     std::fs::create_dir(&output).unwrap();
-
-    // Deliberately broken URL and nonexistent secret file — should be ignored
     let toml = format!(
         r#"[general]
 output_directory = "{output}"
@@ -184,9 +181,69 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
-base_url = "not-a-url-at-all"
-api_key_file = "/nonexistent/classifier-key"
+processing_lease_seconds = 600
+
+[[classifier.endpoints]]
+base_url = "http://classifier-one:8081/v1"
+model = "primary-model"
+api_key = "primary-key"
+request_timeout_seconds = 120
+
+[[classifier.endpoints]]
+base_url = "http://classifier-two:8082/v1"
+model = "secondary-model"
+api_key = "secondary-key"
+request_timeout_seconds = 60
+
+[classifier.endpoints.generation]
+temperature = 0.4
+max_tokens = 500
+
+[[classifier.endpoints]]
+base_url = "http://classifier-three:8083/v1"
+model = "tertiary-model"
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let config = Config::load(Some(&path)).unwrap();
+
+    assert_eq!(config.classifier.endpoints.len(), 3);
+    let endpoint = &config.classifier.endpoints[1];
+    assert_eq!(endpoint.base_url.host_str(), Some("classifier-two"));
+    assert_eq!(endpoint.endpoint, "/chat/completions");
+    assert_eq!(endpoint.model, "secondary-model");
+    assert_eq!(endpoint.request_timeout_seconds, 60);
+    assert_eq!(endpoint.prompt_version, "wildlife-v1");
+    assert_eq!(endpoint.generation.temperature, 0.4);
+    assert_eq!(endpoint.generation.max_tokens, 500);
+    assert_eq!(endpoint.api_key.as_ref().unwrap().expose(), "secondary-key");
+    assert!(
+        config.classifier.endpoints[2].api_key.is_none(),
+        "primary credentials must not be forwarded to another endpoint"
+    );
+}
+
+#[test]
+fn empty_classifier_endpoint_list_is_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    // Classification is optional when no endpoint tables are configured.
+    let toml = format!(
+        r#"[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
 "#,
         output = output.display(),
     );
@@ -213,7 +270,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -241,7 +297,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -292,7 +347,6 @@ password_file = "{secret}"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
         secret = secret_path.display(),
@@ -322,7 +376,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "literal-key"
@@ -337,9 +392,7 @@ api_key_env = "FAUNA_SCAN_API_KEY"
 }
 
 #[test]
-fn classifier_disabled_api_key_conflict_still_detected() {
-    // Even when classifier is disabled, configuring multiple sources for
-    // the same secret should fail.
+fn legacy_top_level_classifier_api_key_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("output");
     std::fs::create_dir(&output).unwrap();
@@ -357,20 +410,18 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
-api_key = "literal-key"
-api_key_file = "/tmp/ignored"
+api_key = "legacy-key"
 "#,
         output = output.display(),
     );
     let path = write_config(&dir, &toml);
     cmd_with_config(&path)
         .failure()
-        .stderr(predicate::str::contains("multiple sources"));
+        .stderr(predicate::str::contains("unknown field"));
 }
 
 #[test]
-fn classifier_disabled_password_conflict_still_detected() {
+fn legacy_top_level_classifier_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("output");
     std::fs::create_dir(&output).unwrap();
@@ -388,16 +439,14 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
-password = "literal"
-password_env = "FAUNA_SCAN_CLS_PASSWORD"
+password = "legacy-password"
 "#,
         output = output.display(),
     );
     let path = write_config(&dir, &toml);
     cmd_with_config(&path)
         .failure()
-        .stderr(predicate::str::contains("multiple sources"));
+        .stderr(predicate::str::contains("unknown field"));
 }
 
 // ── Missing secrets ───────────────────────────────────────────────────────
@@ -421,7 +470,6 @@ password_file = "/nonexistent/secret-file"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -448,7 +496,6 @@ password_env = "FAUNA_SCAN_NONEXISTENT_VAR_12345"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -479,7 +526,6 @@ password = "x"
 start_at = "not-a-timestamp"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -508,7 +554,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -537,7 +582,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -569,7 +613,6 @@ start_at = "2026-01-01T00:00:00Z"
 max_results = 0
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -599,7 +642,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -629,7 +671,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db.display(),
         output = output.display(),
@@ -659,7 +700,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db.display(),
         output = output.display(),
@@ -689,7 +729,6 @@ password = "SENTINEL-PASSWORD-DO-NOT-LEAK"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -733,7 +772,6 @@ password = "SENTINEL-PASSWORD-DO-NOT-LEAK"
 start_at = "invalid-timestamp"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -777,7 +815,8 @@ password = "nvr-pass"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 api_key = "SENTINEL-API-KEY-DO-NOT-LEAK"
 "#,
@@ -824,7 +863,6 @@ password = "SENTINEL-MALFORMED-TOML" trailing-garbage
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -876,7 +914,6 @@ password = "x"
 start_at = "2026-07-11T05:30:00+05:30"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -928,21 +965,22 @@ verify_jpeg = true
 rebase_playback_urls = true
 
 [classifier]
-enabled = true
+poll_interval_seconds = 10
+retry_limit = 5
+retry_initial_delay_seconds = 10
+retry_max_delay_seconds = 300
+processing_lease_seconds = 600
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/chat/completions"
 model = "vision-model"
 api_key = "test-key"
 username = ""
 request_timeout_seconds = 120
-poll_interval_seconds = 10
-retry_limit = 5
-retry_initial_delay_seconds = 10
-retry_max_delay_seconds = 300
-processing_lease_seconds = 600
 prompt_version = "wildlife-v1"
 
-[classifier.generation]
+[classifier.endpoints.generation]
 temperature = 0.1
 max_tokens = 1000
 "#,
@@ -974,7 +1012,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://user:SENTINEL-URL-CRED@localhost:8081/v1"
 model = "test"
 api_key = "k"
@@ -1024,7 +1063,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "SENTINEL-INVALID-URL-VALUE"
 model = "test"
 api_key = "k"
@@ -1073,7 +1113,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "ftp://localhost:8081/v1"
 model = "test"
 api_key = "k"
@@ -1105,7 +1146,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 username = "cls-user"
@@ -1137,7 +1179,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 password = "cls-pass"
@@ -1169,7 +1212,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 "#,
@@ -1198,7 +1242,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 username = "cls-user"
@@ -1229,7 +1274,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "test-key"
@@ -1261,7 +1307,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "https://localhost:8081/v1"
 model = "test"
 api_key = "k"
@@ -1270,60 +1317,6 @@ api_key = "k"
     );
     let path = write_config(&dir, &toml);
     cmd_with_config(&path).success();
-}
-
-// ── Reviewer feedback: SecretSource Debug redaction at process level ──────
-
-// ── Reviewer feedback: disabled classifier URL credential leakage ──────────
-
-#[test]
-fn classifier_disabled_credential_bearing_url_not_in_debug_or_output() {
-    // Load a disabled classifier with a valid credential-bearing URL and
-    // assert the sentinel is absent from stdout and stderr.
-    let dir = tempfile::tempdir().unwrap();
-    let output = dir.path().join("output");
-    std::fs::create_dir(&output).unwrap();
-
-    let toml = format!(
-        r#"[general]
-output_directory = "{output}"
-
-[nvr]
-scheme = "http"
-host = "p"
-port = 80
-username = "u"
-password = "x"
-start_at = "2026-01-01T00:00:00Z"
-
-[classifier]
-enabled = false
-base_url = "http://user:SENTINEL-DISABLED-URL-CRED@localhost:8081/v1"
-"#,
-        output = output.display(),
-    );
-    let path = write_config(&dir, &toml);
-
-    let mut cmd = Command::cargo_bin("fauna-scan").unwrap();
-    cmd.env("CLICOLOR_FORCE", "0");
-    cmd.arg("--config").arg(&path).arg("check-config");
-    let output = cmd.output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "check-config should succeed with disabled classifier"
-    );
-    assert!(
-        !stdout.contains("SENTINEL-DISABLED-URL-CRED"),
-        "credential leaked in stdout: {}",
-        stdout
-    );
-    assert!(
-        !stderr.contains("SENTINEL-DISABLED-URL-CRED"),
-        "credential leaked in stderr: {}",
-        stderr
-    );
 }
 
 #[test]
@@ -1345,7 +1338,6 @@ password = "SENTINEL-DEBUG-LEAK"
 start_at = "not-a-timestamp"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -1390,7 +1382,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "http://user:SENTINEL-EP-CRED@host/path"
 model = "test"
@@ -1440,7 +1433,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/user:SENTINEL-AT-CRED@/path"
 model = "test"
@@ -1472,59 +1466,6 @@ model = "test"
 }
 
 #[test]
-fn classifier_disabled_endpoint_not_retained_at_process_level() {
-    // When classifier is disabled, a credential-bearing endpoint must not be
-    // retained. The check should succeed and the sentinel must not appear in
-    // any output.
-    let dir = tempfile::tempdir().unwrap();
-    let output = dir.path().join("output");
-    std::fs::create_dir(&output).unwrap();
-
-    let toml = format!(
-        r#"[general]
-output_directory = "{output}"
-
-[nvr]
-scheme = "http"
-host = "p"
-port = 80
-username = "u"
-password = "x"
-start_at = "2026-01-01T00:00:00Z"
-
-[classifier]
-enabled = false
-endpoint = "http://user:SENTINEL-DISABLED-EP@host/path"
-"#,
-        output = output.display(),
-    );
-    let path = write_config(&dir, &toml);
-
-    let mut cmd = Command::cargo_bin("fauna-scan").unwrap();
-    cmd.env("CLICOLOR_FORCE", "0");
-    cmd.arg("--config").arg(&path).arg("check-config");
-    let output = cmd.output().unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "check-config should succeed with disabled classifier"
-    );
-    assert!(
-        !stdout.contains("SENTINEL-DISABLED-EP"),
-        "disabled endpoint credential leaked in stdout: {}",
-        stdout
-    );
-    assert!(
-        !stderr.contains("SENTINEL-DISABLED-EP"),
-        "disabled endpoint credential leaked in stderr: {}",
-        stderr
-    );
-}
-
-// ── Default XDG path loading ──────────────────────────────────────────────
-
-#[test]
 fn default_xdg_config_path_loads() {
     let dir = tempfile::tempdir().unwrap();
     let xdg_config = dir.path().join("xdg_config");
@@ -1547,7 +1488,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output_dir.display(),
     );
@@ -1586,7 +1526,6 @@ username = "u"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
     std::fs::write(xdg_config.join("fauna-scan/config.toml"), invalid_toml).unwrap();
 
@@ -1604,7 +1543,6 @@ password = "explicit-pass"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output_dir.display(),
     );
@@ -1640,7 +1578,6 @@ username = "u"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -1671,7 +1608,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -1700,7 +1636,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "   "
 api_key = "k"
@@ -1710,7 +1647,7 @@ api_key = "k"
     let path = write_config(&dir, &toml);
     cmd_with_config(&path)
         .failure()
-        .stderr(predicate::str::contains("classifier.model"));
+        .stderr(predicate::str::contains("classifier.endpoints[0].model"));
 }
 
 #[test]
@@ -1732,7 +1669,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "k"
@@ -1743,7 +1681,9 @@ prompt_version = "   "
     let path = write_config(&dir, &toml);
     cmd_with_config(&path)
         .failure()
-        .stderr(predicate::str::contains("classifier.prompt_version"));
+        .stderr(predicate::str::contains(
+            "classifier.endpoints[0].prompt_version",
+        ));
 }
 
 // ── Invalid classifier temperature ────────────────────────────────────────
@@ -1767,12 +1707,13 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "k"
 
-[classifier.generation]
+[classifier.endpoints.generation]
 temperature = -0.5
 max_tokens = 1000
 "#,
@@ -1805,12 +1746,13 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+retry_initial_delay_seconds = 500
+retry_max_delay_seconds = 100
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "k"
-retry_initial_delay_seconds = 500
-retry_max_delay_seconds = 100
 "#,
         output = output.display(),
     );
@@ -1844,7 +1786,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db_dir.display(),
         output = output.display(),
@@ -1887,7 +1828,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db_path.display(),
         output = output.display(),
@@ -1931,7 +1871,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db.display(),
         output = output_path.display(),
@@ -1964,7 +1903,6 @@ password = "SENTINEL-DIAG-LEAK" trailing-junk
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2021,7 +1959,6 @@ password = "SENTINEL-UNTERM
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2072,7 +2009,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 
 [invalid_section
 "#,
@@ -2119,7 +2055,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2163,7 +2098,6 @@ password = 'SENTINEL-SINGLE-QUOTE-LEAK' trailing-junk
 start_at = '2026-01-01T00:00:00Z'
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2208,7 +2142,6 @@ password = "SENTINEL-MULTILINE-LEAK"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 
 [invalid_section
 "#,
@@ -2255,7 +2188,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2284,7 +2216,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2313,7 +2244,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2344,7 +2274,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "//evil.invalid/path"
 model = "test"
@@ -2390,7 +2321,6 @@ password = "x"
 start_at = "SENTINEL-BAD-TIMESTAMP-VALUE"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2431,7 +2361,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2470,7 +2399,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2514,7 +2442,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2569,7 +2496,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db_path.display(),
         output = output.display(),
@@ -2611,7 +2537,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db.display(),
         output = output_path.display(),
@@ -2651,7 +2576,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/\\evil.invalid/path"
 model = "test"
@@ -2696,7 +2622,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/path\\with\\backslash"
 model = "test"
@@ -2754,7 +2681,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db.display(),
         output = output.display(),
@@ -2805,7 +2731,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db.display(),
         output = output.display(),
@@ -2846,7 +2771,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2901,7 +2825,6 @@ password = 'x'
 start_at = '2026-01-01T00:00:00Z'
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -2960,7 +2883,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -3028,7 +2950,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         output = output.display(),
     );
@@ -3103,7 +3024,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db_link.display(),
         output = output.display(),
@@ -3142,7 +3062,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db.display(),
         output = output_link.display(),
@@ -3182,7 +3101,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db.display(),
         output = output.display(),

@@ -43,13 +43,10 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
 /// Handle the `check-config` command.
 ///
 /// Loads, resolves, and validates the configuration without contacting
-/// external services or creating directories.  Scanner-specific policy
-/// (disabled classifier, lease relationships, maximum duration) is
-/// validated during `Config::load` via `validate_config` for shared
-/// classifier settings, and in `ScannerOptions::from_config` for
-/// scanner-only checks.  This allows `check-config` to accept a
-/// disabled classifier (valid for other commands) while still
-/// rejecting invalid lease configurations.
+/// external services or creating directories. Shared classifier policy and
+/// endpoint-specific lease relationships are validated during `Config::load`.
+/// An empty endpoint list is valid here because classification is optional for
+/// commands that do not run the scanner.
 fn handle_check_config(config_path: Option<&Path>) -> AppResult<()> {
     let config = Config::load(config_path)?;
 
@@ -287,11 +284,11 @@ async fn handle_download(
 /// Run the complete service with downloader and scanner under one supervisor.
 async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
     let config = Config::load(config_path)?;
-    if !config.classifier.enabled {
+    if config.classifier.endpoints.is_empty() {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "run",
-            "classifier is disabled; run requires downloader and scanner pipelines",
+            "no classifier endpoints are configured; run requires downloader and scanner pipelines",
         ));
     }
     let scanner_options = ScannerOptions::from_config(&config)?;
@@ -355,8 +352,8 @@ async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
 
     // HTTP clients are fully constructed before discovery, but no primary
     // pipeline is spawned until discovery and synchronization finish.
-    let classifier = crate::classifier::ClassifierClient::from_config(&config.classifier)?;
-    let scanner = Scanner::new(ops.clone(), Arc::new(classifier), scanner_options);
+    let classifiers = classifier_clients(&config.classifier)?;
+    let scanner = Scanner::with_classifiers(ops.clone(), classifiers, scanner_options);
 
     // Discovery is deliberately completed before either task is spawned.
     match orchestrator.attempt_discovery().await {
@@ -457,6 +454,19 @@ fn with_command_context(operation: &'static str, error: AppError) -> AppError {
     AppError::with_source(error.category, operation, error.message.clone(), error)
 }
 
+/// Build one client for each configured classifier endpoint.
+fn classifier_clients(
+    config: &crate::configuration::ClassifierConfig,
+) -> AppResult<Vec<Arc<crate::classifier::ClassifierClient>>> {
+    let mut clients = Vec::with_capacity(config.endpoints.len());
+    for endpoint in &config.endpoints {
+        clients.push(Arc::new(
+            crate::classifier::ClassifierClient::from_endpoint_config(endpoint)?,
+        ));
+    }
+    Ok(clients)
+}
+
 fn is_recoverable_nvr_error(category: ErrorCategory) -> bool {
     matches!(
         category,
@@ -519,19 +529,17 @@ fn create_runtime_directories(config: &Config) -> AppResult<()> {
 
 /// Handle the `scan` subcommand.
 ///
-/// Loads configuration, rejects a disabled classifier **before** creating
-/// directories or opening the database (so the classifier-disabled error
-/// is always the first and clearest failure), then constructs
+/// Loads configuration, requires at least one classifier endpoint **before**
+/// creating directories or opening the database, then constructs
 /// ClassifierClient and ScannerOptions, and either executes one finite
 /// pass (`--once`) or enters continuous polling.
 async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> AppResult<()> {
     // Load and validate configuration.
     let config = Config::load(config_path)?;
 
-    // Reject a disabled classifier immediately — before any filesystem
-    // mutation or database open.  This guarantees the classifier-disabled
-    // error is never masked by downstream errors and that a disabled
-    // invocation has no side effects.
+    // Require an endpoint immediately, before any filesystem mutation or
+    // database open, so the configuration error is not masked by downstream
+    // failures and an endpoint-less invocation has no side effects.
     ScannerOptions::from_config(&config)?;
 
     // Create runtime directories (database parent and output directory).
@@ -540,14 +548,14 @@ async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> 
     // Open the database (applies migrations).
     let database = Database::open(&config.general.database_path).await?;
 
-    // Build the classifier client — also rejects disabled classifier.
-    let classifier = crate::classifier::ClassifierClient::from_config(&config.classifier)?;
+    // Build one client per endpoint.
+    let classifiers = classifier_clients(&config.classifier)?;
 
-    // Build scanner options from config (also rejects disabled classifier).
+    // Build scanner options from shared pool policy.
     let options = ScannerOptions::from_config(&config)?;
 
-    // Build scanner.
-    let scanner = Scanner::new(database.ops(), Arc::new(classifier), options);
+    // Build one concurrent worker per configured classifier endpoint.
+    let scanner = Scanner::with_classifiers(database.ops(), classifiers, options);
 
     if args.once {
         // One finite pass: drain all currently eligible images.

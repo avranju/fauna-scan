@@ -36,20 +36,26 @@ concurrency = 2
 playback_host_allowlist = []
 
 [classifier]
-enabled = true
+poll_interval_seconds = 10
+retry_limit = 5
+retry_initial_delay_seconds = 10
+retry_max_delay_seconds = 300
+processing_lease_seconds = 600
+
+[[classifier.endpoints]]
 base_url = "http://classifier:8081/v1"
 endpoint = "/chat/completions"
 model = "vision-model"
 api_key_file = "/run/secrets/classifier_api_key"
 username = ""
 request_timeout_seconds = 120
-poll_interval_seconds = 10
-retry_limit = 5
-retry_initial_delay_seconds = 10
-retry_max_delay_seconds = 300
-processing_lease_seconds = 600
 prompt_version = "wildlife-v1"
 
-[classifier.generation]
+[classifier.endpoints.generation]
 temperature = 0.1
 max_tokens = 1000
+
+# [[classifier.endpoints]]
+# base_url = "http://classifier-2:8081/v1"
+# model = "second-vision-model"
+# api_key_file = "/run/secrets/classifier_2_api_key"

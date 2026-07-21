@@ -115,8 +115,32 @@ pub struct NvrDownloadConfig {
 /// Resolved classifier settings.
 #[derive(Debug, Clone)]
 pub struct ClassifierConfig {
-    /// Whether classification is enabled.
-    pub enabled: bool,
+    /// Configured classifier endpoints. An empty list disables classification.
+    pub endpoints: Vec<ClassifierEndpointConfig>,
+    /// Poll interval in seconds.
+    pub poll_interval_seconds: u64,
+    /// Maximum retry attempts.
+    pub retry_limit: u32,
+    /// Initial retry delay in seconds.
+    pub retry_initial_delay_seconds: u32,
+    /// Maximum retry delay in seconds.
+    pub retry_max_delay_seconds: u32,
+    /// Processing lease duration in seconds.
+    pub processing_lease_seconds: u64,
+}
+
+/// Resolved classifier generation settings.
+#[derive(Debug, Clone)]
+pub struct ClassifierGenerationConfig {
+    /// Temperature for generation.
+    pub temperature: f32,
+    /// Maximum tokens to generate.
+    pub max_tokens: u32,
+}
+
+/// A fully resolved classifier endpoint.
+#[derive(Debug, Clone)]
+pub struct ClassifierEndpointConfig {
     /// Base URL of the classifier API.
     pub base_url: Url,
     /// API endpoint path.
@@ -131,29 +155,10 @@ pub struct ClassifierConfig {
     pub password: Option<Secret>,
     /// Request timeout in seconds.
     pub request_timeout_seconds: u64,
-    /// Poll interval in seconds.
-    pub poll_interval_seconds: u64,
-    /// Maximum retry attempts.
-    pub retry_limit: u32,
-    /// Initial retry delay in seconds.
-    pub retry_initial_delay_seconds: u32,
-    /// Maximum retry delay in seconds.
-    pub retry_max_delay_seconds: u32,
-    /// Processing lease duration in seconds.
-    pub processing_lease_seconds: u64,
     /// Prompt version identifier.
     pub prompt_version: String,
     /// Generation settings.
     pub generation: ClassifierGenerationConfig,
-}
-
-/// Resolved classifier generation settings.
-#[derive(Debug, Clone)]
-pub struct ClassifierGenerationConfig {
-    /// Temperature for generation.
-    pub temperature: f32,
-    /// Maximum tokens to generate.
-    pub max_tokens: u32,
 }
 
 // ── Raw TOML input models ──────────────────────────────────────────────────
@@ -222,7 +227,18 @@ struct RawNvrDownloadConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawClassifierConfig {
-    enabled: Option<bool>,
+    poll_interval_seconds: Option<u64>,
+    retry_limit: Option<u32>,
+    retry_initial_delay_seconds: Option<u32>,
+    retry_max_delay_seconds: Option<u32>,
+    processing_lease_seconds: Option<u64>,
+    endpoints: Vec<RawClassifierEndpointConfig>,
+}
+
+/// Per-endpoint settings for `[[classifier.endpoints]]`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawClassifierEndpointConfig {
     base_url: Option<String>,
     endpoint: Option<String>,
     model: Option<String>,
@@ -234,11 +250,6 @@ struct RawClassifierConfig {
     password_file: Option<PathBuf>,
     password_env: Option<String>,
     request_timeout_seconds: Option<u64>,
-    poll_interval_seconds: Option<u64>,
-    retry_limit: Option<u32>,
-    retry_initial_delay_seconds: Option<u32>,
-    retry_max_delay_seconds: Option<u32>,
-    processing_lease_seconds: Option<u64>,
     prompt_version: Option<String>,
     generation: Option<RawClassifierGenerationConfig>,
 }
@@ -413,13 +424,7 @@ impl Config {
         };
 
         // ── Resolve classifier ─────────────────────────────────────────────
-        let classifier_enabled = raw.classifier.enabled.unwrap_or(false);
-
-        let classifier = if classifier_enabled {
-            resolve_enabled_classifier(&raw.classifier, &get_env)?
-        } else {
-            resolve_disabled_classifier(&raw.classifier)?
-        };
+        let classifier = resolve_classifier(&raw.classifier, &get_env)?;
 
         let config = Config {
             general,
@@ -441,14 +446,39 @@ impl Config {
     }
 }
 
-/// Resolve classifier config when enabled — requires URL, model, auth, etc.
-fn resolve_enabled_classifier<F>(
-    raw: &RawClassifierConfig,
-    get_env: &F,
-) -> AppResult<ClassifierConfig>
+/// Resolve classifier pool settings and each independently configured endpoint.
+fn resolve_classifier<F>(raw: &RawClassifierConfig, get_env: &F) -> AppResult<ClassifierConfig>
 where
     F: Fn(&str) -> Option<String>,
 {
+    let endpoints = raw
+        .endpoints
+        .iter()
+        .enumerate()
+        .map(|(index, endpoint)| resolve_classifier_endpoint(endpoint, get_env, index))
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(ClassifierConfig {
+        endpoints,
+        poll_interval_seconds: raw.poll_interval_seconds.unwrap_or(10),
+        retry_limit: raw.retry_limit.unwrap_or(5),
+        retry_initial_delay_seconds: raw.retry_initial_delay_seconds.unwrap_or(10),
+        retry_max_delay_seconds: raw.retry_max_delay_seconds.unwrap_or(300),
+        processing_lease_seconds: raw.processing_lease_seconds.unwrap_or(600),
+    })
+}
+
+/// Resolve one classifier endpoint. Endpoint settings never inherit from
+/// another endpoint, so credentials and model selection remain isolated.
+fn resolve_classifier_endpoint<F>(
+    raw: &RawClassifierEndpointConfig,
+    get_env: &F,
+    index: usize,
+) -> AppResult<ClassifierEndpointConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let label = format!("classifier.endpoints[{index}]");
     let base_url = raw
         .base_url
         .as_deref()
@@ -456,7 +486,7 @@ where
             AppError::new(
                 ErrorCategory::Configuration,
                 "load_config",
-                "classifier.base_url is required when classifier is enabled",
+                format!("{label}.base_url is required"),
             )
         })?
         .parse::<Url>()
@@ -464,151 +494,56 @@ where
             AppError::new(
                 ErrorCategory::Configuration,
                 "load_config",
-                "classifier.base_url is not a valid URL",
+                format!("{label}.base_url is not a valid URL"),
             )
         })?;
 
-    // Reject URLs containing embedded credentials (user:pass@host).
     if !base_url.username().is_empty() || base_url.password().is_some() {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "load_config",
-            "classifier.base_url must not contain embedded credentials; \
-             use classifier.username/classifier.password or classifier.api_key instead",
+            format!("{label}.base_url must not contain embedded credentials"),
         ));
     }
-
-    let endpoint = validate_classifier_endpoint(raw.endpoint.as_deref())?;
 
     let model = raw.model.clone().ok_or_else(|| {
         AppError::new(
             ErrorCategory::Configuration,
             "load_config",
-            "classifier.model is required when classifier is enabled",
+            format!("{label}.model is required"),
         )
     })?;
-
-    // Classifier API key secret source — always validate source count
-    let api_key_source = SecretSource {
+    let api_key = SecretSource {
         literal: raw.api_key.clone(),
         file: raw.api_key_file.clone(),
         environment: raw.api_key_env.clone(),
-    };
-    let api_key = api_key_source.resolve("classifier.api_key", get_env)?;
-
-    let username = raw.username.clone().unwrap_or_default();
-
-    // Classifier password secret source — always validate source count
-    let password_source = SecretSource {
+    }
+    .resolve(&format!("{label}.api_key"), get_env)?;
+    let password = SecretSource {
         literal: raw.password.clone(),
         file: raw.password_file.clone(),
         environment: raw.password_env.clone(),
-    };
-    let password = password_source.resolve("classifier.password", get_env)?;
+    }
+    .resolve(&format!("{label}.password"), get_env)?;
+    let generation = raw.generation.clone().unwrap_or_default();
 
-    let request_timeout = raw.request_timeout_seconds.unwrap_or(120);
-    let poll_interval = raw.poll_interval_seconds.unwrap_or(10);
-    let retry_limit = raw.retry_limit.unwrap_or(5);
-    let retry_initial = raw.retry_initial_delay_seconds.unwrap_or(10);
-    let retry_max = raw.retry_max_delay_seconds.unwrap_or(300);
-    let lease_seconds = raw.processing_lease_seconds.unwrap_or(600);
-    let prompt_version = raw
-        .prompt_version
-        .clone()
-        .unwrap_or_else(|| "wildlife-v1".to_string());
-
-    let gen_raw = raw.generation.clone().unwrap_or_default();
-    let generation = ClassifierGenerationConfig {
-        temperature: gen_raw.temperature.unwrap_or(0.1),
-        max_tokens: gen_raw.max_tokens.unwrap_or(1000),
-    };
-
-    Ok(ClassifierConfig {
-        enabled: true,
+    Ok(ClassifierEndpointConfig {
         base_url,
-        endpoint,
+        endpoint: validate_classifier_endpoint(raw.endpoint.as_deref(), &label)?,
         model,
         api_key,
-        username,
-        password,
-        request_timeout_seconds: request_timeout,
-        poll_interval_seconds: poll_interval,
-        retry_limit,
-        retry_initial_delay_seconds: retry_initial,
-        retry_max_delay_seconds: retry_max,
-        processing_lease_seconds: lease_seconds,
-        prompt_version,
-        generation,
-    })
-}
-
-/// Resolve classifier config when disabled — no URL/auth validation, no
-/// secret file/environment reads, but source-count conflicts are still
-/// validated.
-fn resolve_disabled_classifier(raw: &RawClassifierConfig) -> AppResult<ClassifierConfig> {
-    let gen_raw = raw.generation.clone().unwrap_or_default();
-
-    // Validate secret-source conflicts even when disabled (source count only;
-    // no file reads or env lookups).
-    let api_key_source = SecretSource {
-        literal: raw.api_key.clone(),
-        file: raw.api_key_file.clone(),
-        environment: raw.api_key_env.clone(),
-    };
-    validate_secret_source_count(&api_key_source, "classifier.api_key")?;
-
-    let password_source = SecretSource {
-        literal: raw.password.clone(),
-        file: raw.password_file.clone(),
-        environment: raw.password_env.clone(),
-    };
-    validate_secret_source_count(&password_source, "classifier.password")?;
-
-    // When disabled, never retain the configured base_url because it may
-    // contain embedded credentials (e.g. http://user:pass@host). Use a
-    // fixed credential-free placeholder so Debug output cannot leak secrets.
-    let base_url = trusted_placeholder_url().map_err(|e| {
-        AppError::new(
-            ErrorCategory::Internal,
-            "resolve_disabled_classifier",
-            format!("internal error: trusted placeholder URL failed to parse: {e}"),
-        )
-    })?;
-
-    Ok(ClassifierConfig {
-        enabled: false,
-        base_url,
-        // When disabled, never retain the configured endpoint because it may
-        // contain an absolute URL or embedded credentials (e.g.
-        // http://user:pass@host/path). Use a fixed safe placeholder.
-        endpoint: "/chat/completions".to_string(),
-        model: raw.model.clone().unwrap_or_default(),
-        api_key: None,
         username: raw.username.clone().unwrap_or_default(),
-        password: None,
+        password,
         request_timeout_seconds: raw.request_timeout_seconds.unwrap_or(120),
-        poll_interval_seconds: raw.poll_interval_seconds.unwrap_or(10),
-        retry_limit: raw.retry_limit.unwrap_or(5),
-        retry_initial_delay_seconds: raw.retry_initial_delay_seconds.unwrap_or(10),
-        retry_max_delay_seconds: raw.retry_max_delay_seconds.unwrap_or(300),
-        processing_lease_seconds: raw.processing_lease_seconds.unwrap_or(600),
         prompt_version: raw
             .prompt_version
             .clone()
             .unwrap_or_else(|| "wildlife-v1".to_string()),
         generation: ClassifierGenerationConfig {
-            temperature: gen_raw.temperature.unwrap_or(0.1),
-            max_tokens: gen_raw.max_tokens.unwrap_or(1000),
+            temperature: generation.temperature.unwrap_or(0.1),
+            max_tokens: generation.max_tokens.unwrap_or(1000),
         },
     })
-}
-
-/// Parse the trusted placeholder URL used for disabled classifier configs.
-///
-/// The placeholder is a compile-time constant and is never attacker-controlled;
-/// if parsing fails this is an internal invariant violation.
-fn trusted_placeholder_url() -> Result<Url, url::ParseError> {
-    Url::parse("http://localhost:8081/v1")
 }
 
 /// Validate a classifier endpoint path.
@@ -616,14 +551,14 @@ fn trusted_placeholder_url() -> Result<Url, url::ParseError> {
 /// The endpoint must be a relative path (starting with `/`), must not contain
 /// a URL scheme (no `://`), and must not contain `@` which could indicate
 /// embedded credentials. Returns the validated path or the default if `None`.
-fn validate_classifier_endpoint(endpoint: Option<&str>) -> AppResult<String> {
+fn validate_classifier_endpoint(endpoint: Option<&str>, label: &str) -> AppResult<String> {
     let endpoint = endpoint.unwrap_or("/chat/completions");
 
     if endpoint.is_empty() {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "load_config",
-            "classifier.endpoint must not be empty",
+            format!("{label}.endpoint must not be empty"),
         ));
     }
 
@@ -634,7 +569,7 @@ fn validate_classifier_endpoint(endpoint: Option<&str>) -> AppResult<String> {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "load_config",
-            "classifier.endpoint must be a relative path, not a full URL",
+            format!("{label}.endpoint must be a relative path, not a full URL"),
         ));
     }
 
@@ -643,7 +578,7 @@ fn validate_classifier_endpoint(endpoint: Option<&str>) -> AppResult<String> {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "load_config",
-            "classifier.endpoint must start with '/'",
+            format!("{label}.endpoint must start with '/'"),
         ));
     }
 
@@ -653,7 +588,7 @@ fn validate_classifier_endpoint(endpoint: Option<&str>) -> AppResult<String> {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "load_config",
-            "classifier.endpoint must be an absolute path, not a scheme-relative reference",
+            format!("{label}.endpoint must be an absolute path, not a scheme-relative reference"),
         ));
     }
 
@@ -665,7 +600,7 @@ fn validate_classifier_endpoint(endpoint: Option<&str>) -> AppResult<String> {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "load_config",
-            "classifier.endpoint must not contain backslashes",
+            format!("{label}.endpoint must not contain backslashes"),
         ));
     }
 
@@ -675,29 +610,11 @@ fn validate_classifier_endpoint(endpoint: Option<&str>) -> AppResult<String> {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "load_config",
-            "classifier.endpoint must not contain embedded credentials",
+            format!("{label}.endpoint must not contain embedded credentials"),
         ));
     }
 
     Ok(endpoint.to_string())
-}
-
-/// Validate that a secret source does not have multiple configured sources.
-///
-/// This is used for disabled-classifier secrets where we still want to
-/// reject conflicts without reading files or environment variables.
-fn validate_secret_source_count(source: &SecretSource, label: &str) -> AppResult<()> {
-    if source.source_count() > 1 {
-        return Err(AppError::new(
-            ErrorCategory::Configuration,
-            "resolve_secret",
-            format!(
-                "multiple sources configured for secret \"{label}\"; \
-                 only one of literal, file, or environment is permitted"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 // ── Semantic validation ────────────────────────────────────────────────────
@@ -845,166 +762,76 @@ fn validate_config(config: &Config) -> AppResult<()> {
         ));
     }
 
-    // ── Classifier validation (only when enabled) ──────────────────────────
-    if config.classifier.enabled {
-        // base_url must have a valid scheme and host
-        if config.classifier.base_url.scheme().is_empty()
-            || config.classifier.base_url.host().is_none()
-        {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.base_url is not a valid URL",
-            ));
-        }
+    // ── Classifier pool validation ───────────────────────────────────────
+    if config.classifier.poll_interval_seconds == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "classifier.poll_interval_seconds must be greater than zero",
+        ));
+    }
+    if config.classifier.retry_limit == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "classifier.retry_limit must be greater than zero",
+        ));
+    }
+    if config.classifier.retry_initial_delay_seconds == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "classifier.retry_initial_delay_seconds must be greater than zero",
+        ));
+    }
+    if config.classifier.retry_max_delay_seconds == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "classifier.retry_max_delay_seconds must be greater than zero",
+        ));
+    }
+    if config.classifier.processing_lease_seconds == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "classifier.processing_lease_seconds must be greater than zero",
+        ));
+    }
+    if config.classifier.retry_initial_delay_seconds > config.classifier.retry_max_delay_seconds {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "classifier.retry_initial_delay_seconds must not exceed retry_max_delay_seconds",
+        ));
+    }
 
-        // Require http or https scheme for classifier URLs.
-        let cls_scheme = config.classifier.base_url.scheme();
-        if cls_scheme != "http" && cls_scheme != "https" {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.base_url must use the http or https scheme",
-            ));
-        }
+    // Reject leases so large that adding them to a DateTime<Utc> could
+    // overflow Chrono's bounds.
+    const MAX_LEASE_SECS: u64 = 3_155_760_000;
+    if config.classifier.processing_lease_seconds > MAX_LEASE_SECS {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            format!(
+                "classifier.processing_lease_seconds ({}) exceeds maximum supported duration \
+                 ({MAX_LEASE_SECS} seconds, ~100 years)",
+                config.classifier.processing_lease_seconds
+            ),
+        ));
+    }
 
-        // Enforce Basic-auth pairing: if username is set, password must also be
-        // set, and vice-versa. Allow no authentication, api-key-only,
-        // Basic-only, or api-key plus Basic.
-        let has_username = !config.classifier.username.is_empty();
-        let has_password = config.classifier.password.is_some();
-        if has_username != has_password {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                if has_username && !has_password {
-                    "classifier.username is set but classifier.password is missing; \
-                     Basic authentication requires both"
-                } else {
-                    "classifier.password is set but classifier.username is missing; \
-                     Basic authentication requires both"
-                },
-            ));
-        }
-
-        // Classifier model — trim-based emptiness check
-        require_nonempty(&config.classifier.model, "classifier.model")?;
-
-        // Classifier prompt_version — trim-based emptiness check
-        require_nonempty(
-            &config.classifier.prompt_version,
-            "classifier.prompt_version",
-        )?;
-
-        if config.classifier.request_timeout_seconds == 0 {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.request_timeout_seconds must be greater than zero",
-            ));
-        }
-
-        if config.classifier.poll_interval_seconds == 0 {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.poll_interval_seconds must be greater than zero",
-            ));
-        }
-
-        if config.classifier.retry_limit == 0 {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.retry_limit must be greater than zero",
-            ));
-        }
-
-        if config.classifier.retry_initial_delay_seconds == 0 {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.retry_initial_delay_seconds must be greater than zero",
-            ));
-        }
-
-        if config.classifier.retry_max_delay_seconds == 0 {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.retry_max_delay_seconds must be greater than zero",
-            ));
-        }
-
-        if config.classifier.processing_lease_seconds == 0 {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.processing_lease_seconds must be greater than zero",
-            ));
-        }
-
-        if config.classifier.generation.max_tokens == 0 {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.generation.max_tokens must be greater than zero",
-            ));
-        }
-
-        // Classifier temperature must be finite and non-negative.
-        let temp = config.classifier.generation.temperature;
-        if temp.is_nan() || temp.is_infinite() || temp < 0.0 {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.generation.temperature must be a finite non-negative value",
-            ));
-        }
-
-        // Classifier retry delay ordering
-        if config.classifier.retry_initial_delay_seconds > config.classifier.retry_max_delay_seconds
-        {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                "classifier.retry_initial_delay_seconds must not exceed retry_max_delay_seconds",
-            ));
-        }
-
-        // Processing lease must exceed the classifier request timeout so that
-        // the lease does not expire while a classification request is still
-        // in flight.  The lease begins when work is claimed (before file
-        // loading and request construction), while the HTTP timeout begins
-        // later; the lease must provide headroom to prevent concurrent
-        // classification of the same image.
-        if config.classifier.processing_lease_seconds <= config.classifier.request_timeout_seconds {
+    for (index, endpoint) in config.classifier.endpoints.iter().enumerate() {
+        let label = format!("classifier.endpoints[{index}]");
+        validate_classifier_endpoint_config(endpoint, &label)?;
+        if config.classifier.processing_lease_seconds <= endpoint.request_timeout_seconds {
             return Err(AppError::new(
                 ErrorCategory::Configuration,
                 "validate_config",
                 format!(
                     "classifier.processing_lease_seconds ({}) must be greater than \
-                     classifier.request_timeout_seconds ({}) to provide lease headroom",
-                    config.classifier.processing_lease_seconds,
-                    config.classifier.request_timeout_seconds
-                ),
-            ));
-        }
-
-        // Reject leases so large that adding them to a DateTime<Utc> could
-        // overflow Chrono's bounds.  Chrono's DateTime<Utc> wraps at year
-        // 262143, so any lease that would push a year-2000 date past that
-        // bound is rejected.  We conservatively reject anything over
-        // 100 years (3_155_760_000 s).
-        const MAX_LEASE_SECS: u64 = 3_155_760_000;
-        if config.classifier.processing_lease_seconds > MAX_LEASE_SECS {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                format!(
-                    "classifier.processing_lease_seconds ({}) exceeds \
-                     maximum supported duration ({MAX_LEASE_SECS} seconds, ~100 years)",
-                    config.classifier.processing_lease_seconds
+                     {label}.request_timeout_seconds ({}) to provide lease headroom",
+                    config.classifier.processing_lease_seconds, endpoint.request_timeout_seconds,
                 ),
             ));
         }
@@ -1013,11 +840,60 @@ fn validate_config(config: &Config) -> AppResult<()> {
     Ok(())
 }
 
+/// Validate endpoint-specific transport and generation settings.
+fn validate_classifier_endpoint_config(
+    endpoint: &ClassifierEndpointConfig,
+    label: &str,
+) -> AppResult<()> {
+    if endpoint.base_url.scheme() != "http" && endpoint.base_url.scheme() != "https"
+        || endpoint.base_url.host().is_none()
+    {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            format!("{label}.base_url must use the http or https scheme and have a host"),
+        ));
+    }
+    let has_username = !endpoint.username.is_empty();
+    if has_username != endpoint.password.is_some() {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            format!("{label}.username and {label}.password must be configured together"),
+        ));
+    }
+    require_nonempty(&endpoint.model, &format!("{label}.model"))?;
+    require_nonempty(&endpoint.prompt_version, &format!("{label}.prompt_version"))?;
+    if endpoint.request_timeout_seconds == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            format!("{label}.request_timeout_seconds must be greater than zero"),
+        ));
+    }
+    if endpoint.generation.max_tokens == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            format!("{label}.generation.max_tokens must be greater than zero"),
+        ));
+    }
+    let temperature = endpoint.generation.temperature;
+    if !temperature.is_finite() || temperature < 0.0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            format!("{label}.generation.temperature must be a finite non-negative value"),
+        ));
+    }
+    Ok(())
+}
+
 /// Apply consistent trim-based required-string validation.
 ///
 /// Returns an error if the value is empty after trimming whitespace.
 /// Does not silently alter the stored value.
-fn require_nonempty(value: &str, field: &'static str) -> AppResult<()> {
+fn require_nonempty(value: &str, field: &str) -> AppResult<()> {
     if value.trim().is_empty() {
         return Err(AppError::new(
             ErrorCategory::Configuration,
@@ -1502,7 +1378,6 @@ start_at = "2026-07-11T00:00:00Z"
 {extra}
 
 [classifier]
-enabled = false
 "#,
             extra = extra
         )
@@ -1524,7 +1399,6 @@ password = "test-pass"
 start_at = "2026-07-11T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1548,7 +1422,6 @@ start_at = "2026-07-11T00:00:00Z"
 download = { concurrency = 4, playback_host_allowlist = ["cdn.example.com"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1575,7 +1448,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { concurrency = 0 }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -1598,7 +1470,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["http://evil.com"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         assert!(Config::load(Some(&path)).is_err());
@@ -1620,7 +1491,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["cdn.example.com:443"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         assert!(Config::load(Some(&path)).is_err());
@@ -1642,7 +1512,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["user@evil.com"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         assert!(Config::load(Some(&path)).is_err());
@@ -1664,7 +1533,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["cdn.example.com"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1690,7 +1558,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["10.0.0.50"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1716,7 +1583,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["CDN.Example.COM"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1742,7 +1608,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["b.example.com", "a.example.com", "b.example.com"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1770,7 +1635,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["192.168.1.50", "127.0.0.1", "10.0.0.1"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1796,7 +1660,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["127.1"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         assert!(Config::load(Some(&path)).is_err());
@@ -1818,7 +1681,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["127.00.0.1"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         assert!(Config::load(Some(&path)).is_err());
@@ -1840,7 +1702,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["0x7f000001"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         assert!(Config::load(Some(&path)).is_err());
@@ -1862,7 +1723,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["2130706433"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         assert!(Config::load(Some(&path)).is_err());
@@ -1884,7 +1744,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["::1", "2001:db8::1"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1915,7 +1774,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["2001:0db8::1"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1944,7 +1802,6 @@ start_at = "2026-01-01T00:00:00Z"
 download = { playback_host_allowlist = ["CDN.Example.COM"] }
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -1988,7 +1845,7 @@ mod tests {
     }
 
     fn minimal_valid_toml() -> &'static str {
-        "[general]\noutput_directory = \"/tmp/fauna-output\"\n\n[nvr]\nscheme = \"http\"\nhost = \"pigate\"\nport = 8080\nusername = \"admin\"\npassword = \"test-pass\"\nstart_at = \"2026-07-11T00:00:00Z\"\n\n[classifier]\nenabled = false\n"
+        "[general]\noutput_directory = \"/tmp/fauna-output\"\n\n[nvr]\nscheme = \"http\"\nhost = \"pigate\"\nport = 8080\nusername = \"admin\"\npassword = \"test-pass\"\nstart_at = \"2026-07-11T00:00:00Z\"\n\n[classifier]\n"
     }
 
     #[test]
@@ -1999,7 +1856,7 @@ mod tests {
         assert_eq!(config.nvr.scheme, "http");
         assert_eq!(config.nvr.host, "pigate");
         assert_eq!(config.nvr.port, 8080);
-        assert!(!config.classifier.enabled);
+        assert!(config.classifier.endpoints.is_empty());
     }
 
     #[test]
@@ -2017,7 +1874,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -2044,7 +1900,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -2066,7 +1921,6 @@ password = "x"
 start_at = "2026-07-11T05:30:00+05:30"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -2091,7 +1945,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2113,7 +1966,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2137,7 +1989,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2159,7 +2010,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2181,7 +2031,6 @@ password = "x"
 start_at = "not-a-timestamp"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2202,7 +2051,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2226,7 +2074,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 model = "test"
 "#;
         let path = write_config(&dir, toml);
@@ -2237,7 +2086,7 @@ model = "test"
     }
 
     #[test]
-    fn classifier_disabled_skips_url_validation() {
+    fn empty_classifier_endpoint_list_is_valid() {
         let dir = tempfile::tempdir().unwrap();
         let toml = r#"[general]
 output_directory = "/tmp/x"
@@ -2251,12 +2100,10 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
-base_url = "not-a-url"
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
-        // Should succeed because classifier is disabled
+        // Should succeed because classification is optional without endpoints
         assert!(result.is_ok());
     }
 
@@ -2275,7 +2122,6 @@ password = "SENTINEL-SECRET-12345"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -2303,7 +2149,6 @@ retry_initial_delay_seconds = 500
 retry_max_delay_seconds = 100
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2330,7 +2175,6 @@ start_at = "2026-01-01T00:00:00Z"
 poll_interval_seconds = 0
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2355,7 +2199,6 @@ start_at = "2026-01-01T00:00:00Z"
 window_minutes = 0
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2380,7 +2223,6 @@ start_at = "2026-01-01T00:00:00Z"
 max_results = 0
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2405,7 +2247,6 @@ start_at = "2026-01-01T00:00:00Z"
 maximum_image_size_bytes = 0
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2430,7 +2271,6 @@ start_at = "2026-01-01T00:00:00Z"
 retry_limit = 0
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2452,55 +2292,29 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/chat/completions"
 model = "vision-model"
 api_key = "test-key"
 
-[classifier.generation]
+[classifier.endpoints.generation]
 temperature = 0.1
 max_tokens = 1000
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
-        assert!(config.classifier.enabled);
+        assert!(!config.classifier.endpoints.is_empty());
         assert!(
-            config
-                .classifier
+            config.classifier.endpoints[0]
                 .base_url
                 .as_str()
                 .starts_with("http://localhost:8081/v1")
         );
-        assert_eq!(config.classifier.model, "vision-model");
-        assert_eq!(config.classifier.generation.temperature, 0.1);
-        assert_eq!(config.classifier.generation.max_tokens, 1000);
-    }
-
-    #[test]
-    fn classifier_disabled_with_broken_url_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let toml = r#"[general]
-output_directory = "/tmp/x"
-
-[nvr]
-scheme = "http"
-host = "p"
-port = 80
-username = "u"
-password = "x"
-start_at = "2026-01-01T00:00:00Z"
-
-[classifier]
-enabled = false
-base_url = "not-a-valid-url"
-api_key_file = "/nonexistent/path"
-"#;
-        let path = write_config(&dir, toml);
-        // Should succeed: classifier is disabled, so URL and secret files are
-        // not validated or resolved.
-        let config = Config::load(Some(&path)).unwrap();
-        assert!(!config.classifier.enabled);
+        assert_eq!(config.classifier.endpoints[0].model, "vision-model");
+        assert_eq!(config.classifier.endpoints[0].generation.temperature, 0.1);
+        assert_eq!(config.classifier.endpoints[0].generation.max_tokens, 1000);
     }
 
     #[test]
@@ -2542,21 +2356,22 @@ verify_jpeg = true
 rebase_playback_urls = true
 
 [classifier]
-enabled = true
+poll_interval_seconds = 10
+retry_limit = 5
+retry_initial_delay_seconds = 10
+retry_max_delay_seconds = 300
+processing_lease_seconds = 600
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/chat/completions"
 model = "vision-model"
 api_key = "test-key"
 username = ""
 request_timeout_seconds = 120
-poll_interval_seconds = 10
-retry_limit = 5
-retry_initial_delay_seconds = 10
-retry_max_delay_seconds = 300
-processing_lease_seconds = 600
 prompt_version = "wildlife-v1"
 
-[classifier.generation]
+[classifier.endpoints.generation]
 temperature = 0.1
 max_tokens = 1000
 "#,
@@ -2576,8 +2391,8 @@ max_tokens = 1000
         assert_eq!(config.nvr.search.poll_overlap_seconds, 120);
         assert_eq!(config.nvr.download.retry_limit, 10);
         assert_eq!(config.nvr.download.maximum_image_size_bytes, 25_000_000);
-        assert!(config.classifier.enabled);
-        assert_eq!(config.classifier.prompt_version, "wildlife-v1");
+        assert!(!config.classifier.endpoints.is_empty());
+        assert_eq!(config.classifier.endpoints[0].prompt_version, "wildlife-v1");
 
         // Timestamp normalized to UTC: 00:00:00+05:30 = 18:30:00 UTC (previous day)
         assert_eq!(config.nvr.start_at.as_datetime().hour(), 18);
@@ -2599,7 +2414,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "literal-key"
@@ -2610,7 +2426,7 @@ api_key_file = "/tmp/ignored"
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.message.contains("multiple sources"));
-        assert!(err.message.contains("classifier.api_key"));
+        assert!(err.message.contains("classifier.endpoints[0].api_key"));
     }
 
     #[test]
@@ -2629,7 +2445,6 @@ password_file = "/tmp/ignored"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2654,12 +2469,13 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "k"
 
-[classifier.generation]
+[classifier.endpoints.generation]
 max_tokens = 0
 "#;
         let path = write_config(&dir, toml);
@@ -2695,7 +2511,6 @@ poll_overlap_seconds = 0
 settlement_delay_seconds = 0
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -2721,7 +2536,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2747,7 +2561,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let config = Config::load(Some(&path)).unwrap();
@@ -2755,9 +2568,7 @@ enabled = false
     }
 
     #[test]
-    fn classifier_disabled_secret_conflict_still_detected() {
-        // Even when classifier is disabled, configuring both api_key and
-        // api_key_file should fail.
+    fn legacy_top_level_classifier_api_key_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let toml = r#"[general]
 output_directory = "/tmp/x"
@@ -2771,20 +2582,16 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
-api_key = "literal-key"
-api_key_file = "/tmp/ignored"
+api_key = "legacy-key"
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.message.contains("multiple sources"));
-        assert!(err.message.contains("classifier.api_key"));
+        assert!(result.unwrap_err().message.contains("unknown field"));
     }
 
     #[test]
-    fn classifier_disabled_password_conflict_still_detected() {
+    fn legacy_top_level_classifier_password_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let toml = r#"[general]
 output_directory = "/tmp/x"
@@ -2798,16 +2605,12 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
-password = "literal"
-password_env = "FAUNA_SCAN_CLS_PASSWORD"
+password = "legacy-password"
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
         assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.message.contains("multiple sources"));
-        assert!(err.message.contains("classifier.password"));
+        assert!(result.unwrap_err().message.contains("unknown field"));
     }
 
     #[test]
@@ -2827,7 +2630,6 @@ password = "SENTINEL-TOML-LEAK" trailing-junk
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#;
         let path = write_config(&dir, toml);
         let result = Config::load(Some(&path));
@@ -2869,7 +2671,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
             db = db_path.display(),
             output = output_dir.display(),
@@ -3006,7 +2807,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://user:SENTINEL-URL-PASS@localhost:8081/v1"
 model = "test"
 api_key = "k"
@@ -3049,7 +2851,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://user@localhost:8081/v1"
 model = "test"
 api_key = "k"
@@ -3086,7 +2889,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "SENTINEL-BAD-URL-VALUE"
 model = "test"
 api_key = "k"
@@ -3126,7 +2930,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "SENTINEL-API-KEY"
@@ -3163,7 +2968,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "ftp://localhost:8081/v1"
 model = "test"
 api_key = "k"
@@ -3199,7 +3005,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 username = "cls-user"
@@ -3235,7 +3042,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 password = "cls-pass"
@@ -3271,7 +3079,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "test-key"
@@ -3280,7 +3089,7 @@ api_key = "test-key"
         );
         let path = write_config(&dir, &toml);
         let config = Config::load(Some(&path)).unwrap();
-        assert!(config.classifier.enabled);
+        assert!(!config.classifier.endpoints.is_empty());
     }
 
     #[test]
@@ -3301,7 +3110,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 username = "cls-user"
@@ -3311,7 +3121,7 @@ password = "cls-pass"
         );
         let path = write_config(&dir, &toml);
         let config = Config::load(Some(&path)).unwrap();
-        assert!(config.classifier.enabled);
+        assert!(!config.classifier.endpoints.is_empty());
     }
 
     #[test]
@@ -3332,7 +3142,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 api_key = "test-key"
@@ -3343,7 +3154,7 @@ password = "cls-pass"
         );
         let path = write_config(&dir, &toml);
         let config = Config::load(Some(&path)).unwrap();
-        assert!(config.classifier.enabled);
+        assert!(!config.classifier.endpoints.is_empty());
     }
 
     #[test]
@@ -3364,7 +3175,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 "#,
@@ -3372,7 +3184,7 @@ model = "test"
         );
         let path = write_config(&dir, &toml);
         let config = Config::load(Some(&path)).unwrap();
-        assert!(config.classifier.enabled);
+        assert!(!config.classifier.endpoints.is_empty());
     }
 
     #[test]
@@ -3393,7 +3205,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "https://localhost:8081/v1"
 model = "test"
 api_key = "k"
@@ -3402,53 +3215,9 @@ api_key = "k"
         );
         let path = write_config(&dir, &toml);
         let config = Config::load(Some(&path)).unwrap();
-        assert!(config.classifier.enabled);
-        assert_eq!(config.classifier.base_url.scheme(), "https");
+        assert!(!config.classifier.endpoints.is_empty());
+        assert_eq!(config.classifier.endpoints[0].base_url.scheme(), "https");
     }
-
-    #[test]
-    fn classifier_disabled_with_credential_bearing_url_does_not_leak() {
-        // When classification is disabled, a syntactically valid URL that
-        // contains embedded credentials must NOT be retained in the resolved
-        // config. The Debug output must not expose the sentinel credential.
-        let dir = tempfile::tempdir().unwrap();
-        let output_dir = dir.path().join("output");
-        std::fs::create_dir(&output_dir).unwrap();
-        let toml = format!(
-            r#"[general]
-output_directory = "{output}"
-
-[nvr]
-scheme = "http"
-host = "p"
-port = 80
-username = "u"
-password = "x"
-start_at = "2026-01-01T00:00:00Z"
-
-[classifier]
-enabled = false
-base_url = "http://user:SENTINEL-DISABLED-URL-PASS@localhost:8081/v1"
-"#,
-            output = output_dir.display(),
-        );
-        let path = write_config(&dir, &toml);
-        let config = Config::load(Some(&path)).unwrap();
-        assert!(!config.classifier.enabled);
-        let debug_output = format!("{config:?}");
-        assert!(
-            !debug_output.contains("SENTINEL-DISABLED-URL-PASS"),
-            "credential-bearing URL leaked in Debug output: {debug_output}"
-        );
-        // The placeholder URL must not contain credentials
-        assert!(
-            config.classifier.base_url.username().is_empty()
-                && config.classifier.base_url.password().is_none(),
-            "disabled classifier should have a credential-free placeholder URL"
-        );
-    }
-
-    // ── Reviewer feedback: classifier endpoint validation ──────────────────
 
     #[test]
     fn classifier_enabled_endpoint_with_absolute_url_rejected() {
@@ -3468,7 +3237,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "http://user:SENTINEL-EP-CRED@host/path"
 model = "test"
@@ -3510,7 +3280,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/user:SENTINEL-AT-CRED@/path"
 model = "test"
@@ -3551,7 +3322,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "chat/completions"
 model = "test"
@@ -3587,7 +3359,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/v1/images/classify"
 model = "test"
@@ -3596,7 +3369,10 @@ model = "test"
         );
         let path = write_config(&dir, &toml);
         let config = Config::load(Some(&path)).unwrap();
-        assert_eq!(config.classifier.endpoint, "/v1/images/classify");
+        assert_eq!(
+            config.classifier.endpoints[0].endpoint,
+            "/v1/images/classify"
+        );
     }
 
     #[test]
@@ -3617,7 +3393,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 model = "test"
 "#,
@@ -3625,49 +3402,7 @@ model = "test"
         );
         let path = write_config(&dir, &toml);
         let config = Config::load(Some(&path)).unwrap();
-        assert_eq!(config.classifier.endpoint, "/chat/completions");
-    }
-
-    #[test]
-    fn classifier_disabled_endpoint_not_retained() {
-        // When disabled, the configured endpoint must not be retained;
-        // a safe placeholder is used instead.
-        let dir = tempfile::tempdir().unwrap();
-        let output_dir = dir.path().join("output");
-        std::fs::create_dir(&output_dir).unwrap();
-        let toml = format!(
-            r#"[general]
-output_directory = "{output}"
-
-[nvr]
-scheme = "http"
-host = "p"
-port = 80
-username = "u"
-password = "x"
-start_at = "2026-01-01T00:00:00Z"
-
-[classifier]
-enabled = false
-endpoint = "http://user:SENTINEL-DISABLED-EP@host/path"
-"#,
-            output = output_dir.display(),
-        );
-        let path = write_config(&dir, &toml);
-        let config = Config::load(Some(&path)).unwrap();
-        assert!(!config.classifier.enabled);
-        // The raw endpoint must not be retained
-        assert_eq!(config.classifier.endpoint, "/chat/completions");
-        // Debug output must not contain the sentinel
-        let debug_output = format!("{config:?}");
-        assert!(
-            !debug_output.contains("SENTINEL-DISABLED-EP"),
-            "disabled endpoint credential leaked in Debug: {debug_output}"
-        );
-        assert!(
-            !debug_output.contains("SENTINEL-DISABLED-EP@host/path"),
-            "raw endpoint value leaked in Debug: {debug_output}"
-        );
+        assert_eq!(config.classifier.endpoints[0].endpoint, "/chat/completions");
     }
 
     #[test]
@@ -3691,7 +3426,8 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/chat/completions"
 model = "test"

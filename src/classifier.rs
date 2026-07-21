@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-use crate::configuration::{ClassifierConfig, Secret};
+use crate::configuration::{ClassifierConfig, ClassifierEndpointConfig, Secret};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::http::{HttpClientConfig, SharedHttpClient};
 
@@ -187,31 +187,33 @@ async fn read_response_body_bounded(
 impl ClassifierClient {
     /// Build a classifier client from configuration.
     ///
-    /// Validates that the classifier is enabled, re-validates the base URL
-    /// (rejecting credentials, unsupported schemes, and missing hosts),
+    /// Requires at least one endpoint, re-validates its base URL (rejecting
+    /// credentials, unsupported schemes, and missing hosts),
     /// assembles the endpoint URL without dropping base-path segments, and
     /// constructs the HTTP client with the configured request timeout.
     pub fn from_config(config: &ClassifierConfig) -> AppResult<Self> {
-        if !config.enabled {
-            return Err(AppError::new(
+        let endpoint = config.endpoints.first().ok_or_else(|| {
+            AppError::new(
                 ErrorCategory::Configuration,
                 "classifier_from_config",
-                "classifier is disabled",
-            ));
-        }
+                "at least one classifier endpoint must be configured",
+            )
+        })?;
+        Self::from_endpoint_config(endpoint)
+    }
 
+    /// Build a client for one configured endpoint in a classifier pool.
+    pub fn from_endpoint_config(config: &ClassifierEndpointConfig) -> AppResult<Self> {
         // Re-validate the base URL to reject credentials, unsupported schemes,
-        // and missing hosts. The config-level validation in resolve_enabled_classifier
-        // checks scheme and host, but we re-check here because the base_url field
-        // could theoretically be modified between config resolution and client build.
+        // and missing hosts. The config-level validation checks these too, but
+        // this protects callers that construct endpoint configs directly.
         validate_classifier_base_url(&config.base_url)?;
 
         let endpoint_url = build_classifier_url(&config.base_url, &config.endpoint)?;
-
         let http = SharedHttpClient::build(HttpClientConfig::from_seconds(
             config.request_timeout_seconds,
             config.request_timeout_seconds,
-            false, // classifier has no invalid-certificate opt-out
+            false,
         ))?;
 
         Ok(Self {
@@ -219,11 +221,7 @@ impl ClassifierClient {
             endpoint_url,
             model: config.model.clone(),
             api_key: config.api_key.clone(),
-            username: if config.username.is_empty() {
-                None
-            } else {
-                Some(config.username.clone())
-            },
+            username: (!config.username.is_empty()).then(|| config.username.clone()),
             password: config.password.clone(),
             temperature: config.generation.temperature,
             max_tokens: config.generation.max_tokens,
@@ -511,6 +509,16 @@ impl ClassifierClient {
     /// Return the assembled endpoint URL for testing.
     pub fn endpoint_url(&self) -> &Url {
         &self.endpoint_url
+    }
+
+    /// Model recorded with classifications sent through this client.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Prompt version recorded with classifications sent through this client.
+    pub fn prompt_version(&self) -> &str {
+        &self.prompt_version
     }
 }
 
@@ -1823,24 +1831,25 @@ mod tests {
     fn build_classifier_url_rejects_credential_base_url() {
         let base = Url::parse("http://user:pass@localhost:8081/v1").unwrap();
         let result = ClassifierClient::from_config(&ClassifierConfig {
-            enabled: true,
-            base_url: base,
-            endpoint: "/chat/completions".to_string(),
-            model: "test".to_string(),
-            api_key: None,
-            username: String::new(),
-            password: None,
-            request_timeout_seconds: 30,
+            endpoints: vec![ClassifierEndpointConfig {
+                base_url: base,
+                endpoint: "/chat/completions".to_string(),
+                model: "test".to_string(),
+                api_key: None,
+                username: String::new(),
+                password: None,
+                request_timeout_seconds: 30,
+                prompt_version: "wildlife-v1".to_string(),
+                generation: crate::configuration::ClassifierGenerationConfig {
+                    temperature: 0.1,
+                    max_tokens: 1000,
+                },
+            }],
             poll_interval_seconds: 10,
             retry_limit: 5,
             retry_initial_delay_seconds: 10,
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 600,
-            prompt_version: "wildlife-v1".to_string(),
-            generation: crate::configuration::ClassifierGenerationConfig {
-                temperature: 0.1,
-                max_tokens: 1000,
-            },
         });
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1852,24 +1861,25 @@ mod tests {
     fn build_classifier_url_rejects_unsupported_scheme() {
         let base = Url::parse("ftp://localhost:8081/v1").unwrap();
         let result = ClassifierClient::from_config(&ClassifierConfig {
-            enabled: true,
-            base_url: base,
-            endpoint: "/chat/completions".to_string(),
-            model: "test".to_string(),
-            api_key: None,
-            username: String::new(),
-            password: None,
-            request_timeout_seconds: 30,
+            endpoints: vec![ClassifierEndpointConfig {
+                base_url: base,
+                endpoint: "/chat/completions".to_string(),
+                model: "test".to_string(),
+                api_key: None,
+                username: String::new(),
+                password: None,
+                request_timeout_seconds: 30,
+                prompt_version: "wildlife-v1".to_string(),
+                generation: crate::configuration::ClassifierGenerationConfig {
+                    temperature: 0.1,
+                    max_tokens: 1000,
+                },
+            }],
             poll_interval_seconds: 10,
             retry_limit: 5,
             retry_initial_delay_seconds: 10,
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 600,
-            prompt_version: "wildlife-v1".to_string(),
-            generation: crate::configuration::ClassifierGenerationConfig {
-                temperature: 0.1,
-                max_tokens: 1000,
-            },
         });
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -2659,31 +2669,19 @@ mod tests {
     // ── ClassifierClient construction tests ─────────────────────────────────
 
     #[test]
-    fn from_config_disabled_fails() {
+    fn from_config_without_endpoints_fails() {
         let config = ClassifierConfig {
-            enabled: false,
-            base_url: Url::parse("http://localhost:8081/v1").unwrap(),
-            endpoint: "/chat/completions".to_string(),
-            model: "test".to_string(),
-            api_key: None,
-            username: String::new(),
-            password: None,
-            request_timeout_seconds: 30,
+            endpoints: Vec::new(),
             poll_interval_seconds: 10,
             retry_limit: 5,
             retry_initial_delay_seconds: 10,
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 600,
-            prompt_version: "wildlife-v1".to_string(),
-            generation: crate::configuration::ClassifierGenerationConfig {
-                temperature: 0.1,
-                max_tokens: 1000,
-            },
         };
         let result = ClassifierClient::from_config(&config);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("disabled"));
+        assert!(err.message.contains("at least one classifier endpoint"));
     }
 
     #[test]

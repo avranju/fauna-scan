@@ -258,7 +258,6 @@ password = "correct-pass"
 start_at = "2026-07-11T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db_path.display(),
         output = temp_dir.path().join("output").display(),

@@ -68,16 +68,17 @@ fn service_config(
     let config_path = dir.join("config.toml");
     let classifier_config = if classifier {
         r#"[classifier]
-enabled = true
+processing_lease_seconds = 5
+
+[[classifier.endpoints]]
 base_url = "http://127.0.0.1:9/v1"
 endpoint = "/chat/completions"
 model = "test-model"
 request_timeout_seconds = 1
-processing_lease_seconds = 5
 prompt_version = "test"
 "#
     } else {
-        "[classifier]\nenabled = false\n"
+        "[classifier]\n"
     };
     let config = format!(
         r#"[general]
@@ -839,7 +840,7 @@ async fn database_startup_failure_precedes_pipeline_start_and_external_request()
 }
 
 #[tokio::test]
-async fn disabled_classifier_fails_before_pipeline_start_or_external_request() {
+async fn missing_classifier_endpoints_fail_before_pipeline_start_or_external_request() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/ISAPI/Streaming/channels"))
@@ -851,7 +852,7 @@ async fn disabled_classifier_fails_before_pipeline_start_or_external_request() {
     let output = service_command(&config_path).output().unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("classifier is disabled"));
+    assert!(stderr.contains("no classifier endpoints are configured"));
     assert!(!stderr.contains("Starting downloader and scanner pipelines"));
     assert_eq!(server.received_requests().await.unwrap().len(), 0);
 }

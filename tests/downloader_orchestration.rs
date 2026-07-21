@@ -14,8 +14,7 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use fauna_scan::configuration::{
-    ClassifierConfig, ClassifierGenerationConfig, Config, GeneralConfig, NvrConfig,
-    NvrDownloadConfig, NvrSearchConfig,
+    ClassifierConfig, Config, GeneralConfig, NvrConfig, NvrDownloadConfig, NvrSearchConfig,
 };
 use fauna_scan::database::Database;
 use fauna_scan::database::models::*;
@@ -100,24 +99,12 @@ fn make_test_config(
             },
         },
         classifier: ClassifierConfig {
-            enabled: false,
-            base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
-            endpoint: "/chat/completions".to_string(),
-            model: "test-model".to_string(),
-            api_key: None,
-            username: "".to_string(),
-            password: None,
-            request_timeout_seconds: 120,
+            endpoints: Vec::new(),
             poll_interval_seconds: 10,
             retry_limit: 5,
             retry_initial_delay_seconds: 10,
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 600,
-            prompt_version: "wildlife-v1".to_string(),
-            generation: ClassifierGenerationConfig {
-                temperature: 0.1,
-                max_tokens: 1000,
-            },
         },
         source_path: std::path::PathBuf::from("/tmp/test.toml"),
     }

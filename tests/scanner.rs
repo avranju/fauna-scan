@@ -52,24 +52,26 @@ fn make_classifier_config(mock_base: &str) -> ClassifierConfig {
     let port = url.port().unwrap_or(80);
     let scheme = url.scheme();
     ClassifierConfig {
-        enabled: true,
-        base_url: Url::parse(&format!("{scheme}://{}:{}", url.host_str().unwrap(), port)).unwrap(),
-        endpoint: "/chat/completions".to_string(),
-        model: "test-model".to_string(),
-        api_key: None,
-        username: String::new(),
-        password: None,
-        request_timeout_seconds: 10,
+        endpoints: vec![fauna_scan::configuration::ClassifierEndpointConfig {
+            base_url: Url::parse(&format!("{scheme}://{}:{}", url.host_str().unwrap(), port))
+                .unwrap(),
+            endpoint: "/chat/completions".to_string(),
+            model: "test-model".to_string(),
+            api_key: None,
+            username: String::new(),
+            password: None,
+            request_timeout_seconds: 10,
+            prompt_version: "wildlife-v1".to_string(),
+            generation: ClassifierGenerationConfig {
+                temperature: 0.1,
+                max_tokens: 1000,
+            },
+        }],
         poll_interval_seconds: 10,
         retry_limit: 5,
         retry_initial_delay_seconds: 1,
         retry_max_delay_seconds: 300,
         processing_lease_seconds: 600,
-        prompt_version: "wildlife-v1".to_string(),
-        generation: ClassifierGenerationConfig {
-            temperature: 0.1,
-            max_tokens: 1000,
-        },
     }
 }
 
@@ -183,8 +185,6 @@ async fn build_scanner(ops: DatabaseOps, mock_server: &MockServer, retry_limit: 
     let classifier = ClassifierClient::from_config(&config).unwrap();
 
     let options = ScannerOptions {
-        model: config.model.clone(),
-        prompt_version: config.prompt_version.clone(),
         poll_interval: std::time::Duration::from_secs(config.poll_interval_seconds),
         retry_limit,
         retry_initial_delay: std::time::Duration::from_secs(1),
@@ -399,6 +399,58 @@ async fn missing_file_becomes_missing() {
 
     // No classifier request should have been made.
     // (If the mock server was hit, the test would fail due to unfulfilled mock.)
+}
+
+/// Two endpoint workers classify different claimed images concurrently.
+#[tokio::test]
+async fn classifier_endpoints_classify_concurrently() {
+    let dir = tempfile::tempdir().unwrap();
+    let primary_server = MockServer::start().await;
+    let secondary_server = MockServer::start().await;
+    let delay = std::time::Duration::from_millis(300);
+
+    for server in [&primary_server, &secondary_server] {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(valid_openai_response())
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
+    let primary_config = make_classifier_config(&primary_server.uri());
+    let secondary_config = make_classifier_config(&secondary_server.uri());
+    let options = ScannerOptions {
+        poll_interval: std::time::Duration::from_secs(10),
+        retry_limit: 5,
+        retry_initial_delay: std::time::Duration::from_secs(1),
+        retry_max_delay: std::time::Duration::from_secs(300),
+        processing_lease_duration: std::time::Duration::from_secs(600),
+        maximum_image_size_bytes: 25_000_000,
+    };
+    let scanner = Scanner::with_classifiers(
+        ops,
+        vec![
+            Arc::new(ClassifierClient::from_config(&primary_config).unwrap()),
+            Arc::new(ClassifierClient::from_config(&secondary_config).unwrap()),
+        ],
+        options,
+    );
+
+    let started = tokio::time::Instant::now();
+    let report = scanner.execute_one_pass().await.unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(550),
+        "two 300ms endpoint requests should overlap"
+    );
+    assert_eq!(report.claimed, 2);
+    assert_eq!(report.completed, 2);
+    assert_eq!(primary_server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(secondary_server.received_requests().await.unwrap().len(), 1);
 }
 
 // ── Invalid file tests ────────────────────────────────────────────────────
@@ -887,24 +939,25 @@ fn lease_equal_to_timeout_is_rejected() {
             },
         },
         classifier: ClassifierConfig {
-            enabled: true,
-            base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
-            endpoint: "/chat/completions".to_string(),
-            model: "test".to_string(),
-            api_key: None,
-            username: String::new(),
-            password: None,
-            request_timeout_seconds: 120,
+            endpoints: vec![fauna_scan::configuration::ClassifierEndpointConfig {
+                base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
+                endpoint: "/chat/completions".to_string(),
+                model: "test".to_string(),
+                api_key: None,
+                username: String::new(),
+                password: None,
+                request_timeout_seconds: 120,
+                prompt_version: "wildlife-v1".to_string(),
+                generation: ClassifierGenerationConfig {
+                    temperature: 0.1,
+                    max_tokens: 1000,
+                },
+            }],
             poll_interval_seconds: 10,
             retry_limit: 5,
             retry_initial_delay_seconds: 10,
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 120, // equal to request timeout
-            prompt_version: "wildlife-v1".to_string(),
-            generation: ClassifierGenerationConfig {
-                temperature: 0.1,
-                max_tokens: 1000,
-            },
         },
         source_path: PathBuf::from("/tmp/test.toml"),
     };
@@ -952,24 +1005,25 @@ fn lease_one_second_above_timeout_is_accepted() {
             },
         },
         classifier: ClassifierConfig {
-            enabled: true,
-            base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
-            endpoint: "/chat/completions".to_string(),
-            model: "test".to_string(),
-            api_key: None,
-            username: String::new(),
-            password: None,
-            request_timeout_seconds: 120,
+            endpoints: vec![fauna_scan::configuration::ClassifierEndpointConfig {
+                base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
+                endpoint: "/chat/completions".to_string(),
+                model: "test".to_string(),
+                api_key: None,
+                username: String::new(),
+                password: None,
+                request_timeout_seconds: 120,
+                prompt_version: "wildlife-v1".to_string(),
+                generation: ClassifierGenerationConfig {
+                    temperature: 0.1,
+                    max_tokens: 1000,
+                },
+            }],
             poll_interval_seconds: 10,
             retry_limit: 5,
             retry_initial_delay_seconds: 10,
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 121, // one second above timeout
-            prompt_version: "wildlife-v1".to_string(),
-            generation: ClassifierGenerationConfig {
-                temperature: 0.1,
-                max_tokens: 1000,
-            },
         },
         source_path: PathBuf::from("/tmp/test.toml"),
     };
@@ -1103,17 +1157,12 @@ async fn concurrent_scanner_lease_renewal_prevents_recovery() {
     // Build Scanner A with a 300ms lease and 1000ms request timeout.
     // The mock server delay (500ms) exceeds the lease (300ms), so the
     // background renewer must keep the lease alive.
-    let config_a = make_classifier_config(&mock_server.uri());
-    let config_a = ClassifierConfig {
-        request_timeout_seconds: 10,
-        processing_lease_seconds: 1,
-        ..config_a
-    };
+    let mut config_a = make_classifier_config(&mock_server.uri());
+    config_a.endpoints[0].request_timeout_seconds = 10;
+    config_a.processing_lease_seconds = 1;
     let classifier_a = ClassifierClient::from_config(&config_a).unwrap();
 
     let options_a = ScannerOptions {
-        model: config_a.model.clone(),
-        prompt_version: config_a.prompt_version.clone(),
         poll_interval: Duration::from_secs(1),
         retry_limit: 3,
         retry_initial_delay: Duration::from_secs(1),
@@ -1124,17 +1173,12 @@ async fn concurrent_scanner_lease_renewal_prevents_recovery() {
     let scanner_a = Scanner::new(ops.clone(), Arc::new(classifier_a), options_a);
 
     // Build Scanner B with the same lease.
-    let config_b = make_classifier_config(&mock_server.uri());
-    let config_b = ClassifierConfig {
-        request_timeout_seconds: 10,
-        processing_lease_seconds: 1,
-        ..config_b
-    };
+    let mut config_b = make_classifier_config(&mock_server.uri());
+    config_b.endpoints[0].request_timeout_seconds = 10;
+    config_b.processing_lease_seconds = 1;
     let classifier_b = ClassifierClient::from_config(&config_b).unwrap();
 
     let options_b = ScannerOptions {
-        model: config_b.model.clone(),
-        prompt_version: config_b.prompt_version.clone(),
         poll_interval: Duration::from_secs(1),
         retry_limit: 3,
         retry_initial_delay: Duration::from_secs(1),
@@ -1227,8 +1271,6 @@ async fn forced_renewal_failure_causes_main_task_failure() {
     let classifier_a = ClassifierClient::from_config(&config_a).unwrap();
 
     let options_a = ScannerOptions {
-        model: config_a.model.clone(),
-        prompt_version: config_a.prompt_version.clone(),
         poll_interval: Duration::from_secs(1),
         retry_limit: 3,
         retry_initial_delay: Duration::from_secs(1),

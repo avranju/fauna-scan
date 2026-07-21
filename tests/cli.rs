@@ -104,7 +104,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#
 }
 
@@ -179,7 +178,6 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
         db = db_dir.display(),
         output = output_dir.display(),
@@ -230,12 +228,13 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+processing_lease_seconds = 60
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/chat/completions"
 model = "test-model"
 request_timeout_seconds = 120
-processing_lease_seconds = 60
 prompt_version = "wildlife-v1"
 "#,
     )
@@ -270,12 +269,13 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
+processing_lease_seconds = 120
+
+[[classifier.endpoints]]
 base_url = "http://localhost:8081/v1"
 endpoint = "/chat/completions"
 model = "test-model"
 request_timeout_seconds = 120
-processing_lease_seconds = 120
 prompt_version = "wildlife-v1"
 "#,
     )
@@ -336,7 +336,6 @@ camera_refresh_interval_seconds = 60
 settlement_delay_seconds = 1
 
 [classifier]
-enabled = false
 "#,
         db_path.display(),
         output_dir.display(),
@@ -371,7 +370,7 @@ enabled = false
 // ── Operational commands ──────────────────────────────────────────────────
 
 #[test]
-fn run_rejects_disabled_classifier_before_startup() {
+fn run_rejects_missing_classifier_endpoints_before_startup() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(&config_path, minimal_valid_config()).unwrap();
@@ -383,7 +382,7 @@ fn run_rejects_disabled_classifier_before_startup() {
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("classifier is disabled")
+            predicate::str::contains("no classifier endpoints are configured")
                 .and(predicate::str::contains("Starting downloader and scanner pipelines").not()),
         );
 }
@@ -422,14 +421,14 @@ fn download_once_exits_nonzero_with_message() {
 }
 
 #[test]
-fn scan_once_exits_nonzero_with_disabled_classifier() {
-    // scan --once with classifier.enabled=false should fail at
-    // configuration validation (scanner_from_config rejects disabled).
+fn scan_once_exits_nonzero_without_classifier_endpoints() {
+    // scan --once with no classifier endpoints should fail before database
+    // or network work begins.
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        minimal_valid_config(), // classifier.enabled = false
+        minimal_valid_config(), // no classifier endpoints
     )
     .unwrap();
     std::fs::create_dir_all("/tmp/fauna-scan-test-output").ok();
@@ -441,7 +440,9 @@ fn scan_once_exits_nonzero_with_disabled_classifier() {
         .arg("--once")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("classifier is disabled"));
+        .stderr(predicate::str::contains(
+            "no classifier endpoints are configured",
+        ));
 }
 
 #[test]
@@ -480,15 +481,16 @@ password = "x"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = true
-base_url = "http://localhost:8081/v1"
-endpoint = "/chat/completions"
-model = "test-model"
 poll_interval_seconds = 10
 retry_limit = 3
 retry_initial_delay_seconds = 5
 retry_max_delay_seconds = 300
 processing_lease_seconds = 600
+
+[[classifier.endpoints]]
+base_url = "http://localhost:8081/v1"
+endpoint = "/chat/completions"
+model = "test-model"
 prompt_version = "wildlife-v1"
 "#,
             db_path.display(),
@@ -529,7 +531,6 @@ password = "p"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
             db_path.display(),
             output_dir.display(),
@@ -590,7 +591,6 @@ password = "p"
 start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
-enabled = false
 "#,
             db_path.display(),
             output_dir.display(),

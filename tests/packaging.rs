@@ -35,11 +35,12 @@ fn checked_in_example_configuration_loads() {
     assert_eq!(config.nvr.search.max_results, 50);
     assert_eq!(config.nvr.download.concurrency, 2);
     assert!(config.nvr.download.rebase_playback_urls);
-    assert_eq!(config.classifier.model, "vision-model");
-    assert_eq!(config.classifier.prompt_version, "wildlife-v1");
+    let endpoint = &config.classifier.endpoints[0];
+    assert_eq!(endpoint.model, "vision-model");
+    assert_eq!(endpoint.prompt_version, "wildlife-v1");
     assert_eq!(config.nvr.password.unwrap().expose(), "nvr-test-secret");
     assert_eq!(
-        config.classifier.api_key.unwrap().expose(),
+        endpoint.api_key.as_ref().unwrap().expose(),
         "classifier-test-key"
     );
 }

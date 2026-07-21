@@ -57,7 +57,7 @@ impl SecretSource {
     /// Returns `Ok(None)` when no source is configured, `Ok(Some(Secret))` when
     /// exactly one source resolves, or an error for conflicts, missing files,
     /// or missing environment variables.
-    pub fn resolve<F>(&self, label: &'static str, get_env: F) -> AppResult<Option<Secret>>
+    pub fn resolve<F>(&self, label: &str, get_env: F) -> AppResult<Option<Secret>>
     where
         F: Fn(&str) -> Option<String>,
     {

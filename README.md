@@ -2,7 +2,7 @@
 
 Fauna Scan is a Linux Rust service that discovers Hikvision cameras, searches
 NVR picture metadata, downloads new JPEGs into SQLite-backed durable state, and
-sequentially classifies them through an OpenAI-compatible vision API.
+classifies them through one or more OpenAI-compatible vision API endpoints.
 
 ## Install and release verification
 
@@ -52,7 +52,13 @@ operator explicitly understands the risk. `start_at` accepts RFC 3339 and is
 converted to UTC. Playback URLs are rebased to the configured NVR origin by
 default; if rebasing is disabled, use the explicit playback host allowlist.
 Classifier Basic authentication uses `username` plus `password_file`; API-key
-and Basic authentication may be combined.
+and Basic authentication may be combined. Configure classifier servers with
+one or more `[[classifier.endpoints]]` tables. Each endpoint requires
+`base_url` and `model`, and runs one concurrent worker. Endpoint settings do
+not inherit from other endpoints; credentials, timeouts, prompts, and
+generation settings are resolved independently. Images
+are claimed atomically and distributed among workers. An empty endpoint list
+disables classification.
 
 ## Commands
 
