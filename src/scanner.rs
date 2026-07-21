@@ -1408,6 +1408,7 @@ mod tests {
                 retry_max_delay_seconds: 300,
                 processing_lease_seconds: 600,
             },
+            web: crate::configuration::WebConfig::default(),
             source_path: PathBuf::from("/tmp/test.toml"),
         };
         let result = ScannerOptions::from_config(&config);
@@ -1722,6 +1723,7 @@ mod tests {
                 retry_max_delay_seconds: 300,
                 processing_lease_seconds: 60,
             },
+            web: crate::configuration::WebConfig::default(),
             source_path: PathBuf::from("/tmp/test.toml"),
         };
         let result = ScannerOptions::from_config(&config);
@@ -1791,6 +1793,7 @@ mod tests {
                 retry_max_delay_seconds: 300,
                 processing_lease_seconds: 10_000_000_000,
             },
+            web: crate::configuration::WebConfig::default(),
             source_path: PathBuf::from("/tmp/test.toml"),
         };
         let result = ScannerOptions::from_config(&config);
@@ -1859,6 +1862,7 @@ mod tests {
                 retry_max_delay_seconds: 300,
                 processing_lease_seconds: 120,
             },
+            web: crate::configuration::WebConfig::default(),
             source_path: PathBuf::from("/tmp/test.toml"),
         };
         let result = ScannerOptions::from_config(&config);
@@ -1928,6 +1932,7 @@ mod tests {
                 retry_max_delay_seconds: 300,
                 processing_lease_seconds: 121,
             },
+            web: crate::configuration::WebConfig::default(),
             source_path: PathBuf::from("/tmp/test.toml"),
         };
         let result = ScannerOptions::from_config(&config);

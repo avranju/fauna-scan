@@ -80,6 +80,10 @@ run:
 run-debug:
 	fauna-scan --log-level debug --config "${XDG_CONFIG_HOME:-$HOME/.config}/fauna-scan/config.toml" run
 
+# Serve only the web interface
+web:
+	fauna-scan --config "${XDG_CONFIG_HOME:-$HOME/.config}/fauna-scan/config.toml" web
+
 # Discover cameras once
 discover:
 	fauna-scan --config "${XDG_CONFIG_HOME:-$HOME/.config}/fauna-scan/config.toml" discover

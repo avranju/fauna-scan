@@ -64,6 +64,7 @@ disables classification.
 
 ```bash
 fauna-scan --config PATH run
+fauna-scan --config PATH web
 fauna-scan --config PATH discover
 fauna-scan --config PATH download --once
 fauna-scan --config PATH scan --once
@@ -73,6 +74,16 @@ fauna-scan --log-level debug --config PATH run
 fauna-scan --help
 fauna-scan --version
 ```
+
+Set `[web].enabled = true` to serve the dashboard with `run`, then open the
+configured address (the example uses `http://127.0.0.1:8787`). The `web`
+command serves the same dashboard against the durable database without
+starting downloader or classifier workers. The interface provides time and
+camera filters, image and classification detail, live queue/lease monitoring,
+the full NVR still-image URL, and an on-demand NVR video recording lookup.
+The default listener is loopback-only. Keep it on loopback or place it behind
+an authenticated TLS reverse proxy; the initial dashboard does not provide
+built-in user authentication.
 
 `run` supervises downloader and scanner pipelines. `download --once` performs
 currently due discovery/search/download work; `scan --once` drains eligible
@@ -101,6 +112,9 @@ docker compose pull
 docker compose up -d
 docker compose logs -f fauna-scan
 ```
+
+With the example Compose configuration, the dashboard is available only on
+the Docker host at `http://127.0.0.1:8787`.
 
 Set `general.database_path` and `general.output_directory` to the container
 paths already used by `config.docker.example.toml`. Compose persists those paths

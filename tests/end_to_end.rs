@@ -274,6 +274,7 @@ fn build_test_config(server: &MockServer, root: &Path, start_at: Timestamp) -> C
             retry_max_delay_seconds: 2,
             processing_lease_seconds: 60,
         },
+        web: fauna_scan::configuration::WebConfig::default(),
         source_path: root.join("config.toml"),
     }
 }

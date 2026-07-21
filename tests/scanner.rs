@@ -959,6 +959,7 @@ fn lease_equal_to_timeout_is_rejected() {
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 120, // equal to request timeout
         },
+        web: fauna_scan::configuration::WebConfig::default(),
         source_path: PathBuf::from("/tmp/test.toml"),
     };
     let result = ScannerOptions::from_config(&config);
@@ -1025,6 +1026,7 @@ fn lease_one_second_above_timeout_is_accepted() {
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 121, // one second above timeout
         },
+        web: fauna_scan::configuration::WebConfig::default(),
         source_path: PathBuf::from("/tmp/test.toml"),
     };
     let result = ScannerOptions::from_config(&config);

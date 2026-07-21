@@ -14,6 +14,7 @@ pub mod authentication;
 pub mod camera_discovery;
 pub mod image_download;
 pub mod image_search;
+pub mod recording_search;
 
 pub use authentication::{NvrRequest, NvrTransport};
 pub use camera_discovery::{CameraDiscoveryClient, parse_camera_discovery_xml};
@@ -28,3 +29,4 @@ pub use image_search::{
 // ── Phase 7 re-exports ───────────────────────────────────────────────────
 
 pub use image_download::{ImageDownloadClient, PlaybackUrlPolicy};
+pub use recording_search::{RecordingMatch, RecordingSearchClient};

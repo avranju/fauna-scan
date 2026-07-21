@@ -3,6 +3,8 @@ services:
     image: git.nerdworks.dev/avranju/fauna-scan:latest
     pull_policy: always
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
     init: true
     stop_grace_period: 30s
     read_only: true

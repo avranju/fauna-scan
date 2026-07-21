@@ -106,6 +106,7 @@ fn make_test_config(
             retry_max_delay_seconds: 300,
             processing_lease_seconds: 600,
         },
+        web: fauna_scan::configuration::WebConfig::default(),
         source_path: std::path::PathBuf::from("/tmp/test.toml"),
     }
 }

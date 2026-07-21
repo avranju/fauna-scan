@@ -31,6 +31,7 @@ fn help_lists_all_subcommands() {
             .and(predicate::str::contains("discover"))
             .and(predicate::str::contains("download"))
             .and(predicate::str::contains("scan"))
+            .and(predicate::str::contains("web"))
             .and(predicate::str::contains("status")),
     );
 }

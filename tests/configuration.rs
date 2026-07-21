@@ -63,6 +63,99 @@ start_at = "2026-01-01T00:00:00Z"
 }
 
 #[test]
+fn web_configuration_loads_and_validates() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let toml = format!(
+        r#"[general]
+output_directory = "{output}"
+
+[web]
+enabled = true
+listen_address = "127.0.0.1:9876"
+clip_pre_roll_seconds = 5
+clip_post_roll_seconds = 15
+maximum_clip_duration_seconds = 60
+
+[nvr]
+host = "nvr"
+port = 80
+username = "user"
+password = "password"
+start_at = "2026-01-01T00:00:00Z"
+"#,
+        output = output.display(),
+    );
+    let config = Config::load(Some(&write_config(&dir, &toml))).unwrap();
+    assert!(config.web.enabled);
+    assert_eq!(config.web.listen_address.to_string(), "127.0.0.1:9876");
+    assert_eq!(config.web.clip_pre_roll_seconds, 5);
+    assert_eq!(config.web.clip_post_roll_seconds, 15);
+    assert_eq!(config.web.maximum_clip_duration_seconds, 60);
+}
+
+#[test]
+fn web_default_clip_must_fit_maximum() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let toml = format!(
+        r#"[general]
+output_directory = "{output}"
+
+[web]
+clip_pre_roll_seconds = 40
+clip_post_roll_seconds = 30
+maximum_clip_duration_seconds = 60
+
+[nvr]
+host = "nvr"
+port = 80
+username = "user"
+password = "password"
+start_at = "2026-01-01T00:00:00Z"
+"#,
+        output = output.display(),
+    );
+    let error = Config::load(Some(&write_config(&dir, &toml)))
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.category,
+        fauna_scan::error::ErrorCategory::Configuration
+    );
+    assert!(error.message.contains("clip"));
+}
+
+#[test]
+fn web_clip_maximum_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let toml = format!(
+        r#"[general]
+output_directory = "{output}"
+
+[web]
+maximum_clip_duration_seconds = 86401
+
+[nvr]
+host = "nvr"
+port = 80
+username = "user"
+password = "password"
+start_at = "2026-01-01T00:00:00Z"
+"#,
+        output = output.display(),
+    );
+    let error = Config::load(Some(&write_config(&dir, &toml)))
+        .err()
+        .unwrap();
+    assert!(error.message.contains("86400"));
+}
+
+#[test]
 fn file_secret_loads_successfully() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("output");

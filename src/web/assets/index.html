@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <meta name="description" content="Explore Fauna Scan images and classification activity">
+    <title>Fauna Scan</title>
+    <link rel="stylesheet" href="/assets/app.css">
+    <script type="module" src="/assets/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="topbar">
+      <a class="brand" href="/" data-link aria-label="Fauna Scan overview">
+        <span class="brand-mark" aria-hidden="true">FS</span>
+        <span>Fauna Scan</span>
+      </a>
+      <nav class="primary-nav" aria-label="Primary navigation">
+        <a href="/" data-link>Overview</a>
+        <a href="/images" data-link>Images</a>
+        <a href="/activity" data-link>Scan activity</a>
+      </nav>
+      <button id="health-button" class="health-pill" type="button" title="Service status">
+        <span class="health-dot" aria-hidden="true"></span><span id="health-label">Connecting</span>
+      </button>
+    </header>
+
+    <section id="filterbar" class="filterbar" aria-label="Data filters">
+      <label>Range
+        <select id="range-preset">
+          <option value="1">Last hour</option>
+          <option value="6">Last 6 hours</option>
+          <option value="24" selected>Last 24 hours</option>
+          <option value="168">Last 7 days</option>
+          <option value="720">Last 30 days</option>
+          <option value="custom">Custom</option>
+          <option value="all">All time</option>
+        </select>
+      </label>
+      <label>From <input id="time-from" type="datetime-local" step="1"></label>
+      <label>To <input id="time-to" type="datetime-local" step="1"></label>
+      <label class="camera-filter">Cameras
+        <select id="camera-select" multiple aria-label="Cameras"></select>
+      </label>
+      <button id="apply-filters" class="button primary" type="button">Apply</button>
+      <button id="reset-filters" class="button ghost" type="button">Reset</button>
+    </section>
+
+    <div id="connection-banner" class="connection-banner" hidden role="status">
+      Live refresh is temporarily unavailable. Showing the last successful data.
+    </div>
+
+    <main id="content" tabindex="-1">
+      <div class="loading-panel" role="status">Loading Fauna Scan…</div>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  </body>
+</html>

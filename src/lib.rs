@@ -16,3 +16,4 @@ pub mod logging;
 pub mod nvr;
 pub mod scanner;
 pub mod service_lifecycle;
+pub mod web;

@@ -1089,6 +1089,7 @@ mod tests {
                 retry_max_delay_seconds: 300,
                 processing_lease_seconds: 600,
             },
+            web: crate::configuration::WebConfig::default(),
             source_path: PathBuf::from("/tmp/config.toml"),
         }
     }

@@ -30,6 +30,9 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
         Command::Run => handle_run(config_path)
             .await
             .map_err(|error| with_command_context("run", error)),
+        Command::Web => handle_web(config_path)
+            .await
+            .map_err(|error| with_command_context("web", error)),
         Command::CheckConfig => handle_check_config(config_path),
         Command::Discover => handle_discover(config_path).await,
         Command::Download(args) => handle_download(args, config_path).await,
@@ -38,6 +41,25 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
             .await
             .map_err(|error| with_command_context("status", error)),
     }
+}
+
+/// Serve the dashboard against durable state without running worker pipelines.
+async fn handle_web(config_path: Option<&Path>) -> AppResult<()> {
+    let config = Config::load(config_path)?;
+    create_runtime_directories(&config)?;
+    let database = Database::open(&config.general.database_path).await?;
+    let transport = Arc::new(NvrTransport::from_config(&config.nvr)?);
+    let state = crate::web::WebState::from_config(database.ops(), &config, transport);
+    let shutdown = ShutdownToken::new();
+    let web_shutdown = shutdown.clone();
+    run_single_pipeline_until_signal(
+        "web",
+        crate::web::serve(state, web_shutdown),
+        shutdown,
+        wait_for_shutdown_signal(),
+        ServiceLifecycleOptions::default().shutdown_timeout,
+    )
+    .await
 }
 
 /// Handle the `check-config` command.
@@ -304,6 +326,10 @@ async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
     let stale_parts_removed =
         crate::filesystem::remove_stale_part_files(&config.general.output_directory).await?;
     let transport = Arc::new(NvrTransport::from_config(&config.nvr)?);
+    let web_state = config
+        .web
+        .enabled
+        .then(|| crate::web::WebState::from_config(ops.clone(), &config, transport.clone()));
     let download_client = Arc::new(ImageDownloadClient::from_config(
         transport.clone(),
         &config.nvr,
@@ -391,10 +417,19 @@ async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
     );
     let shutdown = ShutdownToken::new();
     let downloader_shutdown = shutdown.clone();
+    let web_shutdown = shutdown.clone();
     let downloader = tokio::spawn(async move {
-        orchestrator
-            .run_continuous_with_shutdown(downloader_shutdown)
-            .await
+        if let Some(web_state) = web_state {
+            tokio::try_join!(
+                orchestrator.run_continuous_with_shutdown(downloader_shutdown),
+                crate::web::serve(web_state, web_shutdown),
+            )
+            .map(|_| ())
+        } else {
+            orchestrator
+                .run_continuous_with_shutdown(downloader_shutdown)
+                .await
+        }
     });
     let scanner_shutdown = shutdown.clone();
     let scanner_task =

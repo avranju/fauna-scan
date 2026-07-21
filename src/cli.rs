@@ -29,6 +29,9 @@ pub enum Command {
     /// Start both downloader and scanner pipelines (continuous mode).
     Run,
 
+    /// Serve the web interface without starting downloader or scanner workers.
+    Web,
+
     /// Load and validate configuration without contacting external services.
     CheckConfig,
 

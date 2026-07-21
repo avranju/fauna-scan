@@ -3,6 +3,7 @@
 //!
 //! Implemented in Phase 2.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -32,8 +33,37 @@ pub struct Config {
     pub nvr: NvrConfig,
     /// Classifier (vision LLM) settings.
     pub classifier: ClassifierConfig,
+    /// Optional local web interface settings.
+    pub web: WebConfig,
     /// The configuration file path that was loaded.
     pub source_path: PathBuf,
+}
+
+/// Resolved web interface settings.
+#[derive(Debug, Clone)]
+pub struct WebConfig {
+    /// Whether `run` should serve the web interface.
+    pub enabled: bool,
+    /// Address on which the Axum server listens.
+    pub listen_address: SocketAddr,
+    /// Seconds included before an image timestamp in recording searches.
+    pub clip_pre_roll_seconds: u64,
+    /// Seconds included after an image timestamp in recording searches.
+    pub clip_post_roll_seconds: u64,
+    /// Maximum total recording-search interval accepted from the browser.
+    pub maximum_clip_duration_seconds: u64,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:8787".parse().expect("static socket address"),
+            clip_pre_roll_seconds: 10,
+            clip_post_roll_seconds: 20,
+            maximum_clip_duration_seconds: 120,
+        }
+    }
 }
 
 /// Resolved general settings.
@@ -172,6 +202,18 @@ struct RawConfig {
     nvr: RawNvrConfig,
     #[serde(default)]
     classifier: RawClassifierConfig,
+    #[serde(default)]
+    web: RawWebConfig,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawWebConfig {
+    enabled: Option<bool>,
+    listen_address: Option<String>,
+    clip_pre_roll_seconds: Option<u64>,
+    clip_post_roll_seconds: Option<u64>,
+    maximum_clip_duration_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -426,10 +468,31 @@ impl Config {
         // ── Resolve classifier ─────────────────────────────────────────────
         let classifier = resolve_classifier(&raw.classifier, &get_env)?;
 
+        let web = WebConfig {
+            enabled: raw.web.enabled.unwrap_or(false),
+            listen_address: raw
+                .web
+                .listen_address
+                .as_deref()
+                .unwrap_or("127.0.0.1:8787")
+                .parse::<SocketAddr>()
+                .map_err(|_| {
+                    AppError::new(
+                        ErrorCategory::Configuration,
+                        "load_config",
+                        "web.listen_address must be a valid IP socket address",
+                    )
+                })?,
+            clip_pre_roll_seconds: raw.web.clip_pre_roll_seconds.unwrap_or(10),
+            clip_post_roll_seconds: raw.web.clip_post_roll_seconds.unwrap_or(20),
+            maximum_clip_duration_seconds: raw.web.maximum_clip_duration_seconds.unwrap_or(120),
+        };
+
         let config = Config {
             general,
             nvr,
             classifier,
+            web,
             source_path: config_path_buf.clone(),
         };
 
@@ -620,6 +683,48 @@ fn validate_classifier_endpoint(endpoint: Option<&str>, label: &str) -> AppResul
 // ── Semantic validation ────────────────────────────────────────────────────
 
 fn validate_config(config: &Config) -> AppResult<()> {
+    if config.web.listen_address.port() == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "web.listen_address port must be greater than zero",
+        ));
+    }
+    if config.web.maximum_clip_duration_seconds == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "web.maximum_clip_duration_seconds must be greater than zero",
+        ));
+    }
+    if config.web.maximum_clip_duration_seconds > 86_400 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "web.maximum_clip_duration_seconds must not exceed 86400",
+        ));
+    }
+    let default_clip_duration = config
+        .web
+        .clip_pre_roll_seconds
+        .checked_add(config.web.clip_post_roll_seconds)
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorCategory::Configuration,
+                "validate_config",
+                "web clip duration overflows the supported range",
+            )
+        })?;
+    if default_clip_duration == 0
+        || default_clip_duration > config.web.maximum_clip_duration_seconds
+    {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "web clip pre-roll plus post-roll must be positive and not exceed maximum_clip_duration_seconds",
+        ));
+    }
+
     // NVR scheme
     if config.nvr.scheme != "http" && config.nvr.scheme != "https" {
         return Err(AppError::new(
