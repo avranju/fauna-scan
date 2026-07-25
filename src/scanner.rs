@@ -260,18 +260,25 @@ impl Scanner {
         // so workers naturally distribute work according to endpoint capacity.
         let worker_stop = ShutdownToken::new();
         let mut workers = JoinSet::new();
-        for (classifier, rate_limit) in self
+        for (endpoint_index, (classifier, rate_limit)) in self
             .classifiers
             .iter()
             .cloned()
             .zip(self.rate_limits.iter().cloned())
+            .enumerate()
         {
             let scanner = self.clone();
             let shutdown = shutdown.clone();
             let worker_stop = worker_stop.clone();
             workers.spawn(async move {
                 scanner
-                    .drain_claims(classifier, rate_limit, &shutdown, &worker_stop)
+                    .drain_claims(
+                        endpoint_index,
+                        classifier,
+                        rate_limit,
+                        &shutdown,
+                        &worker_stop,
+                    )
                     .await
             });
         }
@@ -374,11 +381,19 @@ impl Scanner {
     /// images remain or either shutdown token is cancelled.
     async fn drain_claims(
         &self,
+        endpoint_index: usize,
         classifier: Arc<ClassifierClient>,
         rate_limit: Option<crate::configuration::ClassifierRateLimitConfig>,
         shutdown: &ShutdownToken,
         worker_stop: &ShutdownToken,
     ) -> AppResult<ScannerPassReport> {
+        tracing::info!(
+            endpoint_index,
+            classifier_model = classifier.model(),
+            classifier_endpoint = %classifier.endpoint_url(),
+            quota_group = ?rate_limit.as_ref().map(|limit| &limit.quota_group),
+            "Classifier endpoint worker started"
+        );
         let mut report = ScannerPassReport::default();
         loop {
             if shutdown.is_cancelled() || worker_stop.is_cancelled() {
@@ -440,6 +455,16 @@ impl Scanner {
                 None => return Ok(report),
             };
             report.claimed += 1;
+            tracing::info!(
+                endpoint_index,
+                classifier_model = classifier.model(),
+                classifier_endpoint = %classifier.endpoint_url(),
+                image_id = claim.image_id.get(),
+                image_key = %claim.image_key,
+                attempt = claim.processing_attempts,
+                generation = claim.generation,
+                "Classifier endpoint worker claimed image"
+            );
             match self.process_claim(&claim, classifier.clone()).await? {
                 ScannerOutcome::Completed => report.completed += 1,
                 ScannerOutcome::RetryScheduled => report.retry_scheduled += 1,
@@ -624,6 +649,15 @@ impl Scanner {
         ));
 
         // Submit to classifier, capturing the real request start timestamp.
+        tracing::info!(
+            image_id = image_id.get(),
+            image_key = image_key_short,
+            attempt,
+            generation,
+            classifier_model = classifier.model(),
+            classifier_endpoint = %classifier.endpoint_url(),
+            "Submitting classification request"
+        );
         let request_started_at = Timestamp::new(Utc::now());
 
         // Race HTTP handling against lease supervision.  The renewer remains
