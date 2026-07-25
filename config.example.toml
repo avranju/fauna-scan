@@ -69,6 +69,17 @@ prompt_version = "wildlife-v1"
 temperature = 0.1
 max_tokens = 1000
 
+# Optional provider quota policy. Endpoints using the same provider account
+# and model must use the same quota_group and identical values.
+# [classifier.endpoints.rate_limit]
+# quota_group = "provider-account-vision-model"
+# requests_per_minute = 5
+# requests_per_day = 2400
+# tokens_per_minute = 30000
+# tokens_per_day = 1000000
+# estimated_input_tokens_per_request = 4096
+# max_images_per_request = 10
+
 # [[classifier.endpoints]]
 # base_url = "http://second-classifier:8081/v1"
 # model = "second-vision-model"

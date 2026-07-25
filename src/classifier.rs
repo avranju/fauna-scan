@@ -506,6 +506,11 @@ impl ClassifierClient {
         self.submit_classification(prepared).await
     }
 
+    /// Return the configured maximum completion tokens for quota reservation.
+    pub fn max_tokens(&self) -> u32 {
+        self.max_tokens
+    }
+
     /// Return the assembled endpoint URL for testing.
     pub fn endpoint_url(&self) -> &Url {
         &self.endpoint_url
@@ -1844,6 +1849,7 @@ mod tests {
                     temperature: 0.1,
                     max_tokens: 1000,
                 },
+                rate_limit: None,
             }],
             poll_interval_seconds: 10,
             retry_limit: 5,
@@ -1874,6 +1880,7 @@ mod tests {
                     temperature: 0.1,
                     max_tokens: 1000,
                 },
+                rate_limit: None,
             }],
             poll_interval_seconds: 10,
             retry_limit: 5,

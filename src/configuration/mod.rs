@@ -3,6 +3,7 @@
 //!
 //! Implemented in Phase 2.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -168,9 +169,29 @@ pub struct ClassifierGenerationConfig {
     pub max_tokens: u32,
 }
 
+/// Provider quota policy for a classifier endpoint.
+///
+/// Token budgets are reserved before a request using `estimated_input_tokens_per_request`
+/// plus the endpoint's `generation.max_tokens`; this is intentionally
+/// conservative so the service cannot overshoot a provider quota.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifierRateLimitConfig {
+    /// Stable identifier for the provider/account/model quota shared by endpoints.
+    pub quota_group: String,
+    pub requests_per_minute: u64,
+    pub requests_per_day: u64,
+    pub tokens_per_minute: u64,
+    pub tokens_per_day: u64,
+    pub estimated_input_tokens_per_request: u64,
+    pub max_images_per_request: u32,
+}
+
 /// A fully resolved classifier endpoint.
 #[derive(Debug, Clone)]
 pub struct ClassifierEndpointConfig {
+    /// Optional provider quota policy. Endpoints sharing a quota group share
+    /// one budget even when their transport URLs differ.
+    pub rate_limit: Option<ClassifierRateLimitConfig>,
     /// Base URL of the classifier API.
     pub base_url: Url,
     /// API endpoint path.
@@ -294,6 +315,19 @@ struct RawClassifierEndpointConfig {
     request_timeout_seconds: Option<u64>,
     prompt_version: Option<String>,
     generation: Option<RawClassifierGenerationConfig>,
+    rate_limit: Option<RawClassifierRateLimitConfig>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawClassifierRateLimitConfig {
+    quota_group: Option<String>,
+    requests_per_minute: Option<u64>,
+    requests_per_day: Option<u64>,
+    tokens_per_minute: Option<u64>,
+    tokens_per_day: Option<u64>,
+    estimated_input_tokens_per_request: Option<u64>,
+    max_images_per_request: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -589,8 +623,48 @@ where
     }
     .resolve(&format!("{label}.password"), get_env)?;
     let generation = raw.generation.clone().unwrap_or_default();
+    let rate_limit = raw
+        .rate_limit
+        .as_ref()
+        .map(|limit| {
+            let required = |value: Option<u64>, field: &str| {
+                value.ok_or_else(|| {
+                    AppError::new(
+                        ErrorCategory::Configuration,
+                        "load_config",
+                        format!("{label}.rate_limit.{field} is required"),
+                    )
+                })
+            };
+            Ok(ClassifierRateLimitConfig {
+                quota_group: limit.quota_group.clone().ok_or_else(|| {
+                    AppError::new(
+                        ErrorCategory::Configuration,
+                        "load_config",
+                        format!("{label}.rate_limit.quota_group is required"),
+                    )
+                })?,
+                requests_per_minute: required(limit.requests_per_minute, "requests_per_minute")?,
+                requests_per_day: required(limit.requests_per_day, "requests_per_day")?,
+                tokens_per_minute: required(limit.tokens_per_minute, "tokens_per_minute")?,
+                tokens_per_day: required(limit.tokens_per_day, "tokens_per_day")?,
+                estimated_input_tokens_per_request: required(
+                    limit.estimated_input_tokens_per_request,
+                    "estimated_input_tokens_per_request",
+                )?,
+                max_images_per_request: limit.max_images_per_request.ok_or_else(|| {
+                    AppError::new(
+                        ErrorCategory::Configuration,
+                        "load_config",
+                        format!("{label}.rate_limit.max_images_per_request is required"),
+                    )
+                })?,
+            })
+        })
+        .transpose()?;
 
     Ok(ClassifierEndpointConfig {
+        rate_limit,
         base_url,
         endpoint: validate_classifier_endpoint(raw.endpoint.as_deref(), &label)?,
         model,
@@ -926,9 +1000,23 @@ fn validate_config(config: &Config) -> AppResult<()> {
         ));
     }
 
+    let mut quota_groups = BTreeMap::<&str, &ClassifierRateLimitConfig>::new();
     for (index, endpoint) in config.classifier.endpoints.iter().enumerate() {
         let label = format!("classifier.endpoints[{index}]");
         validate_classifier_endpoint_config(endpoint, &label)?;
+        if let Some(limit) = &endpoint.rate_limit
+            && let Some(existing) = quota_groups.insert(&limit.quota_group, limit)
+            && existing != limit
+        {
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "validate_config",
+                format!(
+                    "{label}.rate_limit differs from another endpoint in quota_group {}",
+                    limit.quota_group
+                ),
+            ));
+        }
         if config.classifier.processing_lease_seconds <= endpoint.request_timeout_seconds {
             return Err(AppError::new(
                 ErrorCategory::Configuration,
@@ -982,6 +1070,34 @@ fn validate_classifier_endpoint_config(
             "validate_config",
             format!("{label}.generation.max_tokens must be greater than zero"),
         ));
+    }
+    if let Some(limit) = &endpoint.rate_limit {
+        require_nonempty(
+            &limit.quota_group,
+            &format!("{label}.rate_limit.quota_group"),
+        )?;
+        if limit.requests_per_minute == 0
+            || limit.requests_per_day == 0
+            || limit.tokens_per_minute == 0
+            || limit.tokens_per_day == 0
+            || limit.max_images_per_request == 0
+        {
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "validate_config",
+                format!("{label}.rate_limit values must be greater than zero"),
+            ));
+        }
+        let reservation = limit
+            .estimated_input_tokens_per_request
+            .saturating_add(endpoint.generation.max_tokens as u64);
+        if reservation > limit.tokens_per_minute || reservation > limit.tokens_per_day {
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "validate_config",
+                format!("{label}.rate_limit token budget cannot admit one request"),
+            ));
+        }
     }
     let temperature = endpoint.generation.temperature;
     if !temperature.is_finite() || temperature < 0.0 {

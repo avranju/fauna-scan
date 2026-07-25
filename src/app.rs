@@ -379,7 +379,18 @@ async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
     // HTTP clients are fully constructed before discovery, but no primary
     // pipeline is spawned until discovery and synchronization finish.
     let classifiers = classifier_clients(&config.classifier)?;
-    let scanner = Scanner::with_classifiers(ops.clone(), classifiers, scanner_options);
+    let rate_limits = config
+        .classifier
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.rate_limit.clone())
+        .collect();
+    let scanner = Scanner::with_classifiers_and_rate_limits(
+        ops.clone(),
+        classifiers,
+        rate_limits,
+        scanner_options,
+    );
 
     // Discovery is deliberately completed before either task is spawned.
     match orchestrator.attempt_discovery().await {
@@ -590,7 +601,18 @@ async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> 
     let options = ScannerOptions::from_config(&config)?;
 
     // Build one concurrent worker per configured classifier endpoint.
-    let scanner = Scanner::with_classifiers(database.ops(), classifiers, options);
+    let rate_limits = config
+        .classifier
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.rate_limit.clone())
+        .collect();
+    let scanner = Scanner::with_classifiers_and_rate_limits(
+        database.ops(),
+        classifiers,
+        rate_limits,
+        options,
+    );
 
     if args.once {
         // One finite pass: drain all currently eligible images.

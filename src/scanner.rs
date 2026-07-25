@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use crate::classifier::{ClassifierClient, ClassifierError, ClassifierOutput, RetryDisposition};
 use crate::configuration::Config;
 use crate::database::models::*;
-use crate::database::repository::DatabaseOps;
+use crate::database::repository::{DatabaseOps, RateLimitReservation};
 use crate::domain::ImageId;
 use crate::domain::Timestamp;
 use crate::error::{AppError, AppResult, ErrorCategory};
@@ -162,6 +162,8 @@ pub struct Scanner {
     pub database: DatabaseOps,
     /// Classifier clients, each served by an independent worker.
     pub classifiers: Vec<Arc<ClassifierClient>>,
+    /// Optional provider quota policy aligned with `classifiers`.
+    pub rate_limits: Vec<Option<crate::configuration::ClassifierRateLimitConfig>>,
     /// Validated scanner policy.
     pub options: ScannerOptions,
 }
@@ -176,6 +178,7 @@ impl Scanner {
         Self {
             database,
             classifiers: vec![classifier],
+            rate_limits: vec![None],
             options,
         }
     }
@@ -188,13 +191,31 @@ impl Scanner {
         classifiers: Vec<Arc<ClassifierClient>>,
         options: ScannerOptions,
     ) -> Self {
+        let rate_limits = vec![None; classifiers.len()];
+        Self::with_classifiers_and_rate_limits(database, classifiers, rate_limits, options)
+    }
+
+    /// Create a scanner pool with optional provider quota policies aligned to
+    /// the supplied classifier endpoints.
+    pub fn with_classifiers_and_rate_limits(
+        database: DatabaseOps,
+        classifiers: Vec<Arc<ClassifierClient>>,
+        rate_limits: Vec<Option<crate::configuration::ClassifierRateLimitConfig>>,
+        options: ScannerOptions,
+    ) -> Self {
         assert!(
             !classifiers.is_empty(),
             "a scanner requires at least one classifier endpoint"
         );
+        assert_eq!(
+            classifiers.len(),
+            rate_limits.len(),
+            "classifier rate limit count must match endpoints"
+        );
         Self {
             database,
             classifiers,
+            rate_limits,
             options,
         }
     }
@@ -239,13 +260,18 @@ impl Scanner {
         // so workers naturally distribute work according to endpoint capacity.
         let worker_stop = ShutdownToken::new();
         let mut workers = JoinSet::new();
-        for classifier in self.classifiers.iter().cloned() {
+        for (classifier, rate_limit) in self
+            .classifiers
+            .iter()
+            .cloned()
+            .zip(self.rate_limits.iter().cloned())
+        {
             let scanner = self.clone();
             let shutdown = shutdown.clone();
             let worker_stop = worker_stop.clone();
             workers.spawn(async move {
                 scanner
-                    .drain_claims(classifier, &shutdown, &worker_stop)
+                    .drain_claims(classifier, rate_limit, &shutdown, &worker_stop)
                     .await
             });
         }
@@ -349,6 +375,7 @@ impl Scanner {
     async fn drain_claims(
         &self,
         classifier: Arc<ClassifierClient>,
+        rate_limit: Option<crate::configuration::ClassifierRateLimitConfig>,
         shutdown: &ShutdownToken,
         worker_stop: &ShutdownToken,
     ) -> AppResult<ScannerPassReport> {
@@ -356,6 +383,39 @@ impl Scanner {
         loop {
             if shutdown.is_cancelled() || worker_stop.is_cancelled() {
                 return Ok(report);
+            }
+            // Do not reserve provider quota when there is no local work. The
+            // subsequent atomic claim remains necessary because other endpoint
+            // workers may race this preflight check.
+            if !self
+                .database
+                .has_eligible_processing(&Timestamp::new(Utc::now()))
+                .await?
+            {
+                return Ok(report);
+            }
+            if let Some(limit) = &rate_limit {
+                loop {
+                    match self
+                        .database
+                        .reserve_classifier_rate_limit(
+                            limit,
+                            classifier.max_tokens(),
+                            &Timestamp::new(Utc::now()),
+                        )
+                        .await?
+                    {
+                        RateLimitReservation::Granted => break,
+                        RateLimitReservation::Wait(wait) => {
+                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint quota unavailable; waiting");
+                            tokio::select! {
+                                _ = shutdown.cancelled() => return Ok(report),
+                                _ = worker_stop.cancelled() => return Ok(report),
+                                _ = sleep(wait) => {}
+                            }
+                        }
+                    }
+                }
             }
             let lease_until = Timestamp::new(
                 Utc::now()
@@ -1626,6 +1686,7 @@ mod tests {
                     temperature: 0.1,
                     max_tokens: 100,
                 },
+                rate_limit: None,
             }],
             poll_interval_seconds: 10,
             retry_limit: 3,
@@ -1716,6 +1777,7 @@ mod tests {
                         temperature: 0.1,
                         max_tokens: 1000,
                     },
+                    rate_limit: None,
                 }],
                 poll_interval_seconds: 10,
                 retry_limit: 5,
@@ -1786,6 +1848,7 @@ mod tests {
                         temperature: 0.1,
                         max_tokens: 1000,
                     },
+                    rate_limit: None,
                 }],
                 poll_interval_seconds: 10,
                 retry_limit: 5,
@@ -1855,6 +1918,7 @@ mod tests {
                         temperature: 0.1,
                         max_tokens: 1000,
                     },
+                    rate_limit: None,
                 }],
                 poll_interval_seconds: 10,
                 retry_limit: 5,
@@ -1925,6 +1989,7 @@ mod tests {
                         temperature: 0.1,
                         max_tokens: 1000,
                     },
+                    rate_limit: None,
                 }],
                 poll_interval_seconds: 10,
                 retry_limit: 5,

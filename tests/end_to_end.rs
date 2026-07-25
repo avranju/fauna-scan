@@ -267,6 +267,7 @@ fn build_test_config(server: &MockServer, root: &Path, start_at: Timestamp) -> C
                     temperature: 0.0,
                     max_tokens: 100,
                 },
+                rate_limit: None,
             }],
             poll_interval_seconds: 1,
             retry_limit: 2,

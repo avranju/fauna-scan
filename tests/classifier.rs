@@ -37,6 +37,7 @@ fn make_classifier_config(mock_base: &str) -> ClassifierConfig {
                 temperature: 0.1,
                 max_tokens: 1000,
             },
+            rate_limit: None,
         }],
         poll_interval_seconds: 10,
         retry_limit: 5,
