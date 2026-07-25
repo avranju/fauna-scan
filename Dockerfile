@@ -22,7 +22,7 @@ RUN cargo build --locked --release
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates \
+    && apt-get install --no-install-recommends --yes ca-certificates sqlite3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 fauna-scan \
     && useradd --system --uid 10001 --gid fauna-scan \
