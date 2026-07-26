@@ -422,12 +422,13 @@ impl Scanner {
                     {
                         RateLimitReservation::Granted => break,
                         RateLimitReservation::Wait(wait) => {
-                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint quota unavailable; waiting");
-                            tokio::select! {
-                                _ = shutdown.cancelled() => return Ok(report),
-                                _ = worker_stop.cancelled() => return Ok(report),
-                                _ = sleep(wait) => {}
-                            }
+                            // Do not keep this scanner pass alive while a provider is
+                            // unavailable. Other endpoint workers may already have
+                            // drained the current queue and exited; returning lets the
+                            // continuous loop start a fresh pass and recreate them for
+                            // images downloaded while this quota remains exhausted.
+                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint quota unavailable; yielding pass");
+                            return Ok(report);
                         }
                     }
                 }

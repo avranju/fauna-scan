@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use fauna_scan::classifier::ClassifierClient;
-use fauna_scan::configuration::{ClassifierConfig, ClassifierGenerationConfig};
+use fauna_scan::configuration::{
+    ClassifierConfig, ClassifierGenerationConfig, ClassifierRateLimitConfig,
+};
 use fauna_scan::database::Database;
 use fauna_scan::database::models::*;
 use fauna_scan::database::repository::DatabaseOps;
@@ -452,6 +454,80 @@ async fn classifier_endpoints_classify_concurrently() {
     assert_eq!(report.completed, 2);
     assert_eq!(primary_server.received_requests().await.unwrap().len(), 1);
     assert_eq!(secondary_server.received_requests().await.unwrap().len(), 1);
+}
+
+/// A quota-blocked endpoint yields its worker instead of holding the pass open,
+/// so an unrestricted endpoint can process current work and be recreated on
+/// later polling passes.
+#[tokio::test]
+async fn quota_blocked_endpoint_does_not_block_other_endpoint_or_pass_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let quota_server = MockServer::start().await;
+    let available_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(valid_openai_response())
+                .set_delay(std::time::Duration::from_millis(50)),
+        )
+        .mount(&available_server)
+        .await;
+
+    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
+    let policy = ClassifierRateLimitConfig {
+        quota_group: "exhausted-test-quota".to_string(),
+        requests_per_minute: 1,
+        requests_per_day: 1,
+        tokens_per_minute: 2_000,
+        tokens_per_day: 2_000,
+        estimated_input_tokens_per_request: 1,
+        max_images_per_request: 1,
+    };
+    // Consume the sole daily reservation. A second reservation would wait
+    // until UTC midnight, which must not stall this scanner pass.
+    assert!(matches!(
+        ops.reserve_classifier_rate_limit(&policy, 1_000, &Timestamp::new(Utc::now()))
+            .await
+            .unwrap(),
+        fauna_scan::database::repository::RateLimitReservation::Granted
+    ));
+
+    let mut quota_config = make_classifier_config(&quota_server.uri());
+    quota_config.endpoints[0].rate_limit = Some(policy);
+    let available_config = make_classifier_config(&available_server.uri());
+    let scanner = Scanner::with_classifiers_and_rate_limits(
+        ops,
+        vec![
+            Arc::new(ClassifierClient::from_config(&quota_config).unwrap()),
+            Arc::new(ClassifierClient::from_config(&available_config).unwrap()),
+        ],
+        vec![
+            quota_config.endpoints[0].rate_limit.clone(),
+            available_config.endpoints[0].rate_limit.clone(),
+        ],
+        ScannerOptions {
+            poll_interval: std::time::Duration::from_secs(10),
+            retry_limit: 5,
+            retry_initial_delay: std::time::Duration::from_secs(1),
+            retry_max_delay: std::time::Duration::from_secs(300),
+            processing_lease_duration: std::time::Duration::from_secs(600),
+            maximum_image_size_bytes: 25_000_000,
+        },
+    );
+
+    let report = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        scanner.execute_one_pass(),
+    )
+    .await
+    .expect("quota wait held the scanner pass open")
+    .unwrap();
+
+    assert_eq!(report.claimed, 2);
+    assert_eq!(report.completed, 2);
+    assert_eq!(quota_server.received_requests().await.unwrap().len(), 0);
+    assert_eq!(available_server.received_requests().await.unwrap().len(), 2);
 }
 
 // ── Invalid file tests ────────────────────────────────────────────────────
