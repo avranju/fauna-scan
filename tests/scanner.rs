@@ -530,6 +530,68 @@ async fn quota_blocked_endpoint_does_not_block_other_endpoint_or_pass_completion
     assert_eq!(available_server.received_requests().await.unwrap().len(), 2);
 }
 
+/// A minute-limited worker remains alive and resumes its reservation loop
+/// instead of yielding permanently while other work keeps the scanner pass open.
+#[tokio::test]
+async fn minute_limited_endpoint_waits_within_the_current_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(valid_openai_response()))
+        .mount(&server)
+        .await;
+
+    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
+    let policy = ClassifierRateLimitConfig {
+        quota_group: "minute-limited-test-quota".to_string(),
+        requests_per_minute: 1,
+        requests_per_day: 100,
+        tokens_per_minute: 2_000,
+        tokens_per_day: 200_000,
+        estimated_input_tokens_per_request: 1,
+        max_images_per_request: 1,
+    };
+    let mut config = make_classifier_config(&server.uri());
+    config.endpoints[0].rate_limit = Some(policy);
+    let scanner = Scanner::with_classifiers_and_rate_limits(
+        ops,
+        vec![Arc::new(ClassifierClient::from_config(&config).unwrap())],
+        vec![config.endpoints[0].rate_limit.clone()],
+        ScannerOptions {
+            poll_interval: std::time::Duration::from_secs(10),
+            retry_limit: 5,
+            retry_initial_delay: std::time::Duration::from_secs(1),
+            retry_max_delay: std::time::Duration::from_secs(300),
+            processing_lease_duration: std::time::Duration::from_secs(600),
+            maximum_image_size_bytes: 25_000_000,
+        },
+    );
+
+    let shutdown = ShutdownToken::new();
+    let task_shutdown = shutdown.clone();
+    let task =
+        tokio::spawn(async move { scanner.execute_one_pass_with_shutdown(&task_shutdown).await });
+
+    for _ in 0..100 {
+        if server.received_requests().await.unwrap().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    // The second image is waiting on the minute window. Previously the worker
+    // returned here and the scanner pass completed immediately.
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert!(!task.is_finished());
+
+    shutdown.cancel();
+    let report = task.await.unwrap().unwrap();
+    assert_eq!(report.claimed, 1);
+    assert_eq!(report.completed, 1);
+}
+
 // ── Invalid file tests ────────────────────────────────────────────────────
 
 /// Empty files, oversized files, and non-JPEG files become failed.

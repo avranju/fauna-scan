@@ -41,7 +41,7 @@ async fn provider_quota_is_sliding_per_minute_and_persistent_per_day() {
     );
     assert!(matches!(
         ops.reserve_classifier_rate_limit(&policy, 10, &start).await.unwrap(),
-        RateLimitReservation::Wait(wait) if wait >= Duration::from_secs(60)
+        RateLimitReservation::DailyExhausted(wait) if wait >= Duration::from_secs(60)
     ));
     drop(ops);
     drop(database);
@@ -52,6 +52,6 @@ async fn provider_quota_is_sliding_per_minute_and_persistent_per_day() {
     let after_minute: Timestamp = "2026-07-25T12:01:01Z".parse().unwrap();
     assert!(matches!(
         database.ops().reserve_classifier_rate_limit(&policy, 10, &after_minute).await.unwrap(),
-        RateLimitReservation::Wait(wait) if wait > Duration::from_secs(10 * 60 * 60)
+        RateLimitReservation::DailyExhausted(wait) if wait > Duration::from_secs(10 * 60 * 60)
     ));
 }

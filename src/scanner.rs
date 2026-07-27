@@ -422,12 +422,22 @@ impl Scanner {
                     {
                         RateLimitReservation::Granted => break,
                         RateLimitReservation::Wait(wait) => {
-                            // Do not keep this scanner pass alive while a provider is
-                            // unavailable. Other endpoint workers may already have
-                            // drained the current queue and exited; returning lets the
-                            // continuous loop start a fresh pass and recreate them for
-                            // images downloaded while this quota remains exhausted.
-                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint quota unavailable; yielding pass");
+                            // A per-minute limit is temporary. Keep this worker alive:
+                            // returning here would only recreate it after every other
+                            // endpoint drains the queue, which may never happen under a
+                            // sustained backlog.
+                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint temporarily rate limited; waiting");
+                            tokio::select! {
+                                _ = shutdown.cancelled() => return Ok(report),
+                                _ = worker_stop.cancelled() => return Ok(report),
+                                _ = sleep(wait) => {}
+                            }
+                        }
+                        RateLimitReservation::DailyExhausted(wait) => {
+                            // Waiting for the UTC daily reset could hold a scanner pass
+                            // open for hours. Yield so unrestricted endpoints can finish
+                            // their current work and later polling can recreate this one.
+                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint daily quota exhausted; yielding pass");
                             return Ok(report);
                         }
                     }

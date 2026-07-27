@@ -40,7 +40,12 @@ impl DatabaseOps {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RateLimitReservation {
     Granted,
+    /// The sliding per-minute limit is temporarily full. The worker can wait
+    /// and try again without abandoning its scanner pass.
     Wait(Duration),
+    /// The UTC daily request or token budget is exhausted. This can be many
+    /// hours, so the worker should yield until a later scanner pass.
+    DailyExhausted(Duration),
 }
 
 impl DatabaseOps {
@@ -136,7 +141,7 @@ impl DatabaseOps {
                 tomorrow.and_hms_opt(0, 0, 0).expect("midnight is valid"),
                 Utc,
             );
-            return Ok(RateLimitReservation::Wait(
+            return Ok(RateLimitReservation::DailyExhausted(
                 (reset - *now_dt).to_std().unwrap_or(Duration::from_secs(1)),
             ));
         }
