@@ -189,6 +189,8 @@ pub struct ClassifierRateLimitConfig {
 /// A fully resolved classifier endpoint.
 #[derive(Debug, Clone)]
 pub struct ClassifierEndpointConfig {
+    /// Whether this endpoint participates in classification request rotation.
+    pub enabled: bool,
     /// Optional provider quota policy. Endpoints sharing a quota group share
     /// one budget even when their transport URLs differ.
     pub rate_limit: Option<ClassifierRateLimitConfig>,
@@ -302,6 +304,7 @@ struct RawClassifierConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawClassifierEndpointConfig {
+    enabled: Option<bool>,
     base_url: Option<String>,
     endpoint: Option<String>,
     model: Option<String>,
@@ -664,6 +667,7 @@ where
         .transpose()?;
 
     Ok(ClassifierEndpointConfig {
+        enabled: raw.enabled.unwrap_or(true),
         rate_limit,
         base_url,
         endpoint: validate_classifier_endpoint(raw.endpoint.as_deref(), &label)?,
@@ -1004,29 +1008,32 @@ fn validate_config(config: &Config) -> AppResult<()> {
     for (index, endpoint) in config.classifier.endpoints.iter().enumerate() {
         let label = format!("classifier.endpoints[{index}]");
         validate_classifier_endpoint_config(endpoint, &label)?;
-        if let Some(limit) = &endpoint.rate_limit
-            && let Some(existing) = quota_groups.insert(&limit.quota_group, limit)
-            && existing != limit
-        {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                format!(
-                    "{label}.rate_limit differs from another endpoint in quota_group {}",
-                    limit.quota_group
-                ),
-            ));
-        }
-        if config.classifier.processing_lease_seconds <= endpoint.request_timeout_seconds {
-            return Err(AppError::new(
-                ErrorCategory::Configuration,
-                "validate_config",
-                format!(
-                    "classifier.processing_lease_seconds ({}) must be greater than \
-                     {label}.request_timeout_seconds ({}) to provide lease headroom",
-                    config.classifier.processing_lease_seconds, endpoint.request_timeout_seconds,
-                ),
-            ));
+        if endpoint.enabled {
+            if let Some(limit) = &endpoint.rate_limit
+                && let Some(existing) = quota_groups.insert(&limit.quota_group, limit)
+                && existing != limit
+            {
+                return Err(AppError::new(
+                    ErrorCategory::Configuration,
+                    "validate_config",
+                    format!(
+                        "{label}.rate_limit differs from another endpoint in quota_group {}",
+                        limit.quota_group
+                    ),
+                ));
+            }
+            if config.classifier.processing_lease_seconds <= endpoint.request_timeout_seconds {
+                return Err(AppError::new(
+                    ErrorCategory::Configuration,
+                    "validate_config",
+                    format!(
+                        "classifier.processing_lease_seconds ({}) must be greater than \
+                         {label}.request_timeout_seconds ({}) to provide lease headroom",
+                        config.classifier.processing_lease_seconds,
+                        endpoint.request_timeout_seconds,
+                    ),
+                ));
+            }
         }
     }
 

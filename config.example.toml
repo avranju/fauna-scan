@@ -55,6 +55,8 @@ processing_lease_seconds = 600
 
 # Each endpoint gets one concurrent classifier worker.
 [[classifier.endpoints]]
+# Set to false to keep an endpoint configured but remove it from request rotation.
+enabled = true
 base_url = "http://localhost:8081/v1"
 endpoint = "/chat/completions"
 model = "vision-model"

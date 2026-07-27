@@ -192,13 +192,17 @@ impl ClassifierClient {
     /// assembles the endpoint URL without dropping base-path segments, and
     /// constructs the HTTP client with the configured request timeout.
     pub fn from_config(config: &ClassifierConfig) -> AppResult<Self> {
-        let endpoint = config.endpoints.first().ok_or_else(|| {
-            AppError::new(
-                ErrorCategory::Configuration,
-                "classifier_from_config",
-                "at least one classifier endpoint must be configured",
-            )
-        })?;
+        let endpoint = config
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.enabled)
+            .ok_or_else(|| {
+                AppError::new(
+                    ErrorCategory::Configuration,
+                    "classifier_from_config",
+                    "at least one classifier endpoint must be configured and enabled",
+                )
+            })?;
         Self::from_endpoint_config(endpoint)
     }
 
@@ -1837,6 +1841,7 @@ mod tests {
         let base = Url::parse("http://user:pass@localhost:8081/v1").unwrap();
         let result = ClassifierClient::from_config(&ClassifierConfig {
             endpoints: vec![ClassifierEndpointConfig {
+                enabled: true,
                 base_url: base,
                 endpoint: "/chat/completions".to_string(),
                 model: "test".to_string(),
@@ -1868,6 +1873,7 @@ mod tests {
         let base = Url::parse("ftp://localhost:8081/v1").unwrap();
         let result = ClassifierClient::from_config(&ClassifierConfig {
             endpoints: vec![ClassifierEndpointConfig {
+                enabled: true,
                 base_url: base,
                 endpoint: "/chat/completions".to_string(),
                 model: "test".to_string(),

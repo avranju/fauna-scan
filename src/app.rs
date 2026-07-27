@@ -306,11 +306,16 @@ async fn handle_download(
 /// Run the complete service with downloader and scanner under one supervisor.
 async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
     let config = Config::load(config_path)?;
-    if config.classifier.endpoints.is_empty() {
+    if !config
+        .classifier
+        .endpoints
+        .iter()
+        .any(|endpoint| endpoint.enabled)
+    {
         return Err(AppError::new(
             ErrorCategory::Configuration,
             "run",
-            "no classifier endpoints are configured; run requires downloader and scanner pipelines",
+            "no classifier endpoints are configured or enabled; run requires downloader and scanner pipelines",
         ));
     }
     let scanner_options = ScannerOptions::from_config(&config)?;
@@ -383,6 +388,7 @@ async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
         .classifier
         .endpoints
         .iter()
+        .filter(|endpoint| endpoint.enabled)
         .map(|endpoint| endpoint.rate_limit.clone())
         .collect();
     let scanner = Scanner::with_classifiers_and_rate_limits(
@@ -500,12 +506,12 @@ fn with_command_context(operation: &'static str, error: AppError) -> AppError {
     AppError::with_source(error.category, operation, error.message.clone(), error)
 }
 
-/// Build one client for each configured classifier endpoint.
+/// Build one client for each enabled classifier endpoint.
 fn classifier_clients(
     config: &crate::configuration::ClassifierConfig,
 ) -> AppResult<Vec<Arc<crate::classifier::ClassifierClient>>> {
     let mut clients = Vec::with_capacity(config.endpoints.len());
-    for endpoint in &config.endpoints {
+    for endpoint in config.endpoints.iter().filter(|endpoint| endpoint.enabled) {
         clients.push(Arc::new(
             crate::classifier::ClassifierClient::from_endpoint_config(endpoint)?,
         ));
@@ -575,7 +581,7 @@ fn create_runtime_directories(config: &Config) -> AppResult<()> {
 
 /// Handle the `scan` subcommand.
 ///
-/// Loads configuration, requires at least one classifier endpoint **before**
+/// Loads configuration, requires at least one enabled classifier endpoint **before**
 /// creating directories or opening the database, then constructs
 /// ClassifierClient and ScannerOptions, and either executes one finite
 /// pass (`--once`) or enters continuous polling.
@@ -583,7 +589,7 @@ async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> 
     // Load and validate configuration.
     let config = Config::load(config_path)?;
 
-    // Require an endpoint immediately, before any filesystem mutation or
+    // Require an enabled endpoint immediately, before any filesystem mutation or
     // database open, so the configuration error is not masked by downstream
     // failures and an endpoint-less invocation has no side effects.
     ScannerOptions::from_config(&config)?;
@@ -600,11 +606,12 @@ async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> 
     // Build scanner options from shared pool policy.
     let options = ScannerOptions::from_config(&config)?;
 
-    // Build one concurrent worker per configured classifier endpoint.
+    // Build one concurrent worker per enabled classifier endpoint.
     let rate_limits = config
         .classifier
         .endpoints
         .iter()
+        .filter(|endpoint| endpoint.enabled)
         .map(|endpoint| endpoint.rate_limit.clone())
         .collect();
     let scanner = Scanner::with_classifiers_and_rate_limits(
@@ -641,4 +648,54 @@ async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> 
 /// Strip potentially sensitive details from an io::Error message.
 fn safe_io_message(e: &std::io::Error) -> String {
     e.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classifier_clients;
+    use crate::configuration::{
+        ClassifierConfig, ClassifierEndpointConfig, ClassifierGenerationConfig,
+    };
+    use url::Url;
+
+    fn endpoint(enabled: bool, base_url: &str) -> ClassifierEndpointConfig {
+        ClassifierEndpointConfig {
+            enabled,
+            rate_limit: None,
+            base_url: Url::parse(base_url).unwrap(),
+            endpoint: "/chat/completions".to_string(),
+            model: "test-model".to_string(),
+            api_key: None,
+            username: String::new(),
+            password: None,
+            request_timeout_seconds: 10,
+            prompt_version: "wildlife-v1".to_string(),
+            generation: ClassifierGenerationConfig {
+                temperature: 0.1,
+                max_tokens: 1000,
+            },
+        }
+    }
+
+    #[test]
+    fn classifier_clients_exclude_disabled_endpoints() {
+        let config = ClassifierConfig {
+            endpoints: vec![
+                endpoint(false, "ftp://disabled.invalid/v1"),
+                endpoint(true, "http://enabled.invalid/v1"),
+            ],
+            poll_interval_seconds: 10,
+            retry_limit: 5,
+            retry_initial_delay_seconds: 10,
+            retry_max_delay_seconds: 300,
+            processing_lease_seconds: 600,
+        };
+
+        let clients = classifier_clients(&config).expect("enabled endpoint should build");
+        assert_eq!(clients.len(), 1);
+        assert_eq!(
+            clients[0].endpoint_url().host_str(),
+            Some("enabled.invalid")
+        );
+    }
 }

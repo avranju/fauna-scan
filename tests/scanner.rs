@@ -55,6 +55,7 @@ fn make_classifier_config(mock_base: &str) -> ClassifierConfig {
     let scheme = url.scheme();
     ClassifierConfig {
         endpoints: vec![fauna_scan::configuration::ClassifierEndpointConfig {
+            enabled: true,
             base_url: Url::parse(&format!("{scheme}://{}:{}", url.host_str().unwrap(), port))
                 .unwrap(),
             endpoint: "/chat/completions".to_string(),
@@ -1079,6 +1080,7 @@ fn lease_equal_to_timeout_is_rejected() {
         },
         classifier: ClassifierConfig {
             endpoints: vec![fauna_scan::configuration::ClassifierEndpointConfig {
+                enabled: true,
                 base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
                 endpoint: "/chat/completions".to_string(),
                 model: "test".to_string(),
@@ -1147,6 +1149,7 @@ fn lease_one_second_above_timeout_is_accepted() {
         },
         classifier: ClassifierConfig {
             endpoints: vec![fauna_scan::configuration::ClassifierEndpointConfig {
+                enabled: true,
                 base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
                 endpoint: "/chat/completions".to_string(),
                 model: "test".to_string(),

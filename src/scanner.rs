@@ -51,13 +51,18 @@ pub struct ScannerOptions {
 impl ScannerOptions {
     /// Build scanner options from configuration.
     ///
-    /// Rejects an empty endpoint list or zero/invalid durations.
+    /// Rejects a configuration with no enabled endpoints or zero/invalid durations.
     pub fn from_config(config: &Config) -> AppResult<Self> {
-        if config.classifier.endpoints.is_empty() {
+        if !config
+            .classifier
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.enabled)
+        {
             return Err(AppError::new(
                 ErrorCategory::Configuration,
                 "scanner_from_config",
-                "no classifier endpoints are configured; scan cannot operate",
+                "no classifier endpoints are configured or enabled; scan cannot operate",
             ));
         }
 
@@ -101,7 +106,9 @@ impl ScannerOptions {
         // This check is also in validate_config (called by Config::load),
         // but tests and library callers may construct Config directly.
         for (index, endpoint) in config.classifier.endpoints.iter().enumerate() {
-            if config.classifier.processing_lease_seconds <= endpoint.request_timeout_seconds {
+            if endpoint.enabled
+                && config.classifier.processing_lease_seconds <= endpoint.request_timeout_seconds
+            {
                 return Err(AppError::new(
                     ErrorCategory::Configuration,
                     "scanner_from_config",
@@ -1719,6 +1726,7 @@ mod tests {
             .await;
         let classifier_config = crate::configuration::ClassifierConfig {
             endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                enabled: true,
                 base_url: url::Url::parse(&server.uri()).unwrap(),
                 endpoint: "/chat/completions".to_string(),
                 model: "test-model".to_string(),
@@ -1810,6 +1818,7 @@ mod tests {
             },
             classifier: crate::configuration::ClassifierConfig {
                 endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                    enabled: true,
                     base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
                     endpoint: "/chat/completions".to_string(),
                     model: "test".to_string(),
@@ -1881,6 +1890,7 @@ mod tests {
             },
             classifier: crate::configuration::ClassifierConfig {
                 endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                    enabled: true,
                     base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
                     endpoint: "/chat/completions".to_string(),
                     model: "test".to_string(),
@@ -1951,6 +1961,7 @@ mod tests {
             },
             classifier: crate::configuration::ClassifierConfig {
                 endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                    enabled: true,
                     base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
                     endpoint: "/chat/completions".to_string(),
                     model: "test".to_string(),
@@ -2022,6 +2033,7 @@ mod tests {
             },
             classifier: crate::configuration::ClassifierConfig {
                 endpoints: vec![crate::configuration::ClassifierEndpointConfig {
+                    enabled: true,
                     base_url: url::Url::parse("http://localhost:8081/v1").unwrap(),
                     endpoint: "/chat/completions".to_string(),
                     model: "test".to_string(),

@@ -24,6 +24,7 @@ fn make_classifier_config(mock_base: &str) -> ClassifierConfig {
 
     ClassifierConfig {
         endpoints: vec![ClassifierEndpointConfig {
+            enabled: true,
             base_url: Url::parse(&format!("{scheme}://{}:{}", url.host_str().unwrap(), port))
                 .unwrap(),
             endpoint: "/chat/completions".to_string(),

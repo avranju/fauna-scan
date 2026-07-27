@@ -54,11 +54,12 @@ default; if rebasing is disabled, use the explicit playback host allowlist.
 Classifier Basic authentication uses `username` plus `password_file`; API-key
 and Basic authentication may be combined. Configure classifier servers with
 one or more `[[classifier.endpoints]]` tables. Each endpoint requires
-`base_url` and `model`, and runs one concurrent worker. Endpoint settings do
-not inherit from other endpoints; credentials, timeouts, prompts, and
-generation settings are resolved independently. Images
-are claimed atomically and distributed among workers. An empty endpoint list
-disables classification.
+`base_url` and `model`, and runs one concurrent worker. Set an endpoint's
+`enabled = false` to remove it from request rotation without removing its
+configuration. Endpoint settings do not inherit from other endpoints;
+credentials, timeouts, prompts, and generation settings are resolved
+independently. Images are claimed atomically and distributed among enabled
+workers. An empty endpoint list disables classification.
 
 ## Commands
 

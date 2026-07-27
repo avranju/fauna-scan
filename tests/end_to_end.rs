@@ -255,6 +255,7 @@ fn build_test_config(server: &MockServer, root: &Path, start_at: Timestamp) -> C
         },
         classifier: ClassifierConfig {
             endpoints: vec![ClassifierEndpointConfig {
+                enabled: true,
                 base_url: Url::parse(&format!("{}/v1", server.uri())).expect("classifier URI"),
                 endpoint: "/chat/completions".to_string(),
                 model: "phase12-model".to_string(),

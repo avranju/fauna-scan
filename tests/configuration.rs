@@ -283,6 +283,7 @@ api_key = "primary-key"
 request_timeout_seconds = 120
 
 [[classifier.endpoints]]
+enabled = false
 base_url = "http://classifier-two:8082/v1"
 model = "secondary-model"
 api_key = "secondary-key"
@@ -302,7 +303,9 @@ model = "tertiary-model"
     let config = Config::load(Some(&path)).unwrap();
 
     assert_eq!(config.classifier.endpoints.len(), 3);
+    assert!(config.classifier.endpoints[0].enabled);
     let endpoint = &config.classifier.endpoints[1];
+    assert!(!endpoint.enabled);
     assert_eq!(endpoint.base_url.host_str(), Some("classifier-two"));
     assert_eq!(endpoint.endpoint, "/chat/completions");
     assert_eq!(endpoint.model, "secondary-model");

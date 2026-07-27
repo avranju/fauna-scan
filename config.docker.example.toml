@@ -50,6 +50,8 @@ retry_max_delay_seconds = 300
 processing_lease_seconds = 600
 
 [[classifier.endpoints]]
+# Set to false to keep an endpoint configured but remove it from request rotation.
+enabled = true
 base_url = "http://classifier:8081/v1"
 endpoint = "/chat/completions"
 model = "vision-model"
