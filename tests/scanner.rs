@@ -19,6 +19,7 @@ use fauna_scan::database::repository::DatabaseOps;
 use fauna_scan::domain::*;
 use fauna_scan::scanner::{Scanner, ScannerOptions, ScannerPassReport, scanner_backoff};
 use fauna_scan::service_lifecycle::ShutdownToken;
+use sqlx::Row;
 use tempfile::TempDir;
 use url::Url;
 use wiremock::matchers::{method, path};
@@ -690,6 +691,66 @@ async fn retryable_then_success() {
     // Verify the image is done.
     let img = scanner.database.get_image(ImageId::new(1)).await.unwrap();
     assert_eq!(img.processing_status, ProcessingStatus::Done);
+}
+
+/// A provider 429 keeps the rolling-minute attempt but refunds the daily
+/// quota because the provider did not generate a response.
+#[tokio::test]
+async fn http_429_refunds_daily_rate_limit_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .mount(&mock_server)
+        .await;
+
+    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let policy = ClassifierRateLimitConfig {
+        quota_group: "refund-on-429".to_string(),
+        requests_per_minute: 1,
+        requests_per_day: 1,
+        tokens_per_minute: 2_000,
+        tokens_per_day: 2_000,
+        estimated_input_tokens_per_request: 1,
+        max_images_per_request: 1,
+    };
+    let mut config = make_classifier_config(&mock_server.uri());
+    config.endpoints[0].rate_limit = Some(policy.clone());
+    let scanner = Scanner::with_classifiers_and_rate_limits(
+        ops,
+        vec![Arc::new(ClassifierClient::from_config(&config).unwrap())],
+        vec![config.endpoints[0].rate_limit.clone()],
+        ScannerOptions {
+            poll_interval: std::time::Duration::from_secs(10),
+            retry_limit: 5,
+            retry_initial_delay: std::time::Duration::from_secs(1),
+            retry_max_delay: std::time::Duration::from_secs(300),
+            processing_lease_duration: std::time::Duration::from_secs(600),
+            maximum_image_size_bytes: 25_000_000,
+        },
+    );
+
+    let report = scanner.clone().execute_one_pass().await.unwrap();
+    assert_eq!(report.retry_scheduled, 1);
+    let usage = sqlx::query(
+        "SELECT requests, tokens FROM classifier_rate_limit_daily_usage \
+         WHERE quota_group = ?",
+    )
+    .bind(&policy.quota_group)
+    .fetch_one(scanner.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(usage.get::<i64, _>(0), 0);
+    assert_eq!(usage.get::<i64, _>(1), 0);
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM classifier_rate_limit_events WHERE quota_group = ?",
+    )
+    .bind(&policy.quota_group)
+    .fetch_one(scanner.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(event_count, 1);
 }
 
 // ── Retry exhaustion test ─────────────────────────────────────────────────

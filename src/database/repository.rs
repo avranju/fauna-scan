@@ -48,6 +48,30 @@ pub enum RateLimitReservation {
     DailyExhausted(Duration),
 }
 
+/// An individual provider-quota reservation. It is returned only together
+/// with an atomically claimed image, so it can safely be refunded if Cerebras
+/// rejects the request before charging tokens.
+#[derive(Debug, Clone)]
+pub struct RateLimitGrant {
+    id: String,
+    quota_group: String,
+    day: String,
+    token_cost: i64,
+}
+
+/// Result of atomically checking quota and claiming work for a rate-limited
+/// classifier endpoint.
+#[derive(Debug)]
+pub enum RateLimitedProcessingClaim {
+    Claimed {
+        claim: ProcessingClaim,
+        grant: RateLimitGrant,
+    },
+    NoWork,
+    Wait(Duration),
+    DailyExhausted(Duration),
+}
+
 impl DatabaseOps {
     /// Atomically reserve one classifier request against its shared provider
     /// quota. Minute accounting uses a sliding 60-second window; daily
@@ -87,18 +111,11 @@ impl DatabaseOps {
             .begin()
             .await
             .map_err(|e| map_sqlx_error("reserve_classifier_rate_limit", e))?;
-        // This write acquires SQLite's writer lock before the reads below,
-        // serializing reservations from scanner workers sharing this database.
-        sqlx::query(
-            "DELETE FROM classifier_rate_limit_events WHERE quota_group = ? AND reserved_at <= ?",
-        )
-        .bind(&limit.quota_group)
-        .bind(&cutoff_str)
-        .execute(tx.as_mut())
-        .await
-        .map_err(|e| map_sqlx_error("reserve_classifier_rate_limit", e))?;
-        let minute = sqlx::query("SELECT COUNT(*), COALESCE(SUM(token_cost), 0), MIN(reserved_at) FROM classifier_rate_limit_events WHERE quota_group = ?")
-            .bind(&limit.quota_group).fetch_one(tx.as_mut()).await
+        // Keep events beyond the rolling minute window. A later provider 429
+        // may need to refund its daily charge, while the event must still
+        // remain visible to preserve the original attempt's minute throttle.
+        let minute = sqlx::query("SELECT COUNT(*), COALESCE(SUM(token_cost), 0), MIN(reserved_at) FROM classifier_rate_limit_events WHERE quota_group = ? AND reserved_at > ?")
+            .bind(&limit.quota_group).bind(&cutoff_str).fetch_one(tx.as_mut()).await
             .map_err(|e| map_sqlx_error("reserve_classifier_rate_limit", e))?;
         let minute_requests: i64 = minute.get(0);
         let minute_tokens: i64 = minute.get(1);
@@ -157,6 +174,326 @@ impl DatabaseOps {
             wait.max(Duration::from_millis(1)),
         ))
     }
+}
+
+impl DatabaseOps {
+    /// Atomically admit provider quota and claim an image. Keeping these two
+    /// writes in one `BEGIN IMMEDIATE` transaction prevents an endpoint worker
+    /// from spending quota after another worker has claimed the final image.
+    pub async fn claim_next_processing_with_rate_limit(
+        &self,
+        limit: &crate::configuration::ClassifierRateLimitConfig,
+        max_tokens: u32,
+        now: &Timestamp,
+        lease_until: &Timestamp,
+    ) -> AppResult<RateLimitedProcessingClaim> {
+        let token_cost = limit
+            .estimated_input_tokens_per_request
+            .checked_add(max_tokens as u64)
+            .ok_or_else(|| {
+                AppError::new(
+                    ErrorCategory::Configuration,
+                    "claim_next_processing_with_rate_limit",
+                    "classifier token reservation overflow",
+                )
+            })?;
+        let token_cost = i64::try_from(token_cost).map_err(|_| {
+            AppError::new(
+                ErrorCategory::Configuration,
+                "claim_next_processing_with_rate_limit",
+                "classifier token reservation exceeds SQLite integer range",
+            )
+        })?;
+        let now_dt = now.as_datetime();
+        let now_str = super::format_timestamp(now);
+        let lease_str = super::format_timestamp(lease_until);
+        let cutoff = Timestamp::new(*now_dt - chrono::Duration::seconds(60));
+        let cutoff_str = super::format_timestamp(&cutoff);
+        let day = now_dt.date_naive().to_string();
+
+        let mut tx = self
+            .0
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+
+        let image_id: Option<i64> = sqlx::query_scalar(
+            r#"SELECT id FROM images
+               WHERE processing_status IN ('new', 'retry_wait')
+                 AND (processing_status != 'retry_wait'
+                      OR processing_next_attempt_at IS NULL
+                      OR processing_next_attempt_at <= ?)
+                 AND local_path IS NOT NULL
+                 AND download_status = 'downloaded'
+                 AND processing_lease_until IS NULL
+               ORDER BY id ASC
+               LIMIT 1"#,
+        )
+        .bind(&now_str)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+        let Some(image_id) = image_id else {
+            tx.commit()
+                .await
+                .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+            return Ok(RateLimitedProcessingClaim::NoWork);
+        };
+
+        let minute = sqlx::query(
+            "SELECT COUNT(*), COALESCE(SUM(token_cost), 0), MIN(reserved_at) \
+             FROM classifier_rate_limit_events WHERE quota_group = ? AND reserved_at > ?",
+        )
+        .bind(&limit.quota_group)
+        .bind(&cutoff_str)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+        let minute_requests: i64 = minute.get(0);
+        let minute_tokens: i64 = minute.get(1);
+        let oldest: Option<String> = minute.get(2);
+        let daily = sqlx::query(
+            "SELECT requests, tokens FROM classifier_rate_limit_daily_usage \
+             WHERE quota_group = ? AND day = ?",
+        )
+        .bind(&limit.quota_group)
+        .bind(&day)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+        let (daily_requests, daily_tokens) = daily
+            .map(|row| (row.get::<i64, _>(0), row.get::<i64, _>(1)))
+            .unwrap_or((0, 0));
+        let rpm = i64::try_from(limit.requests_per_minute).unwrap_or(i64::MAX);
+        let rpd = i64::try_from(limit.requests_per_day).unwrap_or(i64::MAX);
+        let tpm = i64::try_from(limit.tokens_per_minute).unwrap_or(i64::MAX);
+        let tpd = i64::try_from(limit.tokens_per_day).unwrap_or(i64::MAX);
+        let permitted = minute_requests < rpm
+            && minute_tokens.saturating_add(token_cost) <= tpm
+            && daily_requests < rpd
+            && daily_tokens.saturating_add(token_cost) <= tpd;
+        if !permitted {
+            tx.commit()
+                .await
+                .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+            if daily_requests >= rpd || daily_tokens.saturating_add(token_cost) > tpd {
+                let tomorrow = now_dt
+                    .date_naive()
+                    .succ_opt()
+                    .expect("date has a successor");
+                let reset = chrono::DateTime::<Utc>::from_naive_utc_and_offset(
+                    tomorrow.and_hms_opt(0, 0, 0).expect("midnight is valid"),
+                    Utc,
+                );
+                return Ok(RateLimitedProcessingClaim::DailyExhausted(
+                    (reset - *now_dt).to_std().unwrap_or(Duration::from_secs(1)),
+                ));
+            }
+            let wait = oldest
+                .and_then(|value| value.parse::<Timestamp>().ok())
+                .and_then(|oldest| {
+                    ((*oldest.as_datetime() + chrono::Duration::seconds(60)) - *now_dt)
+                        .to_std()
+                        .ok()
+                })
+                .unwrap_or(Duration::from_secs(1));
+            return Ok(RateLimitedProcessingClaim::Wait(
+                wait.max(Duration::from_millis(1)),
+            ));
+        }
+
+        let row = sqlx::query(
+            r#"UPDATE images
+               SET processing_status = 'processing',
+                   processing_attempts = processing_attempts + 1,
+                   processing_generation = processing_generation + 1,
+                   processing_started_at = ?,
+                   processing_lease_until = ?,
+                   updated_at = ?
+               WHERE id = ? AND processing_status IN ('new', 'retry_wait')
+                 AND (processing_status != 'retry_wait'
+                      OR processing_next_attempt_at IS NULL
+                      OR processing_next_attempt_at <= ?)
+                 AND local_path IS NOT NULL
+                 AND download_status = 'downloaded'
+                 AND processing_lease_until IS NULL
+               RETURNING id, image_key, local_path, processing_attempts,
+                         processing_generation, processing_lease_until"#,
+        )
+        .bind(&now_str)
+        .bind(&lease_str)
+        .bind(&now_str)
+        .bind(image_id)
+        .bind(&now_str)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+        let Some(row) = row else {
+            tx.commit()
+                .await
+                .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+            return Ok(RateLimitedProcessingClaim::NoWork);
+        };
+
+        let reservation_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO classifier_rate_limit_events (id, quota_group, reserved_at, token_cost) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&reservation_id)
+        .bind(&limit.quota_group)
+        .bind(&now_str)
+        .bind(token_cost)
+        .execute(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+        sqlx::query(
+            "INSERT INTO classifier_rate_limit_daily_usage (quota_group, day, requests, tokens) \
+             VALUES (?, ?, 1, ?) ON CONFLICT(quota_group, day) DO UPDATE SET \
+             requests = requests + 1, tokens = tokens + excluded.tokens",
+        )
+        .bind(&limit.quota_group)
+        .bind(&day)
+        .bind(token_cost)
+        .execute(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+        tx.commit()
+            .await
+            .map_err(|e| map_sqlx_error("claim_next_processing_with_rate_limit", e))?;
+
+        let claim = processing_claim_from_row(row, "claim_next_processing_with_rate_limit")?;
+        Ok(RateLimitedProcessingClaim::Claimed {
+            claim,
+            grant: RateLimitGrant {
+                id: reservation_id,
+                quota_group: limit.quota_group.clone(),
+                day,
+                token_cost,
+            },
+        })
+    }
+
+    /// Cancel a reservation when request preparation failed before any HTTP
+    /// submission. Both daily and minute accounting are released because the
+    /// provider never observed an attempt.
+    pub async fn cancel_classifier_rate_limit(&self, grant: &RateLimitGrant) -> AppResult<bool> {
+        let mut tx = self
+            .0
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_sqlx_error("cancel_classifier_rate_limit", e))?;
+        let removed = sqlx::query(
+            "DELETE FROM classifier_rate_limit_events WHERE id = ? AND daily_refunded_at IS NULL",
+        )
+        .bind(&grant.id)
+        .execute(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("cancel_classifier_rate_limit", e))?;
+        if removed.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .map_err(|e| map_sqlx_error("cancel_classifier_rate_limit", e))?;
+            return Ok(false);
+        }
+        decrement_daily_rate_limit_usage(tx.as_mut(), grant, "cancel_classifier_rate_limit")
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|e| map_sqlx_error("cancel_classifier_rate_limit", e))?;
+        Ok(true)
+    }
+
+    /// Refund daily quota after an explicit provider rejection. The event is
+    /// retained so the failed attempt continues to count in the rolling
+    /// minute window and cannot turn retries into a request burst.
+    pub async fn refund_daily_classifier_rate_limit(
+        &self,
+        grant: &RateLimitGrant,
+        now: &Timestamp,
+    ) -> AppResult<bool> {
+        let mut tx = self
+            .0
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_sqlx_error("refund_daily_classifier_rate_limit", e))?;
+        let marked = sqlx::query(
+            "UPDATE classifier_rate_limit_events SET daily_refunded_at = ? \
+             WHERE id = ? AND daily_refunded_at IS NULL",
+        )
+        .bind(super::format_timestamp(now))
+        .bind(&grant.id)
+        .execute(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("refund_daily_classifier_rate_limit", e))?;
+        if marked.rows_affected() == 0 {
+            tx.commit()
+                .await
+                .map_err(|e| map_sqlx_error("refund_daily_classifier_rate_limit", e))?;
+            return Ok(false);
+        }
+        decrement_daily_rate_limit_usage(tx.as_mut(), grant, "refund_daily_classifier_rate_limit")
+            .await?;
+        tx.commit()
+            .await
+            .map_err(|e| map_sqlx_error("refund_daily_classifier_rate_limit", e))?;
+        Ok(true)
+    }
+}
+
+async fn decrement_daily_rate_limit_usage(
+    connection: &mut sqlx::SqliteConnection,
+    grant: &RateLimitGrant,
+    operation: &'static str,
+) -> AppResult<()> {
+    let usage = sqlx::query(
+        "UPDATE classifier_rate_limit_daily_usage SET requests = requests - 1, \
+         tokens = tokens - ? WHERE quota_group = ? AND day = ? \
+         AND requests > 0 AND tokens >= ?",
+    )
+    .bind(grant.token_cost)
+    .bind(&grant.quota_group)
+    .bind(&grant.day)
+    .bind(grant.token_cost)
+    .execute(connection)
+    .await
+    .map_err(|e| map_sqlx_error(operation, e))?;
+    if usage.rows_affected() != 1 {
+        return Err(AppError::new(
+            ErrorCategory::Database,
+            operation,
+            "rate-limit event exists without matching daily usage",
+        ));
+    }
+    Ok(())
+}
+
+fn processing_claim_from_row(
+    row: sqlx::sqlite::SqliteRow,
+    operation: &'static str,
+) -> AppResult<ProcessingClaim> {
+    let image_id: i64 = row.try_get(0).map_err(|e| map_sqlx_error(operation, e))?;
+    let image_key: String = row.try_get(1).map_err(|e| map_sqlx_error(operation, e))?;
+    let local_path: String = row.try_get(2).map_err(|e| map_sqlx_error(operation, e))?;
+    let processing_attempts: i64 = row.try_get(3).map_err(|e| map_sqlx_error(operation, e))?;
+    let generation: i64 = row.try_get(4).map_err(|e| map_sqlx_error(operation, e))?;
+    let lease_until_str: String = row.try_get(5).map_err(|e| map_sqlx_error(operation, e))?;
+    let lease_until = lease_until_str.parse::<Timestamp>().map_err(|e| {
+        AppError::with_source(
+            ErrorCategory::Database,
+            operation,
+            format!("invalid lease_until timestamp: {e}"),
+            anyhow::Error::from(e),
+        )
+    })?;
+    Ok(ProcessingClaim {
+        image_id: ImageId::new(image_id),
+        image_key: ImageKey::new(image_key),
+        local_path: PathBuf::from(local_path),
+        processing_attempts,
+        generation,
+        lease_until,
+    })
 }
 
 // ── Active camera enumeration ───────────────────────────────────────────

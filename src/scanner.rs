@@ -17,7 +17,7 @@ use tokio::time::sleep;
 use crate::classifier::{ClassifierClient, ClassifierError, ClassifierOutput, RetryDisposition};
 use crate::configuration::Config;
 use crate::database::models::*;
-use crate::database::repository::{DatabaseOps, RateLimitReservation};
+use crate::database::repository::{DatabaseOps, RateLimitGrant, RateLimitedProcessingClaim};
 use crate::domain::ImageId;
 use crate::domain::Timestamp;
 use crate::error::{AppError, AppResult, ErrorCategory};
@@ -406,52 +406,9 @@ impl Scanner {
             if shutdown.is_cancelled() || worker_stop.is_cancelled() {
                 return Ok(report);
             }
-            // Do not reserve provider quota when there is no local work. The
-            // subsequent atomic claim remains necessary because other endpoint
-            // workers may race this preflight check.
-            if !self
-                .database
-                .has_eligible_processing(&Timestamp::new(Utc::now()))
-                .await?
-            {
-                return Ok(report);
-            }
-            if let Some(limit) = &rate_limit {
-                loop {
-                    match self
-                        .database
-                        .reserve_classifier_rate_limit(
-                            limit,
-                            classifier.max_tokens(),
-                            &Timestamp::new(Utc::now()),
-                        )
-                        .await?
-                    {
-                        RateLimitReservation::Granted => break,
-                        RateLimitReservation::Wait(wait) => {
-                            // A per-minute limit is temporary. Keep this worker alive:
-                            // returning here would only recreate it after every other
-                            // endpoint drains the queue, which may never happen under a
-                            // sustained backlog.
-                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint temporarily rate limited; waiting");
-                            tokio::select! {
-                                _ = shutdown.cancelled() => return Ok(report),
-                                _ = worker_stop.cancelled() => return Ok(report),
-                                _ = sleep(wait) => {}
-                            }
-                        }
-                        RateLimitReservation::DailyExhausted(wait) => {
-                            // Waiting for the UTC daily reset could hold a scanner pass
-                            // open for hours. Yield so unrestricted endpoints can finish
-                            // their current work and later polling can recreate this one.
-                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint daily quota exhausted; yielding pass");
-                            return Ok(report);
-                        }
-                    }
-                }
-            }
+            let now = Timestamp::new(Utc::now());
             let lease_until = Timestamp::new(
-                Utc::now()
+                now.as_datetime()
                     .checked_add_signed(
                         chrono::Duration::from_std(self.options.processing_lease_duration)
                             .expect("lease duration fits in chrono::Duration"),
@@ -464,13 +421,52 @@ impl Scanner {
                         )
                     })?,
             );
-            let claim = match self
-                .database
-                .claim_next_processing(&Timestamp::new(Utc::now()), &lease_until)
-                .await?
-            {
-                Some(claim) => claim,
-                None => return Ok(report),
+            let (claim, rate_limit_grant) = if let Some(limit) = &rate_limit {
+                loop {
+                    match self
+                        .database
+                        .claim_next_processing_with_rate_limit(
+                            limit,
+                            classifier.max_tokens(),
+                            &Timestamp::new(Utc::now()),
+                            &lease_until,
+                        )
+                        .await?
+                    {
+                        RateLimitedProcessingClaim::Claimed { claim, grant } => {
+                            break (claim, Some(grant));
+                        }
+                        RateLimitedProcessingClaim::NoWork => return Ok(report),
+                        RateLimitedProcessingClaim::Wait(wait) => {
+                            // A per-minute limit is temporary. Keep this worker alive:
+                            // returning here would only recreate it after every other
+                            // endpoint drains the queue, which may never happen under a
+                            // sustained backlog.
+                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint temporarily rate limited; waiting");
+                            tokio::select! {
+                                _ = shutdown.cancelled() => return Ok(report),
+                                _ = worker_stop.cancelled() => return Ok(report),
+                                _ = sleep(wait) => {}
+                            }
+                        }
+                        RateLimitedProcessingClaim::DailyExhausted(wait) => {
+                            // Waiting for the UTC daily reset could hold a scanner pass
+                            // open for hours. Yield so unrestricted endpoints can finish
+                            // their current work and later polling can recreate this one.
+                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint daily quota exhausted; yielding pass");
+                            return Ok(report);
+                        }
+                    }
+                }
+            } else {
+                match self
+                    .database
+                    .claim_next_processing(&now, &lease_until)
+                    .await?
+                {
+                    Some(claim) => (claim, None),
+                    None => return Ok(report),
+                }
             };
             report.claimed += 1;
             tracing::info!(
@@ -483,13 +479,27 @@ impl Scanner {
                 generation = claim.generation,
                 "Classifier endpoint worker claimed image"
             );
-            match self.process_claim(&claim, classifier.clone()).await? {
+            match self
+                .process_claim(&claim, classifier.clone(), rate_limit_grant)
+                .await?
+            {
                 ScannerOutcome::Completed => report.completed += 1,
                 ScannerOutcome::RetryScheduled => report.retry_scheduled += 1,
                 ScannerOutcome::Failed => report.failed += 1,
                 ScannerOutcome::Missing => report.missing += 1,
             }
         }
+    }
+
+    async fn cancel_unused_rate_limit_grant(
+        &self,
+        grant: Option<&RateLimitGrant>,
+    ) -> AppResult<()> {
+        if let Some(grant) = grant {
+            let cancelled = self.database.cancel_classifier_rate_limit(grant).await?;
+            tracing::info!(cancelled, "Cancelled unused classifier quota reservation");
+        }
+        Ok(())
     }
 
     /// Process a single processing claim: validate the local file, call the
@@ -503,6 +513,7 @@ impl Scanner {
         &self,
         claim: &ProcessingClaim,
         classifier: Arc<ClassifierClient>,
+        rate_limit_grant: Option<RateLimitGrant>,
     ) -> AppResult<ScannerOutcome> {
         let image_id = claim.image_id;
         let generation = claim.generation;
@@ -523,6 +534,8 @@ impl Scanner {
                         generation,
                         "Local file is missing"
                     );
+                    self.cancel_unused_rate_limit_grant(rate_limit_grant.as_ref())
+                        .await?;
                     self.database
                         .fail_processing(
                             image_id,
@@ -544,6 +557,8 @@ impl Scanner {
                         error = %e,
                         "Transient filesystem error"
                     );
+                    self.cancel_unused_rate_limit_grant(rate_limit_grant.as_ref())
+                        .await?;
                     return self
                         .handle_classifier_retry_failure(
                             image_id,
@@ -563,6 +578,8 @@ impl Scanner {
                         "Invalid or oversized local image"
                     );
                     let safe_error = format!("invalid local image: {}", e);
+                    self.cancel_unused_rate_limit_grant(rate_limit_grant.as_ref())
+                        .await?;
                     self.database
                         .fail_processing(
                             image_id,
@@ -587,9 +604,15 @@ impl Scanner {
                     .expect("lease duration fits in chrono::Duration"),
         );
 
-        self.database
+        if let Err(error) = self
+            .database
             .renew_processing_lease(image_id, generation, &renewal_deadline, &heartbeat_now)
-            .await?;
+            .await
+        {
+            self.cancel_unused_rate_limit_grant(rate_limit_grant.as_ref())
+                .await?;
+            return Err(error);
+        }
 
         // Build the classification request (synchronous Base64 encoding +
         // request construction).  This phase can be slow for large images,
@@ -611,6 +634,8 @@ impl Scanner {
                     RetryDisposition::Permanent,
                     None,
                 ));
+                self.cancel_unused_rate_limit_grant(rate_limit_grant.as_ref())
+                    .await?;
                 self.database
                     .fail_processing(
                         image_id,
@@ -635,9 +660,15 @@ impl Scanner {
                     .expect("lease duration fits in chrono::Duration"),
         );
 
-        self.database
+        if let Err(error) = self
+            .database
             .renew_processing_lease(image_id, generation, &renewal_deadline2, &heartbeat_now2)
-            .await?;
+            .await
+        {
+            self.cancel_unused_rate_limit_grant(rate_limit_grant.as_ref())
+                .await?;
+            return Err(error);
+        }
 
         // ── Structured lease-renewal supervision ─────────────────────────
         //
@@ -701,6 +732,25 @@ impl Scanner {
                 match raw_bytes {
                     Ok(bytes) => bytes,
                     Err(classifier_err) => {
+                        // Cerebras explicitly rejected this request before
+                        // generation. Refund its daily token reservation, but
+                        // keep the minute-window event so retries cannot burst.
+                        if classifier_err.http_status() == Some(429)
+                            && let Some(grant) = rate_limit_grant.as_ref()
+                        {
+                            let refunded = self
+                                .database
+                                .refund_daily_classifier_rate_limit(
+                                    grant,
+                                    &Timestamp::new(Utc::now()),
+                                )
+                                .await?;
+                            tracing::info!(
+                                image_id = image_id.get(),
+                                refunded,
+                                "Refunded daily classifier quota after HTTP 429"
+                            );
+                        }
                         tracing::warn!(
                             image_id = image_id.get(),
                             image_key = image_key_short,
