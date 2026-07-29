@@ -32,6 +32,7 @@ fn checked_in_example_configuration_loads() {
         state_dir.join("fauna-scan.sqlite3")
     );
     assert_eq!(config.general.output_directory, output_dir);
+    assert_eq!(config.general.non_wildlife_image_retention_days, 4);
     assert_eq!(config.nvr.search.max_results, 50);
     assert_eq!(config.nvr.download.concurrency, 2);
     assert!(config.nvr.download.rebase_playback_urls);

@@ -5,6 +5,11 @@
 database_path = "/var/lib/fauna-scan/fauna-scan.sqlite3"
 output_directory = "/var/lib/fauna-scan/images"
 log_level = "info"
+# Number of days to retain images classified as not containing wildlife.
+# Images older than this (measured from capture time) and classified as
+# no-wildlife will be garbage collected. Images with any wildlife-positive
+# classification are never collected.
+non_wildlife_image_retention_days = 4
 
 [web]
 enabled = true

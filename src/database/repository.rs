@@ -1,6 +1,7 @@
 //! All durable state changes for Fauna Scan, centralized in short
 //! parameterized transactions.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1035,7 +1036,23 @@ impl DatabaseOps {
         local_path: &Path,
         downloaded_at: &Timestamp,
     ) -> AppResult<()> {
-        let path_str = local_path.to_string_lossy().to_string();
+        // Persist the canonical path for successful downloads.  Keeping the
+        // database reference independent of a supported output-root symlink
+        // means that retargeting that symlink cannot make a wildlife path
+        // silently refer to a different file later.
+        let (path_str, file_identity) = match tokio::fs::canonicalize(local_path).await {
+            Ok(path) => {
+                let canonical = path.to_string_lossy().to_string();
+                (canonical.clone(), canonical)
+            }
+            Err(_) => {
+                // A few crash-recovery/test paths complete a row after the
+                // bytes have disappeared. Preserve that compatibility, but
+                // mark the identity unresolved so collection remains fail-safe.
+                let path = local_path.to_string_lossy().to_string();
+                (path.clone(), format!("unresolved:{path}"))
+            }
+        };
         let downloaded_str = super::format_timestamp(downloaded_at);
         let updated_at = super::format_timestamp(downloaded_at);
 
@@ -1043,6 +1060,7 @@ impl DatabaseOps {
             r#"UPDATE images SET
                    download_status = 'downloaded',
                    local_path = ?,
+                   local_file_identity = ?,
                    downloaded_at = ?,
                    download_lease_until = NULL,
                    download_next_attempt_at = NULL,
@@ -1051,6 +1069,7 @@ impl DatabaseOps {
                WHERE id = ? AND download_status = 'downloading'"#,
         )
         .bind(&path_str)
+        .bind(&file_identity)
         .bind(&downloaded_str)
         .bind(&updated_at)
         .bind(image_id.get())
@@ -2035,4 +2054,473 @@ impl DatabaseOps {
             created_at: parse_timestamp_col(&row, 13)?,
         })
     }
+
+    // ── Garbage collection candidate selection ───────────────────────────
+
+    /// Page eligible no-wildlife image paths for garbage collection.
+    ///
+    /// Returns at most `limit` candidates whose `capture_start_at` is
+    /// strictly less than `cutoff`, ordered by image ID for stable pagination.
+    ///
+    /// Eligibility requires:
+    /// - `processing_status = 'done'`
+    /// - `local_path IS NOT NULL`
+    /// - At least one classification with `contains_wildlife = 0`
+    /// - No classification with `contains_wildlife = 1`
+    ///
+    /// Shared-positive path safety is enforced at the filesystem level by the
+    /// garbage collector (which canonicalizes paths), so this query does not
+    /// filter by shared paths.  That prevents alias-direction bugs where the
+    /// SQL string comparison matches one direction but not the other.
+    ///
+    /// When `after_image_id` is provided, only images with a greater ID are
+    /// returned, enabling bounded pagination across passes.
+    pub async fn garbage_collection_candidates(
+        &self,
+        cutoff: &Timestamp,
+        after_image_id: Option<ImageId>,
+        limit: u32,
+    ) -> AppResult<Vec<GarbageCollectionCandidate>> {
+        let cutoff_str = super::format_timestamp(cutoff);
+        let min_id = after_image_id.map(|id| id.get());
+
+        let query = if let Some(min_id) = min_id {
+            sqlx::query_as::<_, GarbageCollectionRow>(
+                r#"SELECT id, local_path
+                       FROM images
+                       WHERE processing_status = 'done'
+                         AND local_path IS NOT NULL
+                         AND capture_start_at < ?
+                         AND id > ?
+                         AND EXISTS (
+                             SELECT 1 FROM classifications
+                             WHERE classifications.image_id = images.id
+                               AND classifications.contains_wildlife = 0
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1 FROM classifications
+                             WHERE classifications.image_id = images.id
+                               AND classifications.contains_wildlife = 1
+                         )
+                       ORDER BY images.id ASC
+                       LIMIT ?"#,
+            )
+            .bind(&cutoff_str)
+            .bind(min_id)
+            .bind(limit)
+        } else {
+            sqlx::query_as::<_, GarbageCollectionRow>(
+                r#"SELECT id, local_path
+                       FROM images
+                       WHERE processing_status = 'done'
+                         AND local_path IS NOT NULL
+                         AND capture_start_at < ?
+                         AND EXISTS (
+                             SELECT 1 FROM classifications
+                             WHERE classifications.image_id = images.id
+                               AND classifications.contains_wildlife = 0
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1 FROM classifications
+                             WHERE classifications.image_id = images.id
+                               AND classifications.contains_wildlife = 1
+                         )
+                       ORDER BY images.id ASC
+                       LIMIT ?"#,
+            )
+            .bind(&cutoff_str)
+            .bind(limit)
+        };
+
+        let rows: Vec<GarbageCollectionRow> = query
+            .fetch_all(&self.0)
+            .await
+            .map_err(|e| map_sqlx_error("garbage_collection_candidates", e))?;
+
+        let candidates = rows
+            .into_iter()
+            .map(|row| {
+                let image_id = ImageId::new(row.id);
+                let local_path = PathBuf::from(row.local_path);
+                GarbageCollectionCandidate {
+                    image_id,
+                    local_path,
+                }
+            })
+            .collect();
+
+        Ok(candidates)
+    }
+
+    /// Page wildlife-positive rows whose stored path is not canonical and
+    /// therefore needs filesystem reconciliation before collection.
+    pub async fn wildlife_file_references_needing_reconciliation(
+        &self,
+        after_image_id: Option<ImageId>,
+        limit: u32,
+    ) -> AppResult<Vec<WildlifeFileReference>> {
+        let min_id = after_image_id.map(|id| id.get());
+        let query = if let Some(min_id) = min_id {
+            sqlx::query_as::<_, (i64, String)>(
+                r#"SELECT images.id, images.local_path
+                     FROM images
+                    WHERE images.id > ?
+                      AND images.local_path IS NOT NULL
+                      AND (images.local_file_identity IS NULL
+                           OR images.local_file_identity LIKE 'unresolved:%'
+                           OR images.local_path != images.local_file_identity)
+                      AND EXISTS (
+                          SELECT 1 FROM classifications
+                           WHERE classifications.image_id = images.id
+                             AND classifications.contains_wildlife = 1
+                      )
+                    ORDER BY images.id ASC
+                    LIMIT ?"#,
+            )
+            .bind(min_id)
+            .bind(limit)
+        } else {
+            sqlx::query_as::<_, (i64, String)>(
+                r#"SELECT images.id, images.local_path
+                     FROM images
+                    WHERE images.local_path IS NOT NULL
+                      AND (images.local_file_identity IS NULL
+                           OR images.local_file_identity LIKE 'unresolved:%'
+                           OR images.local_path != images.local_file_identity)
+                      AND EXISTS (
+                          SELECT 1 FROM classifications
+                           WHERE classifications.image_id = images.id
+                             AND classifications.contains_wildlife = 1
+                      )
+                    ORDER BY images.id ASC
+                    LIMIT ?"#,
+            )
+            .bind(limit)
+        };
+
+        query
+            .fetch_all(&self.0)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|(id, path)| WildlifeFileReference {
+                        image_id: ImageId::new(id),
+                        local_path: PathBuf::from(path),
+                    })
+                    .collect()
+            })
+            .map_err(|e| map_sqlx_error("wildlife_file_references_needing_reconciliation", e))
+    }
+
+    /// Replace a legacy wildlife-positive path with its current canonical
+    /// filesystem path. The guard prevents a stale reconciliation from
+    /// overwriting a path changed by another operation.
+    pub async fn reconcile_wildlife_file_reference(
+        &self,
+        reference: &WildlifeFileReference,
+        canonical_path: &Path,
+    ) -> AppResult<()> {
+        let expected = reference.local_path.to_string_lossy().to_string();
+        let canonical = canonical_path.to_string_lossy().to_string();
+        sqlx::query(
+            r#"UPDATE images
+                  SET local_path = ?, local_file_identity = ?
+                WHERE id = ? AND local_path = ?
+                  AND EXISTS (
+                      SELECT 1 FROM classifications
+                       WHERE classifications.image_id = images.id
+                         AND classifications.contains_wildlife = 1
+                  )"#,
+        )
+        .bind(&canonical)
+        .bind(&canonical)
+        .bind(reference.image_id.get())
+        .bind(&expected)
+        .execute(&self.0)
+        .await
+        .map_err(|e| map_sqlx_error("reconcile_wildlife_file_reference", e))?;
+        Ok(())
+    }
+
+    /// Mark an inaccessible legacy wildlife path as unresolved. It remains
+    /// fail-safe for collection, without requiring the filesystem scan to be
+    /// repeated once for every candidate.
+    pub async fn mark_wildlife_file_reference_unresolved(
+        &self,
+        reference: &WildlifeFileReference,
+    ) -> AppResult<()> {
+        let expected = reference.local_path.to_string_lossy().to_string();
+        let marker = format!("unresolved:{expected}");
+        sqlx::query(
+            r#"UPDATE images
+                  SET local_file_identity = ?
+                WHERE id = ? AND local_path = ?
+                  AND EXISTS (
+                      SELECT 1 FROM classifications
+                       WHERE classifications.image_id = images.id
+                         AND classifications.contains_wildlife = 1
+                  )"#,
+        )
+        .bind(&marker)
+        .bind(reference.image_id.get())
+        .bind(&expected)
+        .execute(&self.0)
+        .await
+        .map_err(|e| map_sqlx_error("mark_wildlife_file_reference_unresolved", e))?;
+        Ok(())
+    }
+
+    /// Return whether a wildlife-positive row still has an unresolved or
+    /// non-canonical path. This short query is also used inside the final
+    /// collection transaction to close the legacy alias race.
+    async fn has_unreconciled_wildlife_file_reference(
+        executor: &mut sqlx::SqliteConnection,
+    ) -> Result<bool, sqlx::Error> {
+        let exists: i64 = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM images
+                  WHERE local_path IS NOT NULL
+                    AND (local_file_identity IS NULL
+                         OR local_file_identity LIKE 'unresolved:%'
+                         OR local_path != local_file_identity)
+                    AND EXISTS (
+                        SELECT 1 FROM classifications
+                         WHERE classifications.image_id = images.id
+                           AND classifications.contains_wildlife = 1
+                    )
+             )"#,
+        )
+        .fetch_one(&mut *executor)
+        .await?;
+        Ok(exists != 0)
+    }
+
+    /// Serialize the final eligibility check, shared-file check, unlink, and
+    /// path clearing against classification writes.
+    ///
+    /// The `BEGIN IMMEDIATE` transaction remains open while `operation` runs.
+    /// Classification completion also uses `BEGIN IMMEDIATE`, so a positive
+    /// classification cannot commit between these checks and unlinking.  The
+    /// Canonical paths are persisted for new downloads and legacy wildlife
+    /// paths are reconciled before this transaction starts. The short
+    /// unresolved-path guard below also closes the race where a legacy row
+    /// receives a positive classification after reconciliation.
+    pub async fn with_gc_candidate<F, Fut, T>(
+        &self,
+        candidate: &GarbageCollectionCandidate,
+        cutoff: &Timestamp,
+        canonical_identity: Option<&Path>,
+        operation: F,
+    ) -> AppResult<Option<T>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = AppResult<T>>,
+    {
+        let cutoff_str = super::format_timestamp(cutoff);
+        let path_str = candidate.local_path.to_string_lossy().to_string();
+        let identity_str = canonical_identity.map(|path| path.to_string_lossy().to_string());
+        let mut tx = self
+            .0
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_sqlx_error("with_gc_candidate", e))?;
+
+        let eligible: i64 = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM images
+                  WHERE id = ?
+                    AND local_path = ?
+                    AND processing_status = 'done'
+                    AND capture_start_at < ?
+                    AND EXISTS (
+                        SELECT 1 FROM classifications
+                         WHERE classifications.image_id = images.id
+                           AND classifications.contains_wildlife = 0
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM classifications
+                         WHERE classifications.image_id = images.id
+                           AND classifications.contains_wildlife = 1
+                    )
+             )"#,
+        )
+        .bind(candidate.image_id.get())
+        .bind(&path_str)
+        .bind(&cutoff_str)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("with_gc_candidate_eligibility", e))?;
+        if eligible == 0 {
+            return Ok(None);
+        }
+
+        // Exact local_path matching is required even when the identity column
+        // is NULL. This protects rows created before migration 0007.
+        let shared_positive: i64 = sqlx::query_scalar(
+            r#"SELECT EXISTS(
+                 SELECT 1 FROM images AS positive_images
+                  WHERE positive_images.local_path IS NOT NULL
+                    AND (positive_images.local_path = ?
+                         OR positive_images.local_file_identity = ?)
+                    AND EXISTS (
+                        SELECT 1 FROM classifications
+                         WHERE classifications.image_id = positive_images.id
+                           AND classifications.contains_wildlife = 1
+                    )
+             )"#,
+        )
+        .bind(&path_str)
+        .bind(&identity_str)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("with_gc_candidate_shared_wildlife", e))?;
+        if shared_positive != 0 {
+            return Ok(None);
+        }
+
+        // A legacy wildlife row that was not reconciled before this
+        // transaction is ambiguous. Do not perform filesystem I/O while the
+        // writer reservation is held; simply defer this candidate to the next
+        // pass after reconciliation.
+        if Self::has_unreconciled_wildlife_file_reference(&mut tx)
+            .await
+            .map_err(|e| map_sqlx_error("with_gc_candidate_unreconciled_wildlife", e))?
+        {
+            return Ok(None);
+        }
+
+        let operation_result = operation().await?;
+        let collected_at = super::format_timestamp(&Timestamp::new(Utc::now()));
+        let update = sqlx::query(
+            r#"UPDATE images
+                  SET local_path = NULL,
+                      local_file_identity = NULL,
+                      updated_at = ?
+                WHERE id = ? AND local_path = ?
+                  AND processing_status = 'done'
+                  AND capture_start_at < ?
+                  AND EXISTS (
+                      SELECT 1 FROM classifications
+                       WHERE classifications.image_id = images.id
+                         AND classifications.contains_wildlife = 0
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM classifications
+                       WHERE classifications.image_id = images.id
+                         AND classifications.contains_wildlife = 1
+                  )"#,
+        )
+        .bind(&collected_at)
+        .bind(candidate.image_id.get())
+        .bind(&path_str)
+        .bind(&cutoff_str)
+        .execute(tx.as_mut())
+        .await
+        .map_err(|e| map_sqlx_error("with_gc_candidate_clear_path", e))?;
+        if update.rows_affected() != 1 {
+            return Err(AppError::new(
+                ErrorCategory::Database,
+                "with_gc_candidate_clear_path",
+                format!(
+                    "image {} changed during garbage collection",
+                    candidate.image_id.get()
+                ),
+            ));
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| map_sqlx_error("with_gc_candidate_commit", e))?;
+        Ok(Some(operation_result))
+    }
+
+    /// Clear `local_path` for a garbage-collected image.
+    ///
+    /// A guarded UPDATE clears `local_path` and refreshes `updated_at` only
+    /// when the row still matches the expected state:
+    /// - The image ID matches
+    /// - The local path still matches the candidate path (prevents clearing
+    ///   a path that was reassigned by another process)
+    /// - The image is still eligible (done status, no wildlife classification)
+    ///
+    /// Shared-positive path safety is enforced at the filesystem level by the
+    /// garbage collector (which canonicalizes paths), so this guard does not
+    /// check for shared wildlife paths.  That prevents alias-direction bugs
+    /// where a string-based SQL predicate matches one direction but not the
+    /// other.
+    ///
+    /// Returns `Ok(())` when the update succeeds or when the row has already
+    /// been cleared (idempotent). Returns an error when the guard fails for
+    /// any other reason (database consistency error).
+    pub async fn mark_local_file_garbage_collected(
+        &self,
+        candidate: &GarbageCollectionCandidate,
+        cutoff: &Timestamp,
+        collected_at: &Timestamp,
+    ) -> AppResult<()> {
+        let cutoff_str = super::format_timestamp(cutoff);
+        let collected_str = super::format_timestamp(collected_at);
+        let path_str = candidate.local_path.to_string_lossy().to_string();
+
+        let result = sqlx::query(
+            r#"UPDATE images
+                   SET local_path = NULL,
+                       local_file_identity = NULL,
+                       updated_at = ?
+               WHERE id = ?
+                 AND local_path = ?
+                 AND processing_status = 'done'
+                 AND capture_start_at < ?
+                 AND EXISTS (
+                     SELECT 1 FROM classifications
+                     WHERE classifications.image_id = images.id
+                       AND classifications.contains_wildlife = 0
+                 )
+                 AND NOT EXISTS (
+                     SELECT 1 FROM classifications
+                     WHERE classifications.image_id = images.id
+                       AND classifications.contains_wildlife = 1
+                 )"#,
+        )
+        .bind(&collected_str)
+        .bind(candidate.image_id.get())
+        .bind(&path_str)
+        .bind(&cutoff_str)
+        .execute(&self.0)
+        .await
+        .map_err(|e| map_sqlx_error("mark_local_file_garbage_collected", e))?;
+
+        if result.rows_affected() == 0 {
+            // Check if the row was already cleared (idempotent case).
+            let already_cleared: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM images WHERE id = ? AND local_path IS NULL",
+            )
+            .bind(candidate.image_id.get())
+            .fetch_one(&self.0)
+            .await
+            .map_err(|e| map_sqlx_error("mark_local_file_garbage_collected_check", e))?;
+
+            if already_cleared > 0 {
+                return Ok(());
+            }
+
+            return Err(AppError::new(
+                ErrorCategory::Database,
+                "mark_local_file_garbage_collected",
+                format!(
+                    "image {} eligibility changed or path mismatch during garbage collection",
+                    candidate.image_id.get()
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// Raw row for GarbageCollectionCandidate deserialization.
+#[derive(sqlx::FromRow)]
+struct GarbageCollectionRow {
+    id: i64,
+    local_path: String,
 }

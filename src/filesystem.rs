@@ -608,6 +608,278 @@ pub fn safe_io_error(e: &io::Error) -> String {
     e.to_string()
 }
 
+// ── Garbage collection file removal ────────────────────────────────────────
+
+/// Outcome of attempting to remove a managed image file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalFileRemoval {
+    /// The file was successfully removed.
+    Removed,
+    /// The file was already missing; no action needed.
+    AlreadyMissing,
+}
+
+/// Check that every component of `relative_path` is a normal path
+/// component (not `ParentDir`, `RootDir`, `Prefix`, etc.) and that no
+/// component is a symlink on the filesystem.
+///
+/// Rejecting non-normal components prevents path-traversal attacks:
+/// a candidate like `output/negative/../positive/wildlife.jpg` would
+/// resolve to a different file than intended, potentially deleting a
+/// wildlife-positive image.
+///
+/// This also checks for symlinks beneath the output root.  For example,
+/// if `output/negative-link` is a symlink to `output/positive`, a
+/// candidate `output/negative-link/wildlife.jpg` is rejected even though
+/// the resolved target is inside the root.
+///
+/// The output root itself is exempt — it may be a symlink to a real
+/// directory outside the managed tree.
+///
+/// `output_root` must be the absolute lexical output root (not the
+/// canonical target), so that symlink checks operate against the
+/// correct filesystem paths.
+fn check_no_symlink_components(output_root: &Path, relative_path: &Path) -> AppResult<()> {
+    // Build the path incrementally, checking each component individually.
+    // This is critical: `symlink_metadata(full_path)` follows symlinks in
+    // intermediate directories and returns the target's metadata, missing
+    // the symlink entirely.  By checking each component separately, we
+    // detect symlinks at every level.
+    let mut current = output_root.to_path_buf();
+    for component in relative_path.components() {
+        // Reject non-normal components (ParentDir, RootDir, Prefix, etc.)
+        // to prevent path traversal through `..` sequences.
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return Err(AppError::new(
+                ErrorCategory::Filesystem,
+                "check_no_symlink_components",
+                format!(
+                    "candidate path contains non-normal component {:?}, refusing removal: {}",
+                    component,
+                    relative_path.display()
+                ),
+            ));
+        }
+
+        current.push(component);
+        let meta = std::fs::symlink_metadata(&current).map_err(|e| {
+            AppError::with_source(
+                ErrorCategory::Filesystem,
+                "check_no_symlink_components",
+                format!("cannot stat {}: {}", current.display(), safe_io_error(&e)),
+                e,
+            )
+        })?;
+        if meta.is_symlink() {
+            return Err(AppError::new(
+                ErrorCategory::Filesystem,
+                "check_no_symlink_components",
+                format!(
+                    "path component is a symlink, refusing removal: {}",
+                    current.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Safely remove a managed image file.
+///
+/// Validates that the candidate path resolves beneath the canonical output root
+/// before attempting removal.  Rejects directories, symlinks resolving outside
+/// the root, and paths that cannot be canonicalized.
+///
+/// **Path safety:** Every component of the candidate path is checked for being
+/// a normal component (rejecting `ParentDir`, `RootDir`, `Prefix`) and for not
+/// being a symlink.  This prevents a negative-image candidate from reaching a
+/// wildlife-positive file through path traversal (`..`) or a symlinked ancestor
+/// directory.  The configured output root itself is exempt — it may be a symlink
+/// to a real directory.
+///
+/// **Output root handling:** The function canonicalizes both the output root
+/// and the candidate path.  The canonical output root is used for containment
+/// verification.  Symlink and path-traversal checks operate on the **original**
+/// candidate path (before canonicalization) to detect symlinked ancestor
+/// directories that would be resolved away by canonicalization.
+///
+/// After validation the candidate path is removed directly (not the resolved
+/// target), so even if the filesystem layout changed between validation and
+/// deletion the operation is deterministic.
+///
+/// - NotFound before or during deletion → `AlreadyMissing`
+/// - Success → `Removed`
+/// - Directory, outside-root, symlink, path traversal, or other I/O error → `Err`
+pub async fn remove_managed_image_file(
+    output_root: &Path,
+    candidate_path: &Path,
+) -> AppResult<LocalFileRemoval> {
+    // Resolve the candidate path. Use symlink-aware metadata to detect
+    // directories and symlinks.
+    let metadata = match tokio::fs::symlink_metadata(candidate_path).await {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(LocalFileRemoval::AlreadyMissing);
+        }
+        Err(e) => {
+            return Err(AppError::with_source(
+                ErrorCategory::Filesystem,
+                "remove_managed_image_file",
+                format!(
+                    "cannot stat file {}: {}",
+                    candidate_path.display(),
+                    safe_io_error(&e)
+                ),
+                e,
+            ));
+        }
+    };
+
+    // Reject directories.
+    if metadata.is_dir() {
+        return Err(AppError::new(
+            ErrorCategory::Filesystem,
+            "remove_managed_image_file",
+            format!(
+                "candidate path is a directory, refusing removal: {}",
+                candidate_path.display()
+            ),
+        ));
+    }
+
+    // Reject symlinks at the candidate path itself.
+    if metadata.is_symlink() {
+        return Err(AppError::new(
+            ErrorCategory::Filesystem,
+            "remove_managed_image_file",
+            format!(
+                "candidate path is a symlink, refusing removal: {}",
+                candidate_path.display()
+            ),
+        ));
+    }
+
+    if !metadata.is_file() {
+        return Err(AppError::new(
+            ErrorCategory::Filesystem,
+            "remove_managed_image_file",
+            format!(
+                "candidate path is not a regular file: {}",
+                candidate_path.display()
+            ),
+        ));
+    }
+
+    // Canonicalize the output root for containment checks.
+    let canonical_output_root = match tokio::fs::canonicalize(output_root).await {
+        Ok(p) => p,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(AppError::with_source(
+                ErrorCategory::Filesystem,
+                "remove_managed_image_file",
+                format!(
+                    "cannot canonicalize output directory {}: {}",
+                    output_root.display(),
+                    safe_io_error(&e)
+                ),
+                e,
+            ));
+        }
+        Err(e) => {
+            return Err(AppError::with_source(
+                ErrorCategory::Filesystem,
+                "remove_managed_image_file",
+                format!(
+                    "cannot canonicalize output directory {}: {}",
+                    output_root.display(),
+                    safe_io_error(&e)
+                ),
+                e,
+            ));
+        }
+    };
+
+    // Canonicalize the candidate path to verify it is beneath the output root.
+    let resolved = match tokio::fs::canonicalize(candidate_path).await {
+        Ok(p) => p,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(LocalFileRemoval::AlreadyMissing);
+        }
+        Err(e) => {
+            return Err(AppError::with_source(
+                ErrorCategory::Filesystem,
+                "remove_managed_image_file",
+                format!(
+                    "cannot canonicalize path {}: {}",
+                    candidate_path.display(),
+                    safe_io_error(&e)
+                ),
+                e,
+            ));
+        }
+    };
+
+    if !resolved.starts_with(&canonical_output_root) {
+        return Err(AppError::new(
+            ErrorCategory::Filesystem,
+            "remove_managed_image_file",
+            format!(
+                "candidate path resolves outside output root: {} is not under {}",
+                resolved.display(),
+                canonical_output_root.display()
+            ),
+        ));
+    }
+
+    // Check every component of the **original** candidate path for normal
+    // components and symlinks.  We use the original path (not the canonicalized
+    // one) because canonicalization follows symlinks, so a symlinked ancestor
+    // directory would be resolved away and the check would miss it.
+    //
+    // We derive the relative path from the original candidate and check each
+    // component against the canonical output root (which is absolute and
+    // matches the canonicalized candidate).
+    //
+    // First, try stripping from the canonical output root. If that fails
+    // (e.g. output root is a symlink alias), fall back to the lexical root.
+    let relative_for_checks = candidate_path
+        .strip_prefix(&canonical_output_root)
+        .or_else(|_| candidate_path.strip_prefix(output_root))
+        .map_err(|_| {
+            AppError::new(
+                ErrorCategory::Filesystem,
+                "remove_managed_image_file",
+                format!(
+                    "candidate path does not start with output root: {} is not under {}",
+                    candidate_path.display(),
+                    output_root.display()
+                ),
+            )
+        })?;
+
+    // Check every component using the canonical output root as base.
+    check_no_symlink_components(&canonical_output_root, relative_for_checks)?;
+
+    // Remove the candidate path directly (not the resolved target).
+    // After symlink-component and path-traversal validation the candidate
+    // is a regular file whose ancestors are all regular directories, so
+    // removing it is safe.
+    match tokio::fs::remove_file(candidate_path).await {
+        Ok(()) => Ok(LocalFileRemoval::Removed),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(LocalFileRemoval::AlreadyMissing),
+        Err(e) => Err(AppError::with_source(
+            ErrorCategory::Filesystem,
+            "remove_managed_image_file",
+            format!(
+                "cannot remove file {}: {}",
+                candidate_path.display(),
+                safe_io_error(&e)
+            ),
+            e,
+        )),
+    }
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1039,5 +1311,278 @@ mod tests {
         // The result should be the original error unchanged.
         assert_eq!(result.message, "interrupted body transfer");
         assert_eq!(result.category, ErrorCategory::Network);
+    }
+
+    // ── remove_managed_image_file tests ───────────────────────────────────
+
+    #[tokio::test]
+    async fn remove_managed_image_file_removes_in_root_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let sub = output.join("camera-1").join("2026").join("07").join("11");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let file_path = sub.join("image.jpg");
+        std::fs::write(&file_path, "jpeg-data").unwrap();
+        assert!(file_path.exists());
+
+        let result = remove_managed_image_file(&output, &file_path)
+            .await
+            .unwrap();
+        assert!(matches!(result, LocalFileRemoval::Removed));
+        assert!(!file_path.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_missing_returns_already_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let missing_path = output.join("nonexistent.jpg");
+        let result = remove_managed_image_file(&output, &missing_path)
+            .await
+            .unwrap();
+        assert!(matches!(result, LocalFileRemoval::AlreadyMissing));
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let sub = output.join("camera-1");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let result = remove_managed_image_file(&output, &sub).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Filesystem);
+        assert!(err.message.contains("directory"));
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_rejects_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        std::fs::create_dir_all(&output).unwrap();
+
+        // Create a file outside the output root.
+        let outside = dir.path().join("outside.jpg");
+        std::fs::write(&outside, "data").unwrap();
+
+        let result = remove_managed_image_file(&output, &outside).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Filesystem);
+        assert!(
+            err.message.contains("outside") || err.message.contains("output root"),
+            "error should mention outside-root: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_rejects_symlink_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let sub = output.join("camera-1");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Create a file outside the output root.
+        let outside = dir.path().join("outside.jpg");
+        std::fs::write(&outside, "data").unwrap();
+
+        // Create a symlink inside output pointing outside.
+        let symlink_path = sub.join("link.jpg");
+        std::os::unix::fs::symlink(&outside, &symlink_path).unwrap();
+
+        let result = remove_managed_image_file(&output, &symlink_path).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Filesystem);
+        assert!(
+            err.message.contains("symlink"),
+            "error should mention symlink: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_rejects_in_root_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let sub = output.join("camera-1");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Create a valid file inside the output root.
+        let target_path = sub.join("target.jpg");
+        std::fs::write(&target_path, "target-data").unwrap();
+
+        // Create a symlink inside output pointing to another file inside output.
+        let symlink_path = sub.join("link.jpg");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).unwrap();
+
+        // Symlinks must be rejected even when the target is inside the root.
+        let result = remove_managed_image_file(&output, &symlink_path).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Filesystem);
+        assert!(
+            err.message.contains("symlink"),
+            "error should mention symlink: {}",
+            err.message
+        );
+
+        // The target file must still exist — we must not have deleted it.
+        assert!(
+            target_path.exists(),
+            "symlink target must survive symlink rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_symlink_to_wildlife_preserves_target() {
+        // A negative-image path that is a symlink to a wildlife-positive file
+        // must not cause the wildlife-positive file to be deleted.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let sub = output.join("camera-1");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Wildlife-positive target file.
+        let wildlife_path = sub.join("wildlife.jpg");
+        std::fs::write(&wildlife_path, "wildlife-jpeg-data").unwrap();
+
+        // Negative candidate symlink pointing to the wildlife file.
+        let negative_path = sub.join("negative.jpg");
+        std::os::unix::fs::symlink(&wildlife_path, &negative_path).unwrap();
+
+        let result = remove_managed_image_file(&output, &negative_path).await;
+        assert!(result.is_err());
+
+        // The wildlife target must still exist.
+        assert!(
+            wildlife_path.exists(),
+            "wildlife-positive target must survive symlink rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_rejects_symlinked_parent_to_wildlife() {
+        // Regression test: if an ancestor directory beneath the output root
+        // is a symlink to another in-root directory, the candidate must be
+        // rejected even though canonicalization resolves to a valid in-root
+        // path.  This prevents a negative-image candidate from deleting a
+        // wildlife-positive file through a symlinked parent.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let positive_dir = output.join("camera-1");
+        let negative_dir = output.join("negative-link");
+        std::fs::create_dir_all(&positive_dir).unwrap();
+
+        // Wildlife-positive file in the real directory.
+        let wildlife_path = positive_dir.join("wildlife.jpg");
+        std::fs::write(&wildlife_path, "wildlife-jpeg-data").unwrap();
+
+        // Symlinked directory that points to the wildlife-positive directory.
+        std::os::unix::fs::symlink(&positive_dir, &negative_dir).unwrap();
+
+        // Negative candidate path that traverses the symlinked directory
+        // to reach the wildlife file.
+        let negative_path = negative_dir.join("wildlife.jpg");
+
+        let result = remove_managed_image_file(&output, &negative_path).await;
+        assert!(
+            result.is_err(),
+            "symlinked parent must be rejected; got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Filesystem);
+        assert!(
+            err.message.contains("symlink"),
+            "error should mention symlink: {}",
+            err.message
+        );
+
+        // The wildlife-positive file must still exist.
+        assert!(
+            wildlife_path.exists(),
+            "wildlife-positive target must survive symlinked-parent rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_rejects_path_traversal_via_parent_dir() {
+        // Regression test: a candidate path containing `..` (ParentDir
+        // component) must be rejected even when canonicalization resolves
+        // to a valid in-root path.  This prevents a negative-image candidate
+        // from deleting a wildlife-positive file through path traversal.
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        let negative_dir = output.join("negative");
+        let positive_dir = output.join("camera-1");
+        std::fs::create_dir_all(&negative_dir).unwrap();
+        std::fs::create_dir_all(&positive_dir).unwrap();
+
+        // Wildlife-positive file.
+        let wildlife_path = positive_dir.join("wildlife.jpg");
+        std::fs::write(&wildlife_path, "wildlife-jpeg-data").unwrap();
+
+        // Negative candidate path that uses `..` to traverse to the
+        // wildlife-positive directory.
+        let negative_path = negative_dir.join("../camera-1/wildlife.jpg");
+
+        let result = remove_managed_image_file(&output, &negative_path).await;
+        assert!(
+            result.is_err(),
+            "path traversal via ParentDir must be rejected; got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.category, ErrorCategory::Filesystem);
+        assert!(
+            err.message.contains("non-normal") || err.message.contains("ParentDir"),
+            "error should mention non-normal component: {}",
+            err.message
+        );
+
+        // The wildlife-positive file must still exist — we must not have
+        // deleted it through path traversal.
+        assert!(
+            wildlife_path.exists(),
+            "wildlife-positive target must survive path-traversal rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_managed_image_file_works_with_symlinked_output_root() {
+        // Test that removal works when the configured output root is a
+        // symlink to a real directory.  The database stores paths under
+        // the symlink alias, and strip_prefix must match them.
+        let dir = tempfile::tempdir().unwrap();
+        let real_output = dir.path().join("real-output");
+        let symlink_output = dir.path().join("symlink-output");
+        std::fs::create_dir_all(&real_output).unwrap();
+        std::os::unix::fs::symlink(&real_output, &symlink_output).unwrap();
+
+        let sub = real_output
+            .join("camera-1")
+            .join("2026")
+            .join("07")
+            .join("11");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let file_path = sub.join("image.jpg");
+        std::fs::write(&file_path, "jpeg-data").unwrap();
+        assert!(file_path.exists());
+
+        // Pass the symlinked output root — the function should resolve
+        // it internally and strip_prefix against the lexical alias.
+        let result = remove_managed_image_file(&symlink_output, &file_path)
+            .await
+            .unwrap();
+        assert!(matches!(result, LocalFileRemoval::Removed));
+        assert!(!file_path.exists());
     }
 }

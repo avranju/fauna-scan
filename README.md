@@ -93,6 +93,30 @@ network or classifier failures remain durable for retry, and expired leases are
 recovered on restart. Completed downloads are not redownloaded, even if their
 local file is later deleted.
 
+### Image retention and garbage collection
+
+Fauna Scan automatically garbage collects locally downloaded images that have
+been classified as not containing wildlife. Only images whose classification
+processing has completed and that contain no wildlife-positive classification
+are eligible. Images with any wildlife-positive classification are preserved
+indefinitely.
+
+Retention is controlled by `general.non_wildlife_image_retention_days` in the
+configuration file (default: `4`). An image is eligible for collection when
+its `capture_start_at` is strictly older than the cutoff (current time minus
+retention), its processing status is `done`, and it has at least one
+`contains_wildlife = false` classification with no `contains_wildlife = true`
+classification. Collection runs as part of every scanner pass, including
+`scan --once`.
+
+When an eligible image is collected, its local file is removed and the
+`local_path` in the database is cleared to `NULL`. The image row, all
+classification records, download status, and completion timestamps are
+preserved in SQLite. Collected images remain browsable in the web dashboard
+as metadata/classification records but no longer expose content or thumbnail
+URLs. The `downloaded` status is unchanged, preserving the guarantee that
+collected files are not redownloaded.
+
 ## Docker Compose deployment
 
 The Compose deployment pulls `git.nerdworks.dev/avranju/fauna-scan:latest` from

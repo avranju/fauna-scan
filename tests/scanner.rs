@@ -39,9 +39,10 @@ fn future_ts(hours: i32) -> Timestamp {
 }
 
 fn past_ts(hours: i32) -> Timestamp {
+    let base = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
     Timestamp::new(
-        Utc.with_ymd_and_hms(2026, 7, 11, 12 - hours as u32, 0, 0)
-            .unwrap(),
+        base.checked_sub_signed(chrono::Duration::hours(hours as i64))
+            .expect("past_ts should not underflow"),
     )
 }
 
@@ -185,7 +186,12 @@ async fn setup_downloaded_images(
 }
 
 /// Build a Scanner from a database, mock classifier server, and options.
-async fn build_scanner(ops: DatabaseOps, mock_server: &MockServer, retry_limit: u32) -> Scanner {
+async fn build_scanner(
+    ops: DatabaseOps,
+    mock_server: &MockServer,
+    output_dir: &std::path::Path,
+    retry_limit: u32,
+) -> Scanner {
     let config = make_classifier_config(&mock_server.uri());
     let classifier = ClassifierClient::from_config(&config).unwrap();
 
@@ -196,6 +202,8 @@ async fn build_scanner(ops: DatabaseOps, mock_server: &MockServer, retry_limit: 
         retry_max_delay: std::time::Duration::from_secs(300),
         processing_lease_duration: std::time::Duration::from_secs(600),
         maximum_image_size_bytes: 25_000_000,
+        output_directory: output_dir.to_path_buf(),
+        non_wildlife_image_retention: std::time::Duration::from_secs(4 * 86_400),
     };
 
     Scanner::new(ops, Arc::new(classifier), options)
@@ -216,7 +224,7 @@ async fn sequential_classification_two_images() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
 
     // Check eligibility with raw SQL
     let eligible_count: i64 = sqlx::query_scalar(
@@ -231,7 +239,7 @@ async fn sequential_classification_two_images() {
     .unwrap();
     assert_eq!(eligible_count, 2, "expected 2 eligible images");
 
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     let report = scanner.clone().execute_one_pass().await.unwrap();
     assert_eq!(report.claimed, 2);
@@ -272,8 +280,8 @@ async fn sequential_classification_two_images() {
 async fn cancellation_before_pass_claims_no_image_or_success_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let mock_server = MockServer::start().await;
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
     let shutdown = ShutdownToken::new();
     shutdown.cancel();
 
@@ -316,8 +324,8 @@ async fn cancellation_after_one_image_prevents_the_next_claim() {
         })
         .mount(&mock_server)
         .await;
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     let report = scanner
         .clone()
@@ -359,7 +367,7 @@ async fn cancellation_wakes_scanner_polling_sleep() {
     let dir = tempfile::tempdir().unwrap();
     let mock_server = MockServer::start().await;
     let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 0, &minimal_jpeg()).await;
-    let mut scanner = build_scanner(ops, &mock_server, 5).await;
+    let mut scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
     scanner.options.poll_interval = std::time::Duration::from_secs(3600);
     let shutdown = ShutdownToken::new();
     let task_shutdown = shutdown.clone();
@@ -390,7 +398,7 @@ async fn missing_file_becomes_missing() {
     let file_path = output_dir.join("img-1.jpg");
     std::fs::remove_file(&file_path).unwrap();
 
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     let report = scanner.clone().execute_one_pass().await.unwrap();
     assert_eq!(report.claimed, 1);
@@ -426,7 +434,7 @@ async fn classifier_endpoints_classify_concurrently() {
             .await;
     }
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
+    let (_db_path, ops, __output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
     let primary_config = make_classifier_config(&primary_server.uri());
     let secondary_config = make_classifier_config(&secondary_server.uri());
     let options = ScannerOptions {
@@ -436,6 +444,8 @@ async fn classifier_endpoints_classify_concurrently() {
         retry_max_delay: std::time::Duration::from_secs(300),
         processing_lease_duration: std::time::Duration::from_secs(600),
         maximum_image_size_bytes: 25_000_000,
+        output_directory: dir.path().to_path_buf(),
+        non_wildlife_image_retention: std::time::Duration::from_secs(4 * 86_400),
     };
     let scanner = Scanner::with_classifiers(
         ops,
@@ -515,6 +525,8 @@ async fn quota_blocked_endpoint_does_not_block_other_endpoint_or_pass_completion
             retry_max_delay: std::time::Duration::from_secs(300),
             processing_lease_duration: std::time::Duration::from_secs(600),
             maximum_image_size_bytes: 25_000_000,
+            output_directory: dir.path().to_path_buf(),
+            non_wildlife_image_retention: std::time::Duration::from_secs(4 * 86_400),
         },
     );
 
@@ -567,6 +579,8 @@ async fn minute_limited_endpoint_waits_within_the_current_pass() {
             retry_max_delay: std::time::Duration::from_secs(300),
             processing_lease_duration: std::time::Duration::from_secs(600),
             maximum_image_size_bytes: 25_000_000,
+            output_directory: dir.path().to_path_buf(),
+            non_wildlife_image_retention: std::time::Duration::from_secs(4 * 86_400),
         },
     );
 
@@ -624,7 +638,7 @@ async fn invalid_files_become_failed() {
         .mount(&mock_server)
         .await;
 
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     let report = scanner.clone().execute_one_pass().await.unwrap();
     assert_eq!(report.claimed, 3);
@@ -667,8 +681,8 @@ async fn retryable_then_success() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     // First pass: should retry-schedule.
     let report1 = scanner.clone().execute_one_pass().await.unwrap();
@@ -728,6 +742,8 @@ async fn http_429_refunds_daily_rate_limit_quota() {
             retry_max_delay: std::time::Duration::from_secs(300),
             processing_lease_duration: std::time::Duration::from_secs(600),
             maximum_image_size_bytes: 25_000_000,
+            output_directory: dir.path().to_path_buf(),
+            non_wildlife_image_retention: std::time::Duration::from_secs(4 * 86_400),
         },
     );
 
@@ -767,8 +783,8 @@ async fn malformed_response_exhaustion() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
-    let scanner = build_scanner(ops, &mock_server, 3).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 3).await;
 
     // Run three passes: first two retry-schedule, third marks as failed.
     for i in 0..3 {
@@ -821,8 +837,8 @@ async fn permanent_failure_immediate() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     let report = scanner.clone().execute_one_pass().await.unwrap();
     assert_eq!(report.claimed, 1);
@@ -851,7 +867,7 @@ async fn expired_lease_recovery() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
 
     // Simulate an interrupted processing claim with expired lease.
     let _now = now_ts();
@@ -864,7 +880,7 @@ async fn expired_lease_recovery() {
     .await
     .unwrap();
 
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     // Pass should recover the expired lease and complete the image.
     let report = scanner.clone().execute_one_pass().await.unwrap();
@@ -891,8 +907,8 @@ async fn no_reclassification_after_restart() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     // First pass: complete the image.
     let report1 = scanner.clone().execute_one_pass().await.unwrap();
@@ -900,7 +916,7 @@ async fn no_reclassification_after_restart() {
 
     // Simulate restart: rebuild scanner from the same database.
     let db = Database::open(&_db_path).await.unwrap();
-    let scanner2 = build_scanner(db.ops(), &mock_server, 5).await;
+    let scanner2 = build_scanner(db.ops(), &mock_server, &output_dir, 5).await;
 
     // Second pass: should find no work.
     let report2 = scanner2.clone().execute_one_pass().await.unwrap();
@@ -926,6 +942,9 @@ fn scanner_pass_report_display() {
         failed: 1,
         missing: 0,
         leases_recovered: 2,
+        files_removed: 0,
+        missing_files_reconciled: 0,
+        garbage_collection_failures: 0,
     };
     let display = format!("{report}");
     assert!(display.contains("claimed=5"));
@@ -934,6 +953,27 @@ fn scanner_pass_report_display() {
     assert!(display.contains("failed=1"));
     assert!(display.contains("missing=0"));
     assert!(display.contains("recovered=2"));
+    // Garbage-collection counters are always present.
+    assert!(display.contains("gc_removed=0"));
+    assert!(display.contains("gc_reconciled=0"));
+    assert!(display.contains("gc_failures=0"));
+
+    // Nonzero GC counters are also reported.
+    let gc_report = ScannerPassReport {
+        claimed: 2,
+        completed: 1,
+        retry_scheduled: 0,
+        failed: 0,
+        missing: 1,
+        leases_recovered: 0,
+        files_removed: 3,
+        missing_files_reconciled: 1,
+        garbage_collection_failures: 2,
+    };
+    let gc_display = format!("{gc_report}");
+    assert!(gc_display.contains("gc_removed=3"));
+    assert!(gc_display.contains("gc_reconciled=1"));
+    assert!(gc_display.contains("gc_failures=2"));
 }
 
 // ── Backoff test ──────────────────────────────────────────────────────────
@@ -991,7 +1031,7 @@ async fn oversized_file_rejected_without_classifier() {
         .mount(&mock_server)
         .await;
 
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     let report = scanner.clone().execute_one_pass().await.unwrap();
     assert_eq!(report.claimed, 1);
@@ -1016,8 +1056,8 @@ async fn scanner_timestamp_ordering() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     let report = scanner.clone().execute_one_pass().await.unwrap();
     assert_eq!(report.claimed, 1);
@@ -1064,11 +1104,11 @@ async fn concurrent_scanners_deduplicate() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
 
     // Create two scanners from the same database.
-    let scanner1 = build_scanner(ops.clone(), &mock_server, 5).await;
-    let scanner2 = build_scanner(ops.clone(), &mock_server, 5).await;
+    let scanner1 = build_scanner(ops.clone(), &mock_server, &output_dir, 5).await;
+    let scanner2 = build_scanner(ops.clone(), &mock_server, &output_dir, 5).await;
 
     // Run scanner1 first to claim the image, then scanner2 concurrently
     // to verify it gets no work.  This avoids SQLite lock contention
@@ -1109,6 +1149,7 @@ fn lease_equal_to_timeout_is_rejected() {
             database_path: PathBuf::from("/tmp/test.db"),
             output_directory: PathBuf::from("/tmp/output"),
             log_level: fauna_scan::cli::LogLevel::Error,
+            non_wildlife_image_retention_days: 4,
         },
         nvr: fauna_scan::configuration::NvrConfig {
             scheme: "http".to_string(),
@@ -1178,6 +1219,7 @@ fn lease_one_second_above_timeout_is_accepted() {
             database_path: PathBuf::from("/tmp/test.db"),
             output_directory: PathBuf::from("/tmp/output"),
             log_level: fauna_scan::cli::LogLevel::Error,
+            non_wildlife_image_retention_days: 4,
         },
         nvr: fauna_scan::configuration::NvrConfig {
             scheme: "http".to_string(),
@@ -1376,6 +1418,8 @@ async fn concurrent_scanner_lease_renewal_prevents_recovery() {
         retry_max_delay: Duration::from_secs(30),
         processing_lease_duration: Duration::from_millis(300),
         maximum_image_size_bytes: 25_000_000,
+        output_directory: dir.path().to_path_buf(),
+        non_wildlife_image_retention: Duration::from_secs(4 * 86_400),
     };
     let scanner_a = Scanner::new(ops.clone(), Arc::new(classifier_a), options_a);
 
@@ -1392,6 +1436,8 @@ async fn concurrent_scanner_lease_renewal_prevents_recovery() {
         retry_max_delay: Duration::from_secs(30),
         processing_lease_duration: Duration::from_millis(300),
         maximum_image_size_bytes: 25_000_000,
+        output_directory: dir.path().to_path_buf(),
+        non_wildlife_image_retention: Duration::from_secs(4 * 86_400),
     };
     let scanner_b = Scanner::new(ops.clone(), Arc::new(classifier_b), options_b);
 
@@ -1484,6 +1530,8 @@ async fn forced_renewal_failure_causes_main_task_failure() {
         retry_max_delay: Duration::from_secs(30),
         processing_lease_duration: Duration::from_millis(200),
         maximum_image_size_bytes: 25_000_000,
+        output_directory: dir.path().to_path_buf(),
+        non_wildlife_image_retention: Duration::from_secs(4 * 86_400),
     };
     let scanner_a = Scanner::new(ops.clone(), Arc::new(classifier_a), options_a);
 
@@ -1539,9 +1587,9 @@ async fn parsing_task_failure_propagates() {
         .mount(&mock_server)
         .await;
 
-    let (_db_path, ops, _output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
 
-    let scanner = build_scanner(ops, &mock_server, 5).await;
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
 
     // A normal pass should succeed.
     let report = scanner.clone().execute_one_pass().await.unwrap();
@@ -1551,4 +1599,135 @@ async fn parsing_task_failure_propagates() {
     // Verify the image is done.
     let img = scanner.database.get_image(ImageId::new(1)).await.unwrap();
     assert_eq!(img.processing_status, ProcessingStatus::Done);
+}
+
+// ── Scanner pass garbage collection tests ─────────────────────────────────
+
+/// An old image classified as no wildlife during scan --once is collected
+/// before the pass returns.
+#[tokio::test]
+async fn scanner_pass_collects_old_negative_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock_server = MockServer::start().await;
+
+    // Return a negative classification.
+    let negative_response = serde_json::json!({
+        "id": "chatcmpl-test",
+        "object": "chat.completion",
+        "created": 1234567890,
+        "model": "test-model",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "{\"contains_animal\": false, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.1, \"summary\": \"Nothing wildlife.\", \"uncertainties\": []}"
+            },
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(negative_response))
+        .mount(&mock_server)
+        .await;
+
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+
+    // Set the capture time to 5 days ago so it's older than the 4-day retention.
+    let old_capture = past_ts(5 * 24);
+    sqlx::query("UPDATE images SET capture_start_at = ? WHERE id = 1")
+        .bind(
+            old_capture
+                .as_datetime()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .execute(ops.pool())
+        .await
+        .unwrap();
+
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
+
+    let report = scanner.clone().execute_one_pass().await.unwrap();
+    assert_eq!(report.claimed, 1);
+    assert_eq!(report.completed, 1);
+    // The garbage collector should have removed the file.
+    assert_eq!(report.files_removed, 1);
+    assert_eq!(report.missing_files_reconciled, 0);
+    assert_eq!(report.garbage_collection_failures, 0);
+
+    // Verify the file was removed.
+    let file_path = output_dir.join("img-1.jpg");
+    assert!(!file_path.exists(), "file should have been removed");
+
+    // Verify local_path is cleared.
+    let img = scanner.database.get_image(ImageId::new(1)).await.unwrap();
+    assert!(img.local_path.is_none());
+    assert_eq!(img.download_status, DownloadStatus::Downloaded);
+    assert_eq!(img.processing_status, ProcessingStatus::Done);
+
+    // Classification should still exist.
+    let class = scanner
+        .database
+        .get_classification(ImageId::new(1), "test-model", "wildlife-v1")
+        .await
+        .unwrap();
+    assert!(!class.contains_wildlife);
+}
+
+/// An old image classified as containing wildlife is never collected.
+#[tokio::test]
+async fn scanner_pass_preserves_old_wildlife_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(valid_openai_response()))
+        .mount(&mock_server)
+        .await;
+
+    let (_db_path, ops, output_dir) = setup_downloaded_images(&dir, 1, &minimal_jpeg()).await;
+
+    // Set the capture time to 5 days ago so it's older than the 4-day retention.
+    let old_capture = past_ts(5 * 24);
+    sqlx::query("UPDATE images SET capture_start_at = ? WHERE id = 1")
+        .bind(
+            old_capture
+                .as_datetime()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        )
+        .execute(ops.pool())
+        .await
+        .unwrap();
+
+    let scanner = build_scanner(ops, &mock_server, &output_dir, 5).await;
+
+    let report = scanner.clone().execute_one_pass().await.unwrap();
+    assert_eq!(report.claimed, 1);
+    assert_eq!(report.completed, 1);
+    // Wildlife-positive images should NOT be collected.
+    assert_eq!(report.files_removed, 0);
+    assert_eq!(report.missing_files_reconciled, 0);
+
+    // Verify the file still exists.
+    let file_path = output_dir.join("img-1.jpg");
+    assert!(
+        file_path.exists(),
+        "wildlife-positive file should be preserved"
+    );
+
+    // Verify local_path is preserved.
+    let img = scanner.database.get_image(ImageId::new(1)).await.unwrap();
+    assert!(img.local_path.is_some());
+    assert_eq!(img.processing_status, ProcessingStatus::Done);
+
+    // Classification should exist and be positive.
+    let class = scanner
+        .database
+        .get_classification(ImageId::new(1), "test-model", "wildlife-v1")
+        .await
+        .unwrap();
+    assert!(class.contains_wildlife);
 }

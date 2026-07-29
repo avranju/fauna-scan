@@ -223,6 +223,7 @@ fn build_test_config(server: &MockServer, root: &Path, start_at: Timestamp) -> C
             database_path: root.join("state/fauna-scan.sqlite3"),
             output_directory: root.join("Pictures/fauna-scan"),
             log_level: fauna_scan::cli::LogLevel::Info,
+            non_wildlife_image_retention_days: 4,
         },
         nvr: NvrConfig {
             scheme: "http".to_string(),

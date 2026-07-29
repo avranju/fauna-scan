@@ -7,6 +7,11 @@ edition = "2024"
 name = "fauna-scan"
 path = "src/main.rs"
 
+[[test]]
+name = "test_relative_output_root"
+path = "tests/test_relative_output_root.rs"
+harness = false
+
 [lib]
 name = "fauna_scan"
 path = "src/lib.rs"

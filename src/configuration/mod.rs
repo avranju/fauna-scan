@@ -76,6 +76,11 @@ pub struct GeneralConfig {
     pub output_directory: PathBuf,
     /// Application log level.
     pub log_level: LogLevel,
+    /// Number of days to retain images classified as not containing wildlife.
+    /// Images older than this duration (measured from capture time) and
+    /// classified as no-wildlife will be garbage collected.
+    /// Images with any wildlife-positive classification are never collected.
+    pub non_wildlife_image_retention_days: u64,
 }
 
 /// Resolved NVR settings.
@@ -245,6 +250,7 @@ struct RawGeneralConfig {
     database_path: Option<String>,
     output_directory: Option<String>,
     log_level: Option<String>,
+    non_wildlife_image_retention_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -400,10 +406,14 @@ impl Config {
 
         let log_level = parse_log_level(raw.general.log_level.as_deref())?;
 
+        let non_wildlife_image_retention_days =
+            raw.general.non_wildlife_image_retention_days.unwrap_or(4);
+
         let general = GeneralConfig {
             database_path,
             output_directory,
             log_level,
+            non_wildlife_image_retention_days,
         };
 
         // ── Resolve NVR ────────────────────────────────────────────────────
@@ -986,6 +996,32 @@ fn validate_config(config: &Config) -> AppResult<()> {
             ErrorCategory::Configuration,
             "validate_config",
             "classifier.retry_initial_delay_seconds must not exceed retry_max_delay_seconds",
+        ));
+    }
+
+    // Non-wildlife image retention — must be positive.
+    if config.general.non_wildlife_image_retention_days == 0 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "general.non_wildlife_image_retention_days must be greater than zero",
+        ));
+    }
+
+    // Reject retention values so large that subtracting them from a DateTime<Utc>
+    // could overflow Chrono's bounds.  Chrono's DateTime is bounded to ~1677 AD
+    // to ~2262 AD; subtracting a very large duration from the lower bound would
+    // underflow.  We conservatively cap retention at ~100 years.
+    const MAX_RETENTION_DAYS: u64 = 36_525; // ~100 years
+    if config.general.non_wildlife_image_retention_days > MAX_RETENTION_DAYS {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            format!(
+                "general.non_wildlife_image_retention_days ({}) exceeds maximum supported duration \
+                 ({MAX_RETENTION_DAYS} days, ~100 years)",
+                config.general.non_wildlife_image_retention_days
+            ),
         ));
     }
 

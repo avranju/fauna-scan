@@ -485,6 +485,30 @@ pub struct LeaseRecoveryCounts {
     pub processing: u64,
 }
 
+// ── Garbage collection candidates ──────────────────────────────────────────
+
+/// A candidate image selected for local-file garbage collection.
+///
+/// Carries only the minimal durable identity and path needed to collect
+/// one local image.  Classification payloads are intentionally excluded
+/// so logging cannot expose raw classifier responses.
+#[derive(Debug, Clone)]
+pub struct GarbageCollectionCandidate {
+    /// The image row identifier.
+    pub image_id: ImageId,
+    /// The local file path that may be removed.
+    pub local_path: PathBuf,
+}
+
+/// A wildlife-positive path whose persisted filesystem identity is not known
+/// to be current. These rows are reconciled before collection so an alias
+/// cannot hide a permanently retained wildlife file.
+#[derive(Debug, Clone)]
+pub struct WildlifeFileReference {
+    pub image_id: ImageId,
+    pub local_path: PathBuf,
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 // All timestamp parsing is now fallible via camera_row_to_record and

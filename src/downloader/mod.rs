@@ -1051,6 +1051,7 @@ mod tests {
                 database_path: PathBuf::from("/tmp/fauna-scan.db"),
                 output_directory: PathBuf::from("/tmp/fauna-output"),
                 log_level: crate::cli::LogLevel::Info,
+                non_wildlife_image_retention_days: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),

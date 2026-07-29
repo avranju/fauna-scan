@@ -9,6 +9,7 @@ use std::process::Command;
 
 use assert_cmd::prelude::*;
 use fauna_scan::configuration::Config;
+use fauna_scan::error::ErrorCategory;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -3203,4 +3204,143 @@ start_at = "2026-01-01T00:00:00Z"
     );
     let path = write_config(&dir, &toml);
     cmd_with_config(&path).success();
+}
+
+// ── Non-wildlife image retention configuration ────────────────────────────
+
+#[test]
+fn retention_default_is_four_days() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let config = Config::load(Some(&path)).unwrap();
+    assert_eq!(
+        config.general.non_wildlife_image_retention_days, 4,
+        "omitting non_wildlife_image_retention_days should default to 4"
+    );
+}
+
+#[test]
+fn retention_explicit_value_is_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[general]
+output_directory = "{output}"
+non_wildlife_image_retention_days = 7
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let config = Config::load(Some(&path)).unwrap();
+    assert_eq!(
+        config.general.non_wildlife_image_retention_days, 7,
+        "explicit retention value should be loaded"
+    );
+}
+
+#[test]
+fn retention_zero_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[general]
+output_directory = "{output}"
+non_wildlife_image_retention_days = 0
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert_eq!(error.category, ErrorCategory::Configuration);
+    assert!(
+        error.message.contains("non_wildlife_image_retention_days"),
+        "error should name the field: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("greater than zero"),
+        "error should mention zero rejection: {}",
+        error.message
+    );
+}
+
+#[test]
+fn retention_exceeds_max_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[general]
+output_directory = "{output}"
+non_wildlife_image_retention_days = 40000
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert_eq!(error.category, ErrorCategory::Configuration);
+    assert!(
+        error.message.contains("non_wildlife_image_retention_days"),
+        "error should name the field: {}",
+        error.message
+    );
+    assert!(
+        error.message.contains("maximum") || error.message.contains("exceeds"),
+        "error should mention exceeding maximum: {}",
+        error.message
+    );
 }

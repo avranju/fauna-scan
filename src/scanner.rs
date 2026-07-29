@@ -4,7 +4,7 @@
 //! shared database, so available classifier capacity is used concurrently
 //! without assigning the same image to more than one endpoint.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,6 +21,7 @@ use crate::database::repository::{DatabaseOps, RateLimitGrant, RateLimitedProces
 use crate::domain::ImageId;
 use crate::domain::Timestamp;
 use crate::error::{AppError, AppResult, ErrorCategory};
+use crate::garbage_collector;
 use crate::service_lifecycle::ShutdownToken;
 
 #[cfg(test)]
@@ -46,6 +47,12 @@ pub struct ScannerOptions {
     pub processing_lease_duration: Duration,
     /// Maximum local image file size in bytes.
     pub maximum_image_size_bytes: u64,
+    /// Directory for downloaded images (used for garbage collection).
+    pub output_directory: PathBuf,
+    /// Duration to retain images classified as not containing wildlife.
+    /// Images older than this (measured from capture time) are eligible
+    /// for garbage collection.
+    pub non_wildlife_image_retention: Duration,
 }
 
 impl ScannerOptions {
@@ -146,6 +153,35 @@ impl ScannerOptions {
             ));
         }
 
+        // Checked multiplication: days * 86_400 must not overflow u64.
+        let retention_secs = config
+            .general
+            .non_wildlife_image_retention_days
+            .checked_mul(86_400)
+            .ok_or_else(|| {
+                AppError::new(
+                    ErrorCategory::Configuration,
+                    "scanner_from_config",
+                    format!(
+                        "general.non_wildlife_image_retention_days ({}) multiplied by 86400 \
+                         overflows u64",
+                        config.general.non_wildlife_image_retention_days
+                    ),
+                )
+            })?;
+
+        // Reject zero retention — a Duration::ZERO produces cutoff = now,
+        // making every completed negative image eligible for immediate
+        // collection.  Config::load rejects zero days, but library callers
+        // may construct Config directly and bypass that validation.
+        if retention_secs == 0 {
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "scanner_from_config",
+                "general.non_wildlife_image_retention_days must be greater than zero",
+            ));
+        }
+
         Ok(Self {
             poll_interval,
             retry_limit: config.classifier.retry_limit,
@@ -153,6 +189,8 @@ impl ScannerOptions {
             retry_max_delay: retry_max,
             processing_lease_duration: lease,
             maximum_image_size_bytes: config.nvr.download.maximum_image_size_bytes,
+            output_directory: config.general.output_directory.clone(),
+            non_wildlife_image_retention: Duration::from_secs(retention_secs),
         })
     }
 }
@@ -320,6 +358,20 @@ impl Scanner {
             return Ok(report);
         }
 
+        // Garbage collect eligible no-wildlife images.
+        let gc_report = garbage_collector::collect_non_wildlife_images(
+            &self.database,
+            &self.options.output_directory,
+            self.options.non_wildlife_image_retention,
+            &Timestamp::new(Utc::now()),
+            shutdown,
+            None,
+        )
+        .await?;
+        report.files_removed = gc_report.files_removed;
+        report.missing_files_reconciled = gc_report.missing_files_reconciled;
+        report.garbage_collection_failures = gc_report.filesystem_failures;
+
         // Update scanner pass metadata.
         let metadata_ts = Timestamp::new(Utc::now());
         self.database
@@ -337,6 +389,9 @@ impl Scanner {
             failed = report.failed,
             missing = report.missing,
             leases_recovered = report.leases_recovered,
+            files_removed = report.files_removed,
+            missing_reconciled = report.missing_files_reconciled,
+            gc_failures = report.garbage_collection_failures,
             "Scanner pass completed"
         );
 
@@ -1111,6 +1166,12 @@ pub struct ScannerPassReport {
     pub failed: u64,
     pub missing: u64,
     pub leases_recovered: u64,
+    /// Local files removed during garbage collection.
+    pub files_removed: u64,
+    /// Already-missing files whose local_path was reconciled.
+    pub missing_files_reconciled: u64,
+    /// Per-file filesystem failures during garbage collection.
+    pub garbage_collection_failures: u64,
 }
 
 /// Display a compact summary of the scanner pass report.
@@ -1126,14 +1187,18 @@ impl std::fmt::Display for ScannerPassReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Scanner pass: claimed={}, completed={}, retry={}, failed={}, missing={}, recovered={}",
+            "Scanner pass: claimed={}, completed={}, retry={}, failed={}, missing={}, recovered={}, gc_removed={}, gc_reconciled={}, gc_failures={}",
             self.claimed,
             self.completed,
             self.retry_scheduled,
             self.failed,
             self.missing,
-            self.leases_recovered
-        )
+            self.leases_recovered,
+            self.files_removed,
+            self.missing_files_reconciled,
+            self.garbage_collection_failures
+        )?;
+        Ok(())
     }
 }
 
@@ -1532,6 +1597,7 @@ mod tests {
                 database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
+                non_wildlife_image_retention_days: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),
@@ -1661,6 +1727,8 @@ mod tests {
             retry_max_delay: Duration::from_secs(300),
             processing_lease_duration: Duration::from_secs(600),
             maximum_image_size_bytes: 25_000_000,
+            output_directory: PathBuf::from("/tmp/output"),
+            non_wildlife_image_retention: Duration::from_secs(4 * 86_400),
         };
         let now = Timestamp::new(Utc::now());
         let lease_until =
@@ -1805,6 +1873,8 @@ mod tests {
             retry_max_delay: Duration::from_secs(30),
             processing_lease_duration: Duration::from_secs(60),
             maximum_image_size_bytes: 25_000_000,
+            output_directory: directory.path().to_path_buf(),
+            non_wildlife_image_retention: Duration::from_secs(4 * 86_400),
         };
 
         FORCE_PARSE_TASK_JOIN_ERROR.store(true, Ordering::SeqCst);
@@ -1836,6 +1906,7 @@ mod tests {
                 database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
+                non_wildlife_image_retention_days: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),
@@ -1908,6 +1979,7 @@ mod tests {
                 database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
+                non_wildlife_image_retention_days: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),
@@ -1979,6 +2051,7 @@ mod tests {
                 database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
+                non_wildlife_image_retention_days: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),
@@ -2051,6 +2124,7 @@ mod tests {
                 database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
+                non_wildlife_image_retention_days: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),

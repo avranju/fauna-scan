@@ -66,6 +66,7 @@ fn make_test_config(
             database_path: db_path.to_path_buf(),
             output_directory: output_dir.to_path_buf(),
             log_level: fauna_scan::cli::LogLevel::Info,
+            non_wildlife_image_retention_days: 4,
         },
         nvr: NvrConfig {
             scheme: scheme.to_string(),

@@ -33,9 +33,10 @@ fn future_ts(hours: i32) -> Timestamp {
 }
 
 fn past_ts(hours: i32) -> Timestamp {
+    let base = Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap();
     Timestamp::new(
-        Utc.with_ymd_and_hms(2026, 7, 11, 12 - hours as u32, 0, 0)
-            .unwrap(),
+        base.checked_sub_signed(chrono::Duration::hours(hours as i64))
+            .expect("past_ts should not underflow"),
     )
 }
 
@@ -5328,4 +5329,749 @@ async fn failure_without_response_retains_prior_diagnostic() {
         Some(first_response),
         "prior diagnostic response should be retained when new failure has no body"
     );
+}
+
+// ── Garbage collection candidate selection ────────────────────────────────
+
+fn gc_format_ts(ts: &Timestamp) -> String {
+    ts.as_datetime()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+async fn insert_gc_image(
+    ops: &DatabaseOps,
+    image_id: i64,
+    image_key: &str,
+    capture_start: &Timestamp,
+    local_path: &str,
+    download_status: &str,
+    processing_status: &str,
+) {
+    let now = now_ts();
+    let now_str = gc_format_ts(&now);
+    let capture_str = gc_format_ts(capture_start);
+
+    let (downloaded_at_str, processing_completed_at_str) =
+        if download_status == "downloaded" && processing_status == "done" {
+            (Some(&now_str as &str), Some(&now_str as &str))
+        } else {
+            (None, None)
+        };
+
+    sqlx::query(
+        r#"INSERT OR REPLACE INTO images (
+               id, image_key, camera_id, track_id, capture_start_at,
+               playback_uri, canonical_playback_uri, local_path,
+               download_status, downloaded_at, processing_status,
+               processing_completed_at, discovered_at, created_at, updated_at
+           ) VALUES (?, ?, 1, '103', ?, 'http://nvr/img', 'http://nvr/img', ?, ?, ?, ?, ?, ?, ?, ?)"#,
+    )
+    .bind(image_id)
+    .bind(image_key)
+    .bind(&capture_str)
+    .bind(local_path)
+    .bind(download_status)
+    .bind(downloaded_at_str)
+    .bind(processing_status)
+    .bind(processing_completed_at_str)
+    .bind(&now_str)
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(ops.pool())
+    .await
+    .unwrap();
+}
+
+async fn ensure_gc_camera(ops: &DatabaseOps) {
+    let now = now_ts();
+    sqlx::query(
+        r#"INSERT OR IGNORE INTO cameras (channel_number, primary_track_id, picture_track_id,
+                                           first_seen_at, last_seen_at, created_at, updated_at)
+           VALUES (1, '101', '103', ?, ?, ?, ?)"#,
+    )
+    .bind(fauna_scan::database::format_timestamp(&now))
+    .bind(fauna_scan::database::format_timestamp(&now))
+    .bind(fauna_scan::database::format_timestamp(&now))
+    .bind(fauna_scan::database::format_timestamp(&now))
+    .execute(ops.pool())
+    .await
+    .unwrap();
+}
+
+async fn insert_gc_classification(ops: &DatabaseOps, image_id: i64, contains_wildlife: bool) {
+    let now = now_ts();
+    let now_str = gc_format_ts(&now);
+    let wildlife = if contains_wildlife { 1 } else { 0 };
+
+    sqlx::query(
+        r#"INSERT INTO classifications (
+               image_id, model, prompt_version, contains_wildlife, is_interesting,
+               summary, species_json, confidence, classification_json, raw_response,
+               request_started_at, request_completed_at, created_at
+           ) VALUES (?, 'test-model', 'wildlife-v1', ?, 0, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)"#,
+    )
+    .bind(image_id)
+    .bind(wildlife)
+    .bind(&now_str)
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(ops.pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn gc_candidates_selects_old_done_negative_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    // Create a camera so the image's foreign key is valid.
+    let now = now_ts();
+    sqlx::query(
+        r#"INSERT INTO cameras (channel_number, primary_track_id, picture_track_id,
+                                first_seen_at, last_seen_at, created_at, updated_at)
+           VALUES (1, '101', '103', ?, ?, ?, ?)"#,
+    )
+    .bind(fauna_scan::database::format_timestamp(&now))
+    .bind(fauna_scan::database::format_timestamp(&now))
+    .bind(fauna_scan::database::format_timestamp(&now))
+    .bind(fauna_scan::database::format_timestamp(&now))
+    .execute(ops.pool())
+    .await
+    .unwrap();
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "old-img",
+        &old_capture,
+        "/tmp/old.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 1, false).await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    let candidates = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].image_id, ImageId::new(1));
+}
+
+#[tokio::test]
+async fn gc_candidates_excludes_recent_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let recent_capture = past_ts(2);
+    insert_gc_image(
+        &ops,
+        1,
+        "recent-img",
+        &recent_capture,
+        "/tmp/recent.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 1, false).await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    let candidates = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn gc_candidates_excludes_non_done_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "unprocessed-img",
+        &old_capture,
+        "/tmp/unprocessed.jpg",
+        "downloaded",
+        "new",
+    )
+    .await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    let candidates = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn gc_candidates_excludes_images_without_classification() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "no-class-img",
+        &old_capture,
+        "/tmp/no-class.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    let candidates = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn gc_candidates_excludes_positive_wildlife_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "wildlife-img",
+        &old_capture,
+        "/tmp/wildlife.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 1, true).await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    let candidates = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn gc_candidates_excludes_any_positive_even_with_negative() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "mixed-img",
+        &old_capture,
+        "/tmp/mixed.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+    // Use distinct model names so both classifications coexist as separate rows.
+    let now_str = gc_format_ts(&now_ts());
+    sqlx::query(
+        r#"INSERT INTO classifications (
+               image_id, model, prompt_version, contains_wildlife, is_interesting,
+               summary, species_json, confidence, classification_json, raw_response,
+               request_started_at, request_completed_at, created_at
+           ) VALUES (?, 'test-model-neg', 'wildlife-v1', 0, 0, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)"#,
+    )
+    .bind(1)
+    .bind(&now_str)
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(ops.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"INSERT INTO classifications (
+               image_id, model, prompt_version, contains_wildlife, is_interesting,
+               summary, species_json, confidence, classification_json, raw_response,
+               request_started_at, request_completed_at, created_at
+           ) VALUES (?, 'test-model-pos', 'wildlife-v1', 1, 0, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)"#,
+    )
+    .bind(1)
+    .bind(&now_str)
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(ops.pool())
+    .await
+    .unwrap();
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    let candidates = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(candidates.len(), 0);
+}
+
+#[tokio::test]
+async fn gc_candidates_paginated_by_image_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    // Insert 3 eligible images
+    for id in 1..=3 {
+        let old_capture = past_ts((id + 5) * 24);
+        insert_gc_image(
+            &ops,
+            id as i64,
+            &format!("img-{}", id),
+            &old_capture,
+            &format!("/tmp/img-{}.jpg", id),
+            "downloaded",
+            "done",
+        )
+        .await;
+        insert_gc_classification(&ops, id as i64, false).await;
+    }
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    // First page: 2 candidates
+    let page1 = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1[0].image_id, ImageId::new(1));
+    assert_eq!(page1[1].image_id, ImageId::new(2));
+
+    // Second page: 1 candidate (after image 2)
+    let page2 = ops
+        .garbage_collection_candidates(&cutoff_ts, Some(ImageId::new(2)), 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].image_id, ImageId::new(3));
+}
+
+// ── mark_local_file_garbage_collected ─────────────────────────────────────
+
+// ── Wildlife-positive file sharing protection ──────────────────────────
+
+/// When two images share the same local_path (e.g. from corruption or
+/// destination collision), the SQL query selects the negative image
+/// because the SQL cannot do canonical path comparison.  The garbage
+/// collector (which canonicalizes paths) will skip it.
+///
+/// This is intentional: the shared-positive check is enforced at the
+/// filesystem level by the collector, which canonicalizes both the
+/// candidate path and all wildlife-positive paths and compares
+/// filesystem identities.  This prevents alias-direction bugs where
+/// a string-based SQL predicate matches one direction but not the other.
+#[tokio::test]
+async fn gc_candidates_selects_negative_image_sharing_path_with_positive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    let shared_path = "/tmp/shared-file.jpg";
+
+    // Insert a negative image (eligible) at ID 1.
+    insert_gc_image(
+        &ops,
+        1,
+        "negative-img",
+        &old_capture,
+        shared_path,
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 1, false).await;
+
+    // Insert a positive wildlife image (NOT eligible) at ID 2 with the
+    // SAME local_path.  This simulates corrupted data or a destination
+    // collision where two images reference the same file.
+    insert_gc_image(
+        &ops,
+        2,
+        "positive-img",
+        &old_capture,
+        shared_path,
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 2, true).await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    // The negative image IS selected by the SQL query because the SQL
+    // cannot do canonical path comparison.  The garbage collector
+    // (which canonicalizes paths) will skip it.
+    let candidates = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        candidates.len(),
+        1,
+        "negative image sharing a path with a positive image IS selected by SQL; collector handles canonical safety"
+    );
+    assert_eq!(candidates[0].image_id, ImageId::new(1));
+}
+
+/// The same behavior applies across different cameras and dates:
+/// the SQL query selects the negative image because the SQL cannot do
+/// canonical path comparison.  The garbage collector (which canonicalizes
+/// paths) will skip it.
+#[tokio::test]
+async fn gc_candidates_selects_negative_sharing_path_with_positive_different_camera() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    let shared_path = "/tmp/shared-wildlife.jpg";
+
+    // Negative image at ID 1.
+    insert_gc_image(
+        &ops,
+        1,
+        "neg-img",
+        &old_capture,
+        shared_path,
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 1, false).await;
+
+    // Positive image at ID 2 (different camera).
+    sqlx::query(
+        r#"INSERT INTO cameras (channel_number, primary_track_id, picture_track_id,
+                                first_seen_at, last_seen_at, created_at, updated_at)
+           VALUES (2, '201', '203', ?, ?, ?, ?)"#,
+    )
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .execute(ops.pool())
+    .await
+    .unwrap();
+
+    let camera_id_2: i64 = sqlx::query_scalar("SELECT id FROM cameras WHERE channel_number = 2")
+        .fetch_one(ops.pool())
+        .await
+        .unwrap();
+
+    sqlx::query(
+        r#"INSERT INTO images (id, image_key, camera_id, track_id, capture_start_at,
+                               playback_uri, canonical_playback_uri, local_path,
+                               download_status, downloaded_at, processing_status,
+                               processing_completed_at, discovered_at, created_at, updated_at)
+           VALUES (?, 'pos-img', ?, '203', ?, 'http://nvr/img', 'http://nvr/img', ?,
+                   'downloaded', ?, 'done', ?, ?, ?, ?)"#,
+    )
+    .bind(2)
+    .bind(camera_id_2)
+    .bind(fauna_scan::database::format_timestamp(&old_capture))
+    .bind(shared_path)
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .bind(fauna_scan::database::format_timestamp(&now_ts()))
+    .execute(ops.pool())
+    .await
+    .unwrap();
+
+    let now_str = gc_format_ts(&now_ts());
+    sqlx::query(
+        r#"INSERT INTO classifications (
+               image_id, model, prompt_version, contains_wildlife, is_interesting,
+               summary, species_json, confidence, classification_json, raw_response,
+               request_started_at, request_completed_at, created_at
+           ) VALUES (?, 'test-model-pos', 'wildlife-v1', 1, 0, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)"#,
+    )
+    .bind(2)
+    .bind(&now_str)
+    .bind(&now_str)
+    .bind(&now_str)
+    .execute(ops.pool())
+    .await
+    .unwrap();
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+
+    // The negative image IS selected by the SQL query because the SQL
+    // cannot do canonical path comparison.  The garbage collector
+    // (which canonicalizes paths) will skip it.
+    let candidates = ops
+        .garbage_collection_candidates(&cutoff_ts, None, 256)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        candidates.len(),
+        1,
+        "negative image sharing path with positive image (different camera) IS selected by SQL; collector handles canonical safety"
+    );
+    assert_eq!(candidates[0].image_id, ImageId::new(1));
+}
+
+#[tokio::test]
+async fn mark_gc_clears_local_path_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "mark-img",
+        &old_capture,
+        "/tmp/mark.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 1, false).await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+    let collected_at = now_ts();
+
+    let candidate = GarbageCollectionCandidate {
+        image_id: ImageId::new(1),
+        local_path: PathBuf::from("/tmp/mark.jpg"),
+    };
+
+    ops.mark_local_file_garbage_collected(&candidate, &cutoff_ts, &collected_at)
+        .await
+        .unwrap();
+
+    // Verify local_path is cleared
+    let img = ops.get_image(ImageId::new(1)).await.unwrap();
+    assert!(img.local_path.is_none());
+    // Verify other fields are preserved
+    assert_eq!(img.download_status, DownloadStatus::Downloaded);
+    assert_eq!(img.processing_status, ProcessingStatus::Done);
+    assert!(img.downloaded_at.is_some());
+    assert!(img.processing_completed_at.is_some());
+
+    // Classification should still exist
+    let class = ops
+        .get_classification(ImageId::new(1), "test-model", "wildlife-v1")
+        .await
+        .unwrap();
+    assert!(!class.contains_wildlife);
+}
+
+#[tokio::test]
+async fn mark_gc_idempotent_when_already_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "idempotent-img",
+        &old_capture,
+        "/tmp/idempotent.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 1, false).await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+    let collected_at = now_ts();
+
+    let candidate = GarbageCollectionCandidate {
+        image_id: ImageId::new(1),
+        local_path: PathBuf::from("/tmp/idempotent.jpg"),
+    };
+
+    // First call should succeed
+    ops.mark_local_file_garbage_collected(&candidate, &cutoff_ts, &collected_at)
+        .await
+        .unwrap();
+
+    // Second call should also succeed (idempotent)
+    ops.mark_local_file_garbage_collected(&candidate, &cutoff_ts, &collected_at)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn mark_gc_rejects_stale_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "stale-img",
+        &old_capture,
+        "/tmp/old-path.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+    insert_gc_classification(&ops, 1, false).await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+    let collected_at = now_ts();
+
+    // Use a different path than what's in the database
+    let candidate = GarbageCollectionCandidate {
+        image_id: ImageId::new(1),
+        local_path: PathBuf::from("/tmp/different-path.jpg"),
+    };
+
+    let result = ops
+        .mark_local_file_garbage_collected(&candidate, &cutoff_ts, &collected_at)
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.category, ErrorCategory::Database);
+    assert!(
+        err.message.contains("eligibility changed") || err.message.contains("path mismatch"),
+        "expected path mismatch error: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn mark_gc_rejects_when_negative_evidence_absent() {
+    // When the negative classification is removed (e.g., by a new positive
+    // classification that doesn't coexist), the mark should fail.
+    let dir = tempfile::tempdir().unwrap();
+    let (_path, ops) = open_test_db(&dir).await;
+
+    ensure_gc_camera(&ops).await;
+
+    let old_capture = past_ts(5 * 24);
+    insert_gc_image(
+        &ops,
+        1,
+        "no-neg-img",
+        &old_capture,
+        "/tmp/no-neg.jpg",
+        "downloaded",
+        "done",
+    )
+    .await;
+    // Only positive classification — no negative evidence
+    insert_gc_classification(&ops, 1, true).await;
+
+    let cutoff = now_ts()
+        .as_datetime()
+        .checked_sub_signed(chrono::Duration::days(4))
+        .unwrap();
+    let cutoff_ts = Timestamp::new(cutoff);
+    let collected_at = now_ts();
+
+    let candidate = GarbageCollectionCandidate {
+        image_id: ImageId::new(1),
+        local_path: PathBuf::from("/tmp/no-neg.jpg"),
+    };
+
+    let result = ops
+        .mark_local_file_garbage_collected(&candidate, &cutoff_ts, &collected_at)
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.category, ErrorCategory::Database);
 }

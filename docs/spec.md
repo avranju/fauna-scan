@@ -123,6 +123,8 @@ fauna-scan --config /path/to/config.toml run
 database_path = "/home/user/.local/state/fauna-scan/fauna-scan.sqlite3"
 output_directory = "/home/user/Pictures/fauna-scan"
 log_level = "info"
+# Retention for no-wildlife images (days from capture time).
+non_wildlife_image_retention_days = 4
 
 [nvr]
 scheme = "http"
@@ -219,6 +221,9 @@ Validation shall include:
 * Secret file existence and readability.
 * `max_results` greater than zero.
 * `maximum_image_size_bytes` greater than zero.
+* `non_wildlife_image_retention_days` greater than zero and not exceeding
+  ~100 years (36 525 days), which is the largest value that can be safely
+  subtracted from a `DateTime<Utc>` without underflowing Chrono's bounds.
 
 Invalid configuration shall cause a non-zero process exit before background tasks start.
 
@@ -1002,13 +1007,72 @@ The scanner loop shall:
 8. Continue with the next image.
 9. Sleep for the configured interval when no work is available.
 
-### 13.5 Successful completion
+### 13.5 Garbage collection of no-wildlife images
+
+The scanner shall automatically garbage collect locally downloaded images
+whose capture time exceeds a configurable retention duration and whose
+completed classifications contain no wildlife.
+
+Configuration:
+
+```toml
+[general]
+non_wildlife_image_retention_days = 4
+```
+
+The default retention is 4 days.
+
+Eligibility criteria:
+
+* `processing_status = done`
+* `local_path IS NOT NULL`
+* `capture_start_at` is strictly older than `now - retention`
+* At least one classification with `contains_wildlife = 0`
+* No classification with `contains_wildlife = 1`
+
+When an eligible image is collected:
+
+* The local file is removed.
+* `local_path` is cleared to `NULL` in the database.
+* The image row, classification rows, download status, and timestamps
+  are preserved.
+* The `downloaded` status is unchanged — the file is not redownloaded.
+
+Images with any wildlife-positive classification are never collected,
+regardless of retention.
+
+Collection runs as part of every scanner pass, including `scan --once`.
+If shutdown is requested, collection is skipped for that pass.
+
+Per-file filesystem failures (e.g. permission denied, path outside root)
+are logged and reported but do not prevent later candidates from being
+processed. Failed candidates remain eligible for retry on a later pass.
+
+Database errors during candidate selection or path-clearing fail the
+scanner pass, because durable reconciliation cannot be trusted.
+
+Acceptance criteria:
+
+1. Omitting `non_wildlife_image_retention_days` produces a validated 4-day retention.
+2. An image older than the cutoff with only negative classifications is collected.
+3. An image at exactly the cutoff or newer is not collected.
+4. Any image with a positive wildlife classification is never collected.
+5. Unclassified, in-progress, or failed images are not collected.
+6. Collection removes the file and clears `local_path` while preserving
+   the image row, classification rows, and download status.
+7. Already-missing eligible files have `local_path` reconciled without
+   failing the pass.
+8. Paths outside the output directory are never deleted.
+9. A filesystem failure does not prevent later candidates from being processed.
+10. Continuous scanner passes and `scan --once` both execute collection.
+
+### 13.6 Successful completion
 
 An image shall be marked `done` only after the classification row has been committed successfully.
 
 The classification insert and processing-state update shall occur in the same transaction.
 
-### 13.6 Crash recovery
+### 13.7 Crash recovery
 
 A row left in `processing` with an expired processing lease shall be returned to a retryable state on startup or during periodic maintenance.
 
@@ -1646,7 +1710,6 @@ The following are explicitly outside the initial implementation:
 * A web dashboard.
 * Sending notifications.
 * Automatically deleting NVR content.
-* Automatically deleting local images.
 * Re-downloading files deleted from local storage.
 * Training or fine-tuning a vision model.
 * Correlating multiple images into a single motion event.
