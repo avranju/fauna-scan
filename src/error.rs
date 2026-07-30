@@ -130,6 +130,34 @@ impl AppError {
     pub fn http_status(&self) -> Option<u16> {
         self.http_status
     }
+
+    /// Format only the application-owned portions of this error's source chain.
+    ///
+    /// Raw third-party sources are deliberately omitted because transport and
+    /// parser errors may contain request URLs, response fragments, or other
+    /// sensitive external data. Every included `AppError::message` is covered
+    /// by the type's existing safe-message contract.
+    pub fn safe_diagnostic_chain(&self) -> String {
+        const MAX_DEPTH: usize = 32;
+
+        let mut entries = Vec::new();
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        let mut depth = 0;
+
+        while let Some(error) = current {
+            if depth >= MAX_DEPTH {
+                entries.push("[diagnostic chain truncated]".to_string());
+                break;
+            }
+            if let Some(app_error) = error.downcast_ref::<AppError>() {
+                entries.push(app_error.to_string());
+            }
+            current = error.source();
+            depth += 1;
+        }
+
+        entries.join(" <- ")
+    }
 }
 
 impl fmt::Display for AppError {
@@ -189,6 +217,40 @@ mod tests {
             inner,
         );
         assert!(err.source.is_some());
+    }
+
+    #[test]
+    fn safe_diagnostic_chain_includes_nested_app_errors() {
+        let inner = AppError::new(
+            ErrorCategory::Database,
+            "record_cursor_error",
+            "database error (code=5): database is locked",
+        );
+        let outer = AppError::with_source(
+            ErrorCategory::Database,
+            "run",
+            "camera search task failed: camera_id=1",
+            inner,
+        );
+
+        let diagnostic = outer.safe_diagnostic_chain();
+        assert!(diagnostic.contains("camera search task failed: camera_id=1"));
+        assert!(diagnostic.contains("record_cursor_error"));
+        assert!(diagnostic.contains("code=5"));
+    }
+
+    #[test]
+    fn safe_diagnostic_chain_omits_raw_third_party_sources() {
+        let err = AppError::with_source(
+            ErrorCategory::Network,
+            "fetch",
+            "request failed",
+            anyhow::anyhow!("https://user:secret@example.invalid/private"),
+        );
+
+        let diagnostic = err.safe_diagnostic_chain();
+        assert_eq!(diagnostic, "[Network] fetch: request failed");
+        assert!(!diagnostic.contains("secret"));
     }
 
     #[test]

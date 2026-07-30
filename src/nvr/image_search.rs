@@ -1444,6 +1444,23 @@ impl<'a> ImageSearchClient<'a> {
         match self.do_search_one_window(window).await {
             Ok(outcome) => Ok(outcome),
             Err(original_error) => {
+                // Log only AppError-owned safe fields. The raw source may
+                // contain an NVR URL or response fragment and is intentionally
+                // excluded by safe_diagnostic_chain().
+                let original_diagnostic = original_error.safe_diagnostic_chain();
+                tracing::warn!(
+                    camera_id = %self.camera_id,
+                    track_id = %self.picture_track,
+                    window_start = %window.start,
+                    window_end = %window.end,
+                    search_error_category = %original_error.category,
+                    search_error_operation = original_error.operation,
+                    search_error_http_status = ?original_error.http_status(),
+                    search_error_message = %original_error.message,
+                    search_error_chain = %original_diagnostic,
+                    "Image search window failed; recording cursor error"
+                );
+
                 // Keep the durable diagnostic deliberately bounded: do not
                 // copy parser messages or playback URLs into the cursor row.
                 let error_msg = format!(
@@ -1461,12 +1478,31 @@ impl<'a> ImageSearchClient<'a> {
                     .await
                 {
                     Ok(()) => Err(original_error),
-                    Err(cursor_error) => Err(AppError::with_source(
-                        ErrorCategory::Database,
-                        "search_one_window",
-                        format!("failed to record image-search cursor error: {cursor_error}"),
-                        original_error,
-                    )),
+                    Err(cursor_error) => {
+                        let cursor_diagnostic = cursor_error.safe_diagnostic_chain();
+                        tracing::error!(
+                            camera_id = %self.camera_id,
+                            track_id = %self.picture_track,
+                            window_start = %window.start,
+                            window_end = %window.end,
+                            original_error_category = %original_error.category,
+                            original_error_operation = original_error.operation,
+                            original_error_http_status = ?original_error.http_status(),
+                            original_error_message = %original_error.message,
+                            original_error_chain = %original_diagnostic,
+                            cursor_error_category = %cursor_error.category,
+                            cursor_error_operation = cursor_error.operation,
+                            cursor_error_message = %cursor_error.message,
+                            cursor_error_chain = %cursor_diagnostic,
+                            "Image search failed and cursor error persistence also failed"
+                        );
+                        Err(AppError::with_source(
+                            ErrorCategory::Database,
+                            "search_one_window",
+                            format!("failed to record image-search cursor error: {cursor_error}"),
+                            original_error,
+                        ))
+                    }
                 }
             }
         }
@@ -1681,7 +1717,22 @@ impl<'a> ImageSearchClient<'a> {
             .await
             .map_err(|e| {
                 // commit_search_window already rolled back the transaction.
-                // Keep its database error as the source for diagnostics.
+                // Keep its database error as the source for diagnostics and
+                // emit its safe operation/message before outer wrapping hides
+                // that detail at the service boundary.
+                let database_diagnostic = e.safe_diagnostic_chain();
+                tracing::error!(
+                    camera_id = %self.camera_id,
+                    track_id = %self.picture_track,
+                    window_start = %window.start,
+                    window_end = %window.end,
+                    position,
+                    database_error_category = %e.category,
+                    database_error_operation = e.operation,
+                    database_error_message = %e.message,
+                    database_error_chain = %database_diagnostic,
+                    "Image search window database commit failed"
+                );
                 AppError::with_source(
                     ErrorCategory::Database,
                     "search_one_window",

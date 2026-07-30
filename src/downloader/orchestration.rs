@@ -696,6 +696,16 @@ impl DownloaderOrchestrator {
                     if !is_expected_camera_failure(err.category) {
                         if first_fatal_error.is_none() {
                             let category = err.category;
+                            let diagnostic_chain = err.safe_diagnostic_chain();
+                            tracing::error!(
+                                camera_id = %cam_id,
+                                error_category = %err.category,
+                                error_operation = err.operation,
+                                error_http_status = ?err.http_status(),
+                                error_message = %err.message,
+                                error_chain = %diagnostic_chain,
+                                "Fatal camera search task failure"
+                            );
                             first_fatal_error = Some(AppError::with_source(
                                 category,
                                 "execute_one_pass",

@@ -103,22 +103,45 @@ pub(crate) fn map_sqlx_error(operation: &'static str, e: sqlx::Error) -> AppErro
     match e {
         sqlx::Error::Database(ref db_err) => {
             let msg = db_err.message().to_string();
+            let code = db_err
+                .code()
+                .map(|value| value.into_owned())
+                .unwrap_or_else(|| "unknown".to_string());
+            tracing::error!(
+                database_operation = operation,
+                database_error_code = %code,
+                database_error_message = %msg,
+                "SQLite operation failed"
+            );
             AppError::with_source(
                 ErrorCategory::Database,
                 operation,
-                format!("database error: {msg}"),
+                format!("database error (code={code}): {msg}"),
                 e,
             )
         }
         sqlx::Error::RowNotFound => {
+            tracing::error!(
+                database_operation = operation,
+                database_error_kind = "row_not_found",
+                "Database operation failed"
+            );
             AppError::new(ErrorCategory::Database, operation, "row not found")
         }
-        _ => AppError::with_source(
-            ErrorCategory::Database,
-            operation,
-            format!("database operation failed: {e}"),
-            e,
-        ),
+        _ => {
+            let msg = e.to_string();
+            tracing::error!(
+                database_operation = operation,
+                database_error_message = %msg,
+                "Database operation failed"
+            );
+            AppError::with_source(
+                ErrorCategory::Database,
+                operation,
+                format!("database operation failed: {msg}"),
+                e,
+            )
+        }
     }
 }
 

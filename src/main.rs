@@ -29,9 +29,15 @@ async fn main() -> ExitCode {
     match app::execute(cli.command, config_path).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            // Include only application-owned safe messages. Raw third-party
+            // sources may contain URLs, response fragments, or credentials and
+            // are intentionally omitted from this diagnostic chain.
+            let diagnostic_chain = e.safe_diagnostic_chain();
             tracing::error!(
                 category = %e.category,
                 operation = e.operation,
+                http_status = ?e.http_status(),
+                diagnostic_chain = %diagnostic_chain,
                 "{}",
                 e.message,
             );
