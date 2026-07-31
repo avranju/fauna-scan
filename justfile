@@ -14,9 +14,14 @@ fmt:
 lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 
-# Run all tests
+# Run all tests (SQLite only; skips PostgreSQL tests)
 test:
 	cargo test --all-targets --no-fail-fast
+
+# Run PostgreSQL integration tests against a live server
+# Requires FAUNA_SCAN_TEST_POSTGRES_URL to be set
+test-postgres:
+	FAUNA_SCAN_TEST_POSTGRES_URL="${FAUNA_SCAN_TEST_POSTGRES_URL:?FAUNA_SCAN_TEST_POSTGRES_URL must be set}" cargo test --test postgres_database -- --ignored
 
 # Build debug binary
 build:

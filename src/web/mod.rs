@@ -1,6 +1,10 @@
 //! Axum-powered read-only web interface and JSON API.
+//!
+//! Exposes a REST API for browsing images, cameras, health, and activity,
+//! plus static assets and an HTML dashboard.  All data access goes through
+//! `DatabaseOps` — the backend-neutral façade — so the web layer is
+//! agnostic to whether the backing store is SQLite or PostgreSQL.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,13 +20,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{QueryBuilder, Row, Sqlite};
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 use url::Url;
 
 use crate::configuration::{Config, NvrConfig, WebConfig};
 use crate::database::repository::DatabaseOps;
+use crate::database::web_models::*;
 use crate::domain::{ImageId, Timestamp, TrackId};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::nvr::{NvrTransport, RecordingSearchClient};
@@ -32,6 +36,8 @@ const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_CSS: &str = include_str!("assets/app.css");
 const APP_JS: &str = include_str!("assets/app.js");
 
+// ── Web state ──────────────────────────────────────────────────────────────
+
 #[derive(Clone)]
 pub struct WebState {
     ops: DatabaseOps,
@@ -39,6 +45,7 @@ pub struct WebState {
     web: WebConfig,
     nvr: NvrConfig,
     recording_search: Arc<RecordingSearchClient>,
+    #[allow(dead_code)]
     started_at: Timestamp,
 }
 
@@ -57,6 +64,8 @@ impl WebState {
         }
     }
 }
+
+// ── Server startup ─────────────────────────────────────────────────────────
 
 /// Serve the UI until the shared service shutdown token is cancelled.
 pub async fn serve(state: WebState, shutdown: ShutdownToken) -> AppResult<()> {
@@ -88,13 +97,16 @@ pub async fn serve(state: WebState, shutdown: ShutdownToken) -> AppResult<()> {
 
 pub fn router(state: WebState) -> Router {
     Router::new()
+        // SPA fallback routes
         .route("/", get(index))
         .route("/images", get(index))
         .route("/images/{id}", get(index))
         .route("/activity", get(index))
         .route("/about", get(index))
+        // Static assets
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(javascript))
+        // API endpoints
         .route("/api/v1/config", get(api_config))
         .route("/api/v1/health", get(api_health))
         .route("/api/v1/cameras", get(api_cameras))
@@ -110,6 +122,8 @@ pub fn router(state: WebState) -> Router {
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
 }
+
+// ── Static asset handlers ──────────────────────────────────────────────────
 
 async fn index() -> Response {
     let mut response = Html(INDEX_HTML).into_response();
@@ -159,6 +173,8 @@ fn security_headers(headers: &mut HeaderMap) {
 async fn not_found() -> WebError {
     WebError::not_found("The requested resource does not exist")
 }
+
+// ── Web error type ─────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 struct WebError {
@@ -218,6 +234,8 @@ impl IntoResponse for WebError {
     }
 }
 
+// ── API: config ────────────────────────────────────────────────────────────
+
 #[derive(Serialize)]
 struct ConfigResponse {
     version: &'static str,
@@ -244,6 +262,8 @@ async fn api_config(State(state): State<WebState>) -> Json<ConfigResponse> {
     })
 }
 
+// ── API: health ────────────────────────────────────────────────────────────
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
@@ -258,32 +278,21 @@ struct HealthResponse {
 }
 
 async fn api_health(State(state): State<WebState>) -> Result<Json<HealthResponse>, WebError> {
-    let rows = sqlx::query("SELECT key, value FROM service_metadata")
-        .fetch_all(state.ops.pool())
-        .await
-        .map_err(db_error)?;
-    let mut metadata = BTreeMap::new();
-    for row in rows {
-        metadata.insert(row.get::<String, _>("key"), row.get::<String, _>("value"));
-    }
-    let (active_downloads, active_classifications): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*) FILTER (WHERE download_status = 'downloading'), COUNT(*) FILTER (WHERE processing_status = 'processing') FROM images",
-    )
-    .fetch_one(state.ops.pool())
-    .await
-    .map_err(db_error)?;
+    let snapshot = state.ops.web_health().await.map_err(db_error)?;
     Ok(Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
         web_started_at: state.started_at.to_string(),
-        last_camera_discovery: metadata.remove("last_successful_camera_discovery"),
-        last_downloader_poll: metadata.remove("last_successful_downloader_poll"),
-        last_scanner_pass: metadata.remove("last_successful_scanner_pass"),
-        active_downloads,
-        active_classifications,
-        generated_at: Timestamp::new(Utc::now()).to_string(),
+        last_camera_discovery: snapshot.last_camera_discovery.clone(),
+        last_downloader_poll: snapshot.last_downloader_poll.clone(),
+        last_scanner_pass: snapshot.last_scanner_pass.clone(),
+        active_downloads: snapshot.active_downloads,
+        active_classifications: snapshot.active_classifications,
+        generated_at: snapshot.generated_at.clone(),
     }))
 }
+
+// ── API: cameras ───────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct CameraDto {
@@ -301,37 +310,29 @@ struct CameraDto {
 }
 
 async fn api_cameras(State(state): State<WebState>) -> Result<Json<Value>, WebError> {
-    let rows = sqlx::query(
-        r#"SELECT c.id, c.channel_number, c.name, c.enabled, c.primary_track_id,
-                  c.picture_track_id, c.last_seen_at, s.last_completed_window_end,
-                  s.last_poll_at, s.next_search_at, s.last_error
-             FROM cameras c
-             LEFT JOIN search_cursors s ON s.camera_id = c.id
-             ORDER BY c.enabled DESC, c.channel_number ASC, c.id ASC"#,
-    )
-    .fetch_all(state.ops.pool())
-    .await
-    .map_err(db_error)?;
-    let data = rows
+    let records = state.ops.web_cameras().await.map_err(db_error)?;
+    let data: Vec<CameraDto> = records
         .into_iter()
-        .map(|row| CameraDto {
-            id: row.get("id"),
-            channel_number: row.get("channel_number"),
-            name: row.get("name"),
-            enabled: row.get::<i64, _>("enabled") != 0,
-            primary_track_id: row.get("primary_track_id"),
-            picture_track_id: row.get("picture_track_id"),
-            last_seen_at: row.get("last_seen_at"),
-            last_completed_window_end: row.get("last_completed_window_end"),
-            last_poll_at: row.get("last_poll_at"),
-            next_search_at: row.get("next_search_at"),
-            last_error: row.get("last_error"),
+        .map(|r| CameraDto {
+            id: r.id,
+            channel_number: r.channel_number,
+            name: r.name,
+            enabled: r.enabled,
+            primary_track_id: r.primary_track_id,
+            picture_track_id: r.picture_track_id,
+            last_seen_at: r.last_seen_at,
+            last_completed_window_end: r.last_completed_window_end,
+            last_poll_at: r.last_poll_at,
+            next_search_at: r.next_search_at,
+            last_error: r.last_error,
         })
-        .collect::<Vec<_>>();
+        .collect();
     Ok(Json(
         json!({ "data": data, "generated_at": Timestamp::new(Utc::now()).to_string() }),
     ))
 }
+
+// ── Query parameter parsing ────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize, Clone)]
 struct ImageParams {
@@ -348,6 +349,8 @@ struct ImageParams {
     limit: Option<u32>,
     cursor: Option<String>,
 }
+
+// ── API: images ────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct CameraSummary {
@@ -404,381 +407,299 @@ async fn query_images(
         "captured_asc" => true,
         _ => return Err(WebError::bad_request("unsupported image sort")),
     };
-    let limit = params.limit.unwrap_or(60).clamp(1, 200) as i64;
-    let cursor = params.cursor.as_deref().map(decode_cursor).transpose()?;
-
-    let mut builder = QueryBuilder::<Sqlite>::new(
-        r#"WITH ranked_classifications AS (
-               SELECT cl.*, ROW_NUMBER() OVER (
-                   PARTITION BY cl.image_id
-                   ORDER BY cl.request_completed_at DESC, cl.id DESC
-               ) AS rn
-               FROM classifications cl
-           )
-           SELECT i.id, i.capture_start_at, i.capture_end_at,
-                  i.camera_id, c.name AS camera_name, c.channel_number,
-                  i.local_path, i.download_status, i.processing_status,
-                  lc.id AS classification_id, lc.contains_wildlife,
-                  lc.is_interesting, lc.summary, lc.species_json,
-                  lc.confidence, lc.model, lc.prompt_version,
-                  lc.request_completed_at
-             FROM images i
-             JOIN cameras c ON c.id = i.camera_id
-             LEFT JOIN ranked_classifications lc ON lc.image_id = i.id AND lc.rn = 1
-            WHERE 1 = 1"#,
-    );
-    append_image_filters(&mut builder, params)?;
-    if let Some((timestamp, id)) = cursor {
-        if ascending {
-            builder.push(" AND (i.capture_start_at > ");
+    let limit = params.limit.unwrap_or(60).clamp(1, 200);
+    let filter = build_image_filter(params)?;
+    let query = WebImageQuery {
+        filter,
+        order: if ascending {
+            WebImageOrder::CapturedAscending
         } else {
-            builder.push(" AND (i.capture_start_at < ");
-        }
-        builder.push_bind(timestamp.clone());
-        builder.push(" OR (i.capture_start_at = ");
-        builder.push_bind(timestamp);
-        if ascending {
-            builder.push(" AND i.id > ");
-        } else {
-            builder.push(" AND i.id < ");
-        }
-        builder.push_bind(id);
-        builder.push("))");
-    }
-    builder.push(if ascending {
-        " ORDER BY i.capture_start_at ASC, i.id ASC LIMIT "
-    } else {
-        " ORDER BY i.capture_start_at DESC, i.id DESC LIMIT "
-    });
-    builder.push_bind(limit + 1);
-
-    let rows = builder
-        .build()
-        .fetch_all(state.ops.pool())
-        .await
-        .map_err(db_error)?;
-    let has_more = rows.len() as i64 > limit;
-    let mut data = rows
-        .into_iter()
-        .take(limit as usize)
-        .map(row_to_image_summary)
-        .collect::<Result<Vec<_>, _>>()?;
-    let next_cursor = if has_more {
-        data.last()
-            .map(|item| encode_cursor(&item.captured_at, item.id))
-    } else {
-        None
+            WebImageOrder::CapturedDescending
+        },
+        limit,
+        cursor: params.cursor.as_deref().map(decode_cursor).transpose()?,
     };
-    Ok((std::mem::take(&mut data), next_cursor))
+
+    let (summaries, next_cursor) = state.ops.web_query_images(&query).await.map_err(db_error)?;
+
+    let data: Vec<ImageSummary> = summaries
+        .into_iter()
+        .map(|s| ImageSummary {
+            id: s.id,
+            captured_at: s.captured_at,
+            capture_end_at: s.capture_end_at,
+            camera: CameraSummary {
+                id: s.camera.id,
+                name: s.camera.name,
+                channel: s.camera.channel,
+            },
+            content_url: s.content_url,
+            thumbnail_url: s.thumbnail_url,
+            download_status: s.download_status,
+            processing_status: s.processing_status,
+            classification: s.classification.map(|c| ClassificationSummary {
+                id: c.id,
+                contains_wildlife: c.contains_wildlife,
+                interesting: c.is_interesting,
+                summary: c.summary,
+                species: c.species,
+                confidence: c.confidence,
+                model: c.model,
+                prompt_version: c.prompt_version,
+                completed_at: c.completed_at,
+            }),
+        })
+        .collect();
+
+    let next_cursor = next_cursor.map(|(ts, id)| encode_cursor(&ts, id));
+    Ok((data, next_cursor))
 }
 
-fn append_image_filters(
-    builder: &mut QueryBuilder<'_, Sqlite>,
-    params: &ImageParams,
-) -> Result<(), WebError> {
-    append_scope_filters(builder, params)?;
-    append_string_list(
-        builder,
-        "i.download_status",
-        params.download_status.as_deref(),
-        &[
-            "pending",
-            "downloading",
-            "downloaded",
-            "retry_wait",
-            "unavailable",
-            "failed",
-        ],
-    )?;
-    append_string_list(
-        builder,
-        "i.processing_status",
-        params.processing_status.as_deref(),
-        &[
-            "new",
-            "processing",
-            "done",
-            "retry_wait",
-            "failed",
-            "missing",
-        ],
-    )?;
-    if let Some(value) = params.classified {
-        builder.push(if value {
-            " AND lc.id IS NOT NULL"
-        } else {
-            " AND lc.id IS NULL"
-        });
+fn build_image_filter(params: &ImageParams) -> Result<WebImageFilter, WebError> {
+    // Valid download and processing statuses for strict validation
+    const VALID_DOWNLOAD_STATUSES: &[&str] = &[
+        "pending",
+        "downloading",
+        "downloaded",
+        "retry_wait",
+        "unavailable",
+        "failed",
+    ];
+    const VALID_PROCESSING_STATUSES: &[&str] = &[
+        "new",
+        "processing",
+        "done",
+        "retry_wait",
+        "failed",
+        "missing",
+    ];
+
+    let scope = WebScopeFilter {
+        from: params
+            .from
+            .as_deref()
+            .map(|s| {
+                s.parse::<Timestamp>()
+                    .map_err(|_| WebError::bad_request("from must be an RFC 3339 timestamp"))
+            })
+            .transpose()?,
+        to: params
+            .to
+            .as_deref()
+            .map(|s| {
+                s.parse::<Timestamp>()
+                    .map_err(|_| WebError::bad_request("to must be an RFC 3339 timestamp"))
+            })
+            .transpose()?,
+        camera_ids: params
+            .camera
+            .as_ref()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim())
+                    .map(|s| {
+                        s.parse::<i64>()
+                            .map_err(|_| WebError::bad_request(format!("invalid camera ID: {s}")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default(),
+    };
+
+    let download_status = params.download_status.as_ref().map(|v| {
+        let statuses: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+        WebDownloadStatusFilter::OneOf(statuses)
+    });
+
+    let processing_status = params.processing_status.as_ref().map(|v| {
+        let statuses: Vec<String> = v.split(',').map(|s| s.trim().to_string()).collect();
+        WebProcessingStatusFilter::OneOf(statuses)
+    });
+
+    // Validate download_status values
+    if let Some(WebDownloadStatusFilter::OneOf(statuses)) = &download_status {
+        for status in statuses {
+            if !VALID_DOWNLOAD_STATUSES.contains(&status.as_str()) {
+                return Err(WebError::bad_request(format!(
+                    "unknown download_status: {status}"
+                )));
+            }
+        }
     }
-    if let Some(value) = params.contains_wildlife {
-        builder
-            .push(" AND lc.contains_wildlife = ")
-            .push_bind(i64::from(value));
+
+    // Validate processing_status values
+    if let Some(WebProcessingStatusFilter::OneOf(statuses)) = &processing_status {
+        for status in statuses {
+            if !VALID_PROCESSING_STATUSES.contains(&status.as_str()) {
+                return Err(WebError::bad_request(format!(
+                    "unknown processing_status: {status}"
+                )));
+            }
+        }
     }
-    if let Some(value) = params.interesting {
-        builder
-            .push(" AND lc.is_interesting = ")
-            .push_bind(i64::from(value));
-    }
-    if let Some(value) = params.confidence_min {
-        if !(0.0..=1.0).contains(&value) {
+
+    let classified = params.classified.map(|v| match v {
+        true => WebClassifiedFilter::Classified,
+        false => WebClassifiedFilter::NotClassified,
+    });
+
+    let contains_wildlife = params.contains_wildlife;
+    let is_interesting = params.interesting;
+
+    let confidence_min = match params.confidence_min {
+        Some(v) if (0.0..=1.0).contains(&v) => Some(v),
+        Some(_) => {
             return Err(WebError::bad_request(
                 "confidence_min must be between 0 and 1",
             ));
         }
-        builder.push(" AND lc.confidence >= ").push_bind(value);
-    }
-    Ok(())
-}
-
-fn append_scope_filters(
-    builder: &mut QueryBuilder<'_, Sqlite>,
-    params: &ImageParams,
-) -> Result<(), WebError> {
-    if let Some(from) = &params.from {
-        let from = crate::database::format_timestamp(&parse_timestamp(from, "from")?);
-        builder.push(" AND i.capture_start_at >= ").push_bind(from);
-    }
-    if let Some(to) = &params.to {
-        let to = crate::database::format_timestamp(&parse_timestamp(to, "to")?);
-        builder.push(" AND i.capture_start_at < ").push_bind(to);
-    }
-    append_i64_list(builder, "i.camera_id", params.camera.as_deref())?;
-    Ok(())
-}
-
-fn append_i64_list(
-    builder: &mut QueryBuilder<'_, Sqlite>,
-    column: &'static str,
-    raw: Option<&str>,
-) -> Result<(), WebError> {
-    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
-        return Ok(());
+        None => None,
     };
-    let values = raw
-        .split(',')
-        .map(|value| {
-            value
-                .parse::<i64>()
-                .map_err(|_| WebError::bad_request("camera contains an invalid ID"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    builder.push(" AND ").push(column).push(" IN (");
-    let mut separated = builder.separated(", ");
-    for value in values {
-        separated.push_bind(value);
-    }
-    separated.push_unseparated(")");
-    Ok(())
-}
 
-fn append_string_list(
-    builder: &mut QueryBuilder<'_, Sqlite>,
-    column: &'static str,
-    raw: Option<&str>,
-    allowed: &[&str],
-) -> Result<(), WebError> {
-    let Some(raw) = raw.filter(|value| !value.is_empty()) else {
-        return Ok(());
-    };
-    let values = raw.split(',').collect::<Vec<_>>();
-    if values.iter().any(|value| !allowed.contains(value)) {
-        return Err(WebError::bad_request("filter contains an unknown status"));
-    }
-    builder.push(" AND ").push(column).push(" IN (");
-    let mut separated = builder.separated(", ");
-    for value in values {
-        separated.push_bind(value.to_string());
-    }
-    separated.push_unseparated(")");
-    Ok(())
-}
-
-fn row_to_image_summary(row: sqlx::sqlite::SqliteRow) -> Result<ImageSummary, WebError> {
-    let id: i64 = row.get("id");
-    let downloaded = row.get::<String, _>("download_status") == "downloaded";
-    let has_path = row.get::<Option<String>, _>("local_path").is_some();
-    let classification_id: Option<i64> = row.get("classification_id");
-    let classification = classification_id.map(|classification_id| ClassificationSummary {
-        id: classification_id,
-        contains_wildlife: row.get::<i64, _>("contains_wildlife") != 0,
-        interesting: row.get::<i64, _>("is_interesting") != 0,
-        summary: row.get("summary"),
-        species: parse_json_value(row.get::<Option<String>, _>("species_json"), json!([])),
-        confidence: row.get("confidence"),
-        model: row.get("model"),
-        prompt_version: row.get("prompt_version"),
-        completed_at: row.get("request_completed_at"),
-    });
-    Ok(ImageSummary {
-        id,
-        captured_at: row.get("capture_start_at"),
-        capture_end_at: row.get("capture_end_at"),
-        camera: CameraSummary {
-            id: row.get("camera_id"),
-            name: row.get("camera_name"),
-            channel: row.get("channel_number"),
-        },
-        content_url: (downloaded && has_path).then(|| format!("/api/v1/images/{id}/content")),
-        thumbnail_url: (downloaded && has_path).then(|| format!("/api/v1/images/{id}/thumbnail")),
-        download_status: row.get("download_status"),
-        processing_status: row.get("processing_status"),
-        classification,
+    Ok(WebImageFilter {
+        scope,
+        download_status,
+        processing_status,
+        classified,
+        contains_wildlife,
+        is_interesting,
+        confidence_min,
     })
 }
+
+// ── API: overview ──────────────────────────────────────────────────────────
 
 async fn api_overview(
     State(state): State<WebState>,
     Query(params): Query<ImageParams>,
 ) -> Result<Json<Value>, WebError> {
     validate_time_range(&params)?;
-    let mut builder = QueryBuilder::<Sqlite>::new(
-        r#"WITH ranked_classifications AS (
-               SELECT cl.*, ROW_NUMBER() OVER (
-                   PARTITION BY cl.image_id ORDER BY cl.request_completed_at DESC, cl.id DESC
-               ) AS rn FROM classifications cl
-           )
-           SELECT COUNT(*) AS discovered,
-                  COALESCE(SUM(i.download_status = 'downloaded'), 0) AS downloaded,
-                  COALESCE(SUM(i.processing_status = 'done'), 0) AS classified,
-                  COALESCE(SUM(lc.contains_wildlife = 1), 0) AS wildlife,
-                  COALESCE(SUM(lc.is_interesting = 1), 0) AS interesting,
-                  COALESCE(SUM(i.download_status = 'retry_wait'), 0)
-                    + COALESCE(SUM(i.processing_status = 'retry_wait'), 0) AS retryable,
-                  COALESCE(SUM(i.download_status IN ('unavailable','failed')), 0)
-                    + COALESCE(SUM(i.processing_status IN ('failed','missing')), 0) AS permanent
-             FROM images i
-             JOIN cameras c ON c.id = i.camera_id
-             LEFT JOIN ranked_classifications lc ON lc.image_id = i.id AND lc.rn = 1
-            WHERE 1 = 1"#,
-    );
-    append_image_filters(&mut builder, &params)?;
-    let row = builder
-        .build()
-        .fetch_one(state.ops.pool())
-        .await
-        .map_err(db_error)?;
+    let filter = build_image_filter(&params)?;
+    let record = state.ops.web_overview(&filter).await.map_err(db_error)?;
     Ok(Json(json!({
         "counts": {
-            "discovered": row.get::<i64, _>("discovered"),
-            "downloaded": row.get::<i64, _>("downloaded"),
-            "classified": row.get::<i64, _>("classified"),
-            "wildlife": row.get::<i64, _>("wildlife"),
-            "interesting": row.get::<i64, _>("interesting"),
-            "retryable_failures": row.get::<i64, _>("retryable"),
-            "permanent_failures": row.get::<i64, _>("permanent")
+            "discovered": record.discovered,
+            "downloaded": record.downloaded,
+            "classified": record.classified,
+            "wildlife": record.wildlife,
+            "interesting": record.interesting,
+            "retryable_failures": record.retryable_failures,
+            "permanent_failures": record.permanent_failures
         },
         "generated_at": Timestamp::new(Utc::now()).to_string()
     })))
 }
 
+// ── API: image detail ─────────────────────────────────────────────────────
+
 async fn api_image(
     State(state): State<WebState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<Value>, WebError> {
-    let image = state
+    let detail = state
         .ops
-        .get_image(ImageId::new(id))
+        .web_image_detail(ImageId::new(id))
         .await
         .map_err(|error| match error.message.as_str() {
             "row not found" => WebError::not_found("Image not found"),
             _ => error.into(),
         })?;
-    let camera = sqlx::query(
-        "SELECT id, channel_number, name, primary_track_id, picture_track_id FROM cameras WHERE id = ?",
-    )
-    .bind(image.camera_id.get())
-    .fetch_one(state.ops.pool())
-    .await
-    .map_err(db_error)?;
-    let classification_rows = sqlx::query(
-        r#"SELECT id, model, prompt_version, contains_wildlife, is_interesting,
-                  summary, species_json, confidence, classification_json,
-                  request_started_at, request_completed_at, created_at
-             FROM classifications WHERE image_id = ?
-             ORDER BY request_completed_at DESC, id DESC"#,
-    )
-    .bind(id)
-    .fetch_all(state.ops.pool())
-    .await
-    .map_err(db_error)?;
-    let classifications = classification_rows
+    let detail = detail.ok_or_else(|| WebError::not_found("Image not found"))?;
+
+    // Validate NVR URLs from the detail record
+    let validated_image_url = detail
+        .nvr
+        .image_url
+        .as_deref()
+        .and_then(|url| validated_still_url(url, &state.nvr));
+    let validated_reported_image_url = detail
+        .nvr
+        .reported_image_url
+        .as_deref()
+        .and_then(|url| validated_still_url(url, &state.nvr));
+
+    let classifications: Vec<Value> = detail
+        .classifications
         .into_iter()
-        .map(|row| {
+        .map(|c| {
             json!({
-                "id": row.get::<i64, _>("id"),
-                "model": row.get::<String, _>("model"),
-                "prompt_version": row.get::<String, _>("prompt_version"),
-                "contains_wildlife": row.get::<i64, _>("contains_wildlife") != 0,
-                "interesting": row.get::<i64, _>("is_interesting") != 0,
-                "summary": row.get::<Option<String>, _>("summary"),
-                "species": parse_json_value(row.get::<Option<String>, _>("species_json"), json!([])),
-                "confidence": row.get::<Option<f64>, _>("confidence"),
-                "structured": parse_json_value(row.get::<Option<String>, _>("classification_json"), Value::Null),
-                "request_started_at": row.get::<String, _>("request_started_at"),
-                "request_completed_at": row.get::<String, _>("request_completed_at"),
-                "created_at": row.get::<String, _>("created_at")
+                "id": c.id,
+                "model": c.model,
+                "prompt_version": c.prompt_version,
+                "contains_wildlife": c.contains_wildlife,
+                "interesting": c.is_interesting,
+                "summary": c.summary,
+                "species": c.species,
+                "confidence": c.confidence,
+                "structured": c.structured,
+                "request_started_at": c.request_started_at,
+                "request_completed_at": c.request_completed_at,
+                "created_at": c.created_at
             })
         })
-        .collect::<Vec<_>>();
-    let canonical_nvr_url = validated_still_url(&image.canonical_playback_uri, &state.nvr);
-    let reported_nvr_url = validated_still_url(&image.playback_uri, &state.nvr);
+        .collect();
+
     Ok(Json(json!({
-        "id": id,
-        "image_key": image.image_key.as_str(),
-        "captured_at": image.capture_start_at.to_string(),
-        "capture_end_at": image.capture_end_at.map(|value| value.to_string()),
-        "discovered_at": image.discovered_at.to_string(),
+        "id": detail.id,
+        "image_key": detail.image_key,
+        "captured_at": detail.captured_at,
+        "capture_end_at": detail.capture_end_at,
+        "discovered_at": detail.discovered_at,
         "camera": {
-            "id": camera.get::<i64, _>("id"),
-            "channel": camera.get::<i64, _>("channel_number"),
-            "name": camera.get::<Option<String>, _>("name"),
-            "primary_track_id": camera.get::<String, _>("primary_track_id"),
-            "picture_track_id": camera.get::<String, _>("picture_track_id")
+            "id": detail.camera.id,
+            "channel": detail.camera.channel,
+            "name": detail.camera.name,
+            "primary_track_id": detail.camera.primary_track_id,
+            "picture_track_id": detail.camera.picture_track_id
         },
-        "content_url": (image.local_path.is_some() && image.download_status.as_str() == "downloaded")
-            .then(|| format!("/api/v1/images/{id}/content")),
+        "content_url": detail.content_url,
         "download": {
-            "status": image.download_status.as_str(),
-            "attempts": image.download_attempts,
-            "downloaded_at": image.downloaded_at.map(|value| value.to_string()),
-            "last_error": image.download_last_error,
-            "next_attempt_at": image.download_next_attempt_at.map(|value| value.to_string()),
-            "lease_until": image.download_lease_until.map(|value| value.to_string())
+            "status": detail.download.status,
+            "attempts": detail.download.attempts,
+            "downloaded_at": detail.download.downloaded_at,
+            "last_error": detail.download.last_error,
+            "next_attempt_at": detail.download.next_attempt_at,
+            "lease_until": detail.download.lease_until
         },
         "processing": {
-            "status": image.processing_status.as_str(),
-            "attempts": image.processing_attempts,
-            "started_at": image.processing_started_at.map(|value| value.to_string()),
-            "completed_at": image.processing_completed_at.map(|value| value.to_string()),
-            "last_error": image.processing_last_error,
-            "next_attempt_at": image.processing_next_attempt_at.map(|value| value.to_string()),
-            "lease_until": image.processing_lease_until.map(|value| value.to_string())
+            "status": detail.processing.status,
+            "attempts": detail.processing.attempts,
+            "started_at": detail.processing.started_at,
+            "completed_at": detail.processing.completed_at,
+            "last_error": detail.processing.last_error,
+            "next_attempt_at": detail.processing.next_attempt_at,
+            "lease_until": detail.processing.lease_until
         },
         "nvr": {
-            "image_url": canonical_nvr_url,
-            "reported_image_url": reported_nvr_url
+            "image_url": validated_image_url,
+            "reported_image_url": validated_reported_image_url
         },
         "classifications": classifications
     })))
 }
 
+// ── API: image content ─────────────────────────────────────────────────────
+
 async fn api_image_content(
     State(state): State<WebState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Response, WebError> {
-    let row = sqlx::query("SELECT local_path, download_status FROM images WHERE id = ?")
-        .bind(id)
-        .fetch_optional(state.ops.pool())
+    let lookup = state
+        .ops
+        .web_image_content_lookup(ImageId::new(id))
         .await
         .map_err(db_error)?
         .ok_or_else(|| WebError::not_found("Image not found"))?;
-    if row.get::<String, _>("download_status") != "downloaded" {
+
+    if lookup.download_status != "downloaded" {
         return Err(WebError::not_found("Image content has not been downloaded"));
     }
-    let path: String = row
-        .get::<Option<String>, _>("local_path")
+
+    let path: String = lookup
+        .local_path
         .ok_or_else(|| WebError::not_found("Local image file is unavailable"))?;
+
     let root = tokio::fs::canonicalize(&state.output_directory)
         .await
         .map_err(|_| WebError::not_found("Image directory is unavailable"))?;
@@ -792,9 +713,12 @@ async fn api_image_content(
             message: "The image path is outside the configured output directory".into(),
         });
     }
+
     let bytes = tokio::fs::read(&path)
         .await
         .map_err(|_| WebError::not_found("Local image file could not be read"))?;
+
+    // Full JPEG validation: check signature and trailer
     if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
         return Err(WebError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -802,6 +726,7 @@ async fn api_image_content(
             message: "The local file is not a valid JPEG".into(),
         });
     }
+
     let mut response = Response::new(Body::from(bytes));
     response
         .headers_mut()
@@ -818,6 +743,8 @@ async fn api_image_content(
     security_headers(response.headers_mut());
     Ok(response)
 }
+
+// ── API: recording ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct RecordingParams {
@@ -845,37 +772,45 @@ async fn api_recording(
             state.web.maximum_clip_duration_seconds
         )));
     }
-    let row = sqlx::query(
-        r#"SELECT i.capture_start_at, c.primary_track_id
-             FROM images i JOIN cameras c ON c.id = i.camera_id
-            WHERE i.id = ?"#,
-    )
-    .bind(id)
-    .fetch_optional(state.ops.pool())
-    .await
-    .map_err(db_error)?
-    .ok_or_else(|| WebError::not_found("Image not found"))?;
-    let target = row
-        .get::<String, _>("capture_start_at")
+
+    let target = state
+        .ops
+        .web_recording_target(ImageId::new(id))
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| WebError::not_found("Image not found"))?;
+
+    let capture_start_at = target
+        .capture_start_at
         .parse::<Timestamp>()
         .map_err(|_| WebError::bad_request("image capture timestamp is invalid"))?;
     let start = Timestamp::new(
-        target
+        capture_start_at
             .as_datetime()
             .checked_sub_signed(Duration::seconds(pre as i64))
             .ok_or_else(|| WebError::bad_request("clip start is out of range"))?,
     );
     let end = Timestamp::new(
-        target
+        capture_start_at
             .as_datetime()
             .checked_add_signed(Duration::seconds(post as i64))
             .ok_or_else(|| WebError::bad_request("clip end is out of range"))?,
     );
-    let track = TrackId::new(row.get::<String, _>("primary_track_id"));
+
+    let track = TrackId::new(target.primary_track_id);
     let found = state
         .recording_search
-        .find(&track, start, end, target)
-        .await?;
+        .find(&track, start, end, capture_start_at)
+        .await
+        .map_err(|e| {
+            tracing::warn!(image_id = %id, "recording search failed: {e}");
+            WebError {
+                status: StatusCode::BAD_GATEWAY,
+                code: "recording_search_failed",
+                message: "Failed to search for recording".into(),
+            }
+        })?;
+
     let Some(recording) = found else {
         return Ok(Json(json!({
             "status": "not_found",
@@ -883,6 +818,7 @@ async fn api_recording(
             "requested_end_at": end.to_string()
         })));
     };
+
     let playback_uri = validate_recording_uri(&recording.playback_uri, &state.nvr)?;
     Ok(Json(json!({
         "status": "found",
@@ -900,74 +836,56 @@ async fn api_recording(
     })))
 }
 
+// ── API: activity ──────────────────────────────────────────────────────────
+
 async fn api_activity(
     State(state): State<WebState>,
     Query(params): Query<ImageParams>,
 ) -> Result<Json<Value>, WebError> {
     validate_time_range(&params)?;
-    let mut counts = Vec::new();
-    for (category, column) in [
-        ("download", "i.download_status"),
-        ("processing", "i.processing_status"),
-    ] {
-        let mut builder = QueryBuilder::<Sqlite>::new("SELECT ");
-        builder
-            .push(column)
-            .push(" AS status, COUNT(*) AS count FROM images i WHERE 1 = 1");
-        append_scope_filters(&mut builder, &params)?;
-        builder.push(" GROUP BY ").push(column);
-        let rows = builder
-            .build()
-            .fetch_all(state.ops.pool())
-            .await
-            .map_err(db_error)?;
-        counts.extend(rows.into_iter().map(|row| {
-            json!({
-                "category": category,
-                "status": row.get::<String, _>("status"),
-                "count": row.get::<i64, _>("count")
-            })
-        }));
-    }
-    let mut active_builder = QueryBuilder::<Sqlite>::new(
-        r#"SELECT i.id, i.capture_start_at, c.name AS camera_name, c.channel_number,
-                  i.download_status, i.download_attempts, i.download_lease_until,
-                  i.processing_status, i.processing_attempts, i.processing_started_at,
-                  i.processing_lease_until
-             FROM images i JOIN cameras c ON c.id = i.camera_id
-            WHERE (i.download_status = 'downloading' OR i.processing_status = 'processing')"#,
-    );
-    append_scope_filters(&mut active_builder, &params)?;
-    active_builder.push(" ORDER BY i.updated_at DESC LIMIT 100");
-    let active_rows = active_builder
-        .build()
-        .fetch_all(state.ops.pool())
-        .await
-        .map_err(db_error)?;
-    let active = active_rows
+    let filter = build_image_filter(&params)?;
+    let record = state.ops.web_activity(&filter).await.map_err(db_error)?;
+
+    let counts: Vec<Value> = record
+        .counts
         .into_iter()
-        .map(|row| {
+        .map(|c| {
             json!({
-                "id": row.get::<i64, _>("id"),
-                "captured_at": row.get::<String, _>("capture_start_at"),
-                "camera_name": row.get::<Option<String>, _>("camera_name"),
-                "channel": row.get::<i64, _>("channel_number"),
-                "download_status": row.get::<String, _>("download_status"),
-                "download_attempts": row.get::<i64, _>("download_attempts"),
-                "download_lease_until": row.get::<Option<String>, _>("download_lease_until"),
-                "processing_status": row.get::<String, _>("processing_status"),
-                "processing_attempts": row.get::<i64, _>("processing_attempts"),
-                "processing_started_at": row.get::<Option<String>, _>("processing_started_at"),
-                "processing_lease_until": row.get::<Option<String>, _>("processing_lease_until")
+                "category": c.category,
+                "status": c.status,
+                "count": c.count
             })
         })
-        .collect::<Vec<_>>();
+        .collect();
+
+    let active: Vec<Value> = record
+        .active
+        .into_iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "captured_at": a.captured_at,
+                "camera_name": a.camera_name,
+                "channel": a.channel,
+                "download_status": a.download_status,
+                "download_attempts": a.download_attempts,
+                "download_lease_until": a.download_lease_until,
+                "processing_status": a.processing_status,
+                "processing_attempts": a.processing_attempts,
+                "processing_started_at": a.processing_started_at,
+                "processing_lease_until": a.processing_lease_until
+            })
+        })
+        .collect();
+
     Ok(Json(json!({
         "counts": counts,
         "active": active,
-        "generated_at": Timestamp::new(Utc::now()).to_string()
+        "generated_at": record.generated_at
     })))
 }
+
+// ── Validation helpers ─────────────────────────────────────────────────────
 
 fn validate_time_range(params: &ImageParams) -> Result<(), WebError> {
     let from = params
@@ -1011,11 +929,6 @@ fn decode_cursor(value: &str) -> Result<(String, i64), WebError> {
         .parse::<i64>()
         .map_err(|_| WebError::bad_request("cursor is invalid"))?;
     Ok((timestamp.to_string(), id))
-}
-
-fn parse_json_value(raw: Option<String>, default: Value) -> Value {
-    raw.and_then(|value| serde_json::from_str(&value).ok())
-        .unwrap_or(default)
 }
 
 fn validated_still_url(raw: &str, config: &NvrConfig) -> Option<String> {
@@ -1064,17 +977,19 @@ fn playback_host_allowed(host: &str, config: &NvrConfig) -> bool {
             .any(|allowed| host.eq_ignore_ascii_case(allowed.trim_matches(['[', ']'])))
 }
 
-fn db_error(error: sqlx::Error) -> WebError {
+fn db_error(error: AppError) -> WebError {
     tracing::warn!(operation = "web_query", "Web database query failed");
     WebError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "database_error",
-        message: match error {
-            sqlx::Error::RowNotFound => "The requested record was not found".into(),
+        message: match error.message.as_str() {
+            "row not found" => "The requested record was not found".into(),
             _ => "The database query failed".into(),
         },
     }
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1087,10 +1002,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("images");
         std::fs::create_dir(&output).unwrap();
-        let database = crate::database::Database::open(&root.path().join("web.sqlite3"))
+        let db_path = root.path().join("web.sqlite3");
+        let sqlite_store = crate::database::sqlite::SqliteDataStore::connect(&db_path, 1)
             .await
             .unwrap();
         let now = "2026-07-21T10:00:00.000000000Z";
+        // Insert camera
         sqlx::query(
             r#"INSERT INTO cameras (
                    id, channel_number, primary_track_id, picture_track_id, name,
@@ -1101,9 +1018,10 @@ mod tests {
         .bind(now)
         .bind(now)
         .bind(now)
-        .execute(database.pool())
+        .execute(sqlite_store.pool())
         .await
         .unwrap();
+        // Insert image
         let image_path = output.join("one.jpg");
         std::fs::write(&image_path, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
         sqlx::query(
@@ -1124,9 +1042,10 @@ mod tests {
         .bind(now)
         .bind(now)
         .bind(now)
-        .execute(database.pool())
+        .execute(sqlite_store.pool())
         .await
         .unwrap();
+        // Insert classification
         sqlx::query(
             r#"INSERT INTO classifications (
                    image_id, model, prompt_version, contains_wildlife,
@@ -1140,9 +1059,10 @@ mod tests {
         .bind(now)
         .bind(now)
         .bind(now)
-        .execute(database.pool())
+        .execute(sqlite_store.pool())
         .await
         .unwrap();
+
         let nvr = NvrConfig {
             scheme: "http".into(),
             host: "nvr".into(),
@@ -1174,7 +1094,7 @@ mod tests {
         };
         let transport = Arc::new(NvrTransport::from_config(&nvr).unwrap());
         let state = WebState {
-            ops: database.ops(),
+            ops: sqlite_store.ops(),
             output_directory: output,
             web: WebConfig::default(),
             nvr,

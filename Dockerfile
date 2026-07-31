@@ -15,6 +15,7 @@ RUN apt-get update \
 
 COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations/
+COPY migrations-postgres ./migrations-postgres/
 COPY src ./src/
 
 RUN cargo build --locked --release

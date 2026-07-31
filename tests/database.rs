@@ -5,20 +5,22 @@
 //! status counts, metadata, and persistence across reopen.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{TimeZone, Timelike, Utc};
-use fauna_scan::database::Database;
 use fauna_scan::database::models::*;
 use fauna_scan::database::repository::DatabaseOps;
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::*;
 use fauna_scan::error::ErrorCategory;
 use tempfile::TempDir;
 
-/// Create a temporary file-backed database and return its path and ops.
-async fn open_test_db(temp_dir: &TempDir) -> (PathBuf, DatabaseOps) {
+/// Create a temporary file-backed database and return its path, store, and ops.
+async fn open_test_db(temp_dir: &TempDir) -> (PathBuf, Arc<SqliteDataStore>, DatabaseOps) {
     let db_path = temp_dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
-    (db_path, db.ops())
+    let store = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let ops = store.ops();
+    (db_path, Arc::new(store), ops)
 }
 
 fn now_ts() -> Timestamp {
@@ -49,7 +51,7 @@ fn lease_ts() -> Timestamp {
 #[tokio::test]
 async fn operational_summary_empty_database_is_all_zero() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     assert_eq!(
         ops.operational_summary().await.unwrap(),
         OperationalSummary::default()
@@ -59,7 +61,7 @@ async fn operational_summary_empty_database_is_all_zero() {
 #[tokio::test]
 async fn operational_summary_uses_combined_image_predicates_and_active_cameras() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let observed = now_ts();
     let records = ops
         .sync_cameras(
@@ -85,7 +87,7 @@ async fn operational_summary_uses_combined_image_predicates_and_active_cameras()
         .unwrap();
     sqlx::query("UPDATE cameras SET enabled = 0 WHERE id = ?")
         .bind(records[1].id.get())
-        .execute(ops.pool())
+        .execute(store.pool())
         .await
         .unwrap();
 
@@ -112,7 +114,7 @@ async fn operational_summary_uses_combined_image_predicates_and_active_cameras()
         .bind(&timestamp)
         .bind(&timestamp)
         .bind(&timestamp)
-        .execute(ops.pool())
+        .execute(store.pool())
         .await
         .unwrap();
     }
@@ -135,35 +137,35 @@ async fn operational_summary_uses_combined_image_predicates_and_active_cameras()
 #[tokio::test]
 async fn empty_database_applies_migration() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, _ops) = open_test_db(&dir).await;
 
     // Verify all tables exist by querying them
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cameras")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 0);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 0);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM classifications")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 0);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM search_cursors")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 0);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_metadata")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 0);
@@ -175,7 +177,7 @@ async fn reopen_is_idempotent() {
     let db_path = dir.path().join("reopen.db");
 
     // First open
-    let db1 = Database::open(&db_path).await.unwrap();
+    let db1 = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cameras")
         .fetch_one(db1.pool())
         .await
@@ -183,7 +185,7 @@ async fn reopen_is_idempotent() {
     assert_eq!(count, 0);
 
     // Second open on same file
-    let db2 = Database::open(&db_path).await.unwrap();
+    let db2 = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cameras")
         .fetch_one(db2.pool())
         .await
@@ -196,7 +198,7 @@ async fn reopen_is_idempotent() {
 #[tokio::test]
 async fn sync_cameras_upserts_and_preserves_first_seen() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let observed = now_ts();
 
     let cameras = vec![
@@ -238,7 +240,7 @@ async fn sync_cameras_upserts_and_preserves_first_seen() {
     let row: (String,) =
         sqlx::query_as("SELECT first_seen_at FROM cameras WHERE picture_track_id = ?")
             .bind("103")
-            .fetch_one(ops.pool())
+            .fetch_one(store.pool())
             .await
             .unwrap();
     assert_eq!(row.0, fauna_scan::database::format_timestamp(&observed));
@@ -247,7 +249,7 @@ async fn sync_cameras_upserts_and_preserves_first_seen() {
 #[tokio::test]
 async fn sync_cameras_marks_absent_inactive() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let observed = now_ts();
 
     // Sync two cameras
@@ -282,7 +284,7 @@ async fn sync_cameras_marks_absent_inactive() {
 
     let enabled: i64 =
         sqlx::query_scalar("SELECT enabled FROM cameras WHERE picture_track_id = '203'")
-            .fetch_one(ops.pool())
+            .fetch_one(store.pool())
             .await
             .unwrap();
     assert_eq!(enabled, 0);
@@ -291,7 +293,7 @@ async fn sync_cameras_marks_absent_inactive() {
 #[tokio::test]
 async fn sync_cameras_empty_discovery_deactivates_all() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let observed = now_ts();
 
     // Sync two cameras
@@ -319,12 +321,12 @@ async fn sync_cameras_empty_discovery_deactivates_all() {
 
     let enabled_103: i64 =
         sqlx::query_scalar("SELECT enabled FROM cameras WHERE picture_track_id = '103'")
-            .fetch_one(ops.pool())
+            .fetch_one(store.pool())
             .await
             .unwrap();
     let enabled_203: i64 =
         sqlx::query_scalar("SELECT enabled FROM cameras WHERE picture_track_id = '203'")
-            .fetch_one(ops.pool())
+            .fetch_one(store.pool())
             .await
             .unwrap();
     assert_eq!(enabled_103, 0);
@@ -336,7 +338,7 @@ async fn sync_cameras_empty_discovery_deactivates_all() {
 #[tokio::test]
 async fn duplicate_image_key_does_not_reset_state() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -437,7 +439,7 @@ async fn duplicate_image_key_does_not_reset_state() {
 #[tokio::test]
 async fn rediscovery_enriches_metadata_preserves_state() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -513,7 +515,7 @@ async fn rediscovery_enriches_metadata_preserves_state() {
 #[tokio::test]
 async fn distinct_images_same_timestamp_coexist() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -575,7 +577,7 @@ async fn distinct_images_same_timestamp_coexist() {
 
     // Verify both images exist
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 2);
@@ -586,7 +588,7 @@ async fn distinct_images_same_timestamp_coexist() {
 #[tokio::test]
 async fn cursor_advances_with_discoveries() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -636,7 +638,7 @@ async fn cursor_advances_with_discoveries() {
 #[tokio::test]
 async fn cursor_error_records_without_advancing() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -669,7 +671,7 @@ async fn cursor_error_records_without_advancing() {
 #[tokio::test]
 async fn claim_next_download_selects_pending() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -729,7 +731,7 @@ async fn claim_next_download_selects_pending() {
 #[tokio::test]
 async fn claim_next_download_selects_due_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -802,7 +804,7 @@ async fn claim_next_download_selects_due_retry() {
 #[tokio::test]
 async fn claim_next_download_skips_future_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -870,7 +872,7 @@ async fn claim_next_download_skips_future_retry() {
 #[tokio::test]
 async fn download_completion_requires_downloading_state() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -924,7 +926,7 @@ async fn download_completion_requires_downloading_state() {
 #[tokio::test]
 async fn download_failure_sets_retry_wait_atomically() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -1001,7 +1003,7 @@ async fn download_failure_sets_retry_wait_atomically() {
 #[tokio::test]
 async fn download_failure_unavailable_clears_retry() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -1066,7 +1068,7 @@ async fn download_failure_unavailable_clears_retry() {
 #[tokio::test]
 async fn download_invalid_failure_transition_unchanged() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -1131,7 +1133,7 @@ async fn download_invalid_failure_transition_unchanged() {
 #[tokio::test]
 async fn claim_next_processing_requires_downloaded_and_local_path() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -1209,7 +1211,7 @@ async fn claim_next_processing_requires_downloaded_and_local_path() {
 #[tokio::test]
 async fn classification_completes_processing_and_inserts_classification() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -1314,7 +1316,7 @@ async fn classification_completes_processing_and_inserts_classification() {
 #[tokio::test]
 async fn classification_completion_waits_for_concurrent_writer() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let lease = lease_ts();
     let camera_id = CameraId::new(1);
@@ -1376,7 +1378,7 @@ async fn classification_completion_waits_for_concurrent_writer() {
     // Model an in-flight downloader completion holding SQLite's single-writer
     // reservation. Classification completion must wait rather than creating a
     // read snapshot and then failing its write upgrade with SQLITE_BUSY.
-    let mut writer = ops.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let mut writer = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
     sqlx::query("INSERT INTO service_metadata (key, value, updated_at) VALUES (?, ?, ?)")
         .bind("concurrent_writer")
         .bind("active")
@@ -1431,7 +1433,7 @@ async fn classification_completion_waits_for_concurrent_writer() {
 #[tokio::test]
 async fn classification_fails_if_not_processing() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -1497,7 +1499,7 @@ async fn classification_fails_if_not_processing() {
 #[tokio::test]
 async fn classification_uniqueness_rollback() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -1596,7 +1598,7 @@ async fn classification_uniqueness_rollback() {
 #[tokio::test]
 async fn processing_failure_sets_retry_wait_atomically() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -1690,7 +1692,7 @@ async fn processing_failure_sets_retry_wait_atomically() {
 #[tokio::test]
 async fn processing_invalid_failure_transition_unchanged() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -1763,7 +1765,8 @@ async fn concurrent_download_claims_deduplicate() {
     let lease = lease_ts();
 
     // Setup and concurrent claims in the same session
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let _pool = db.pool();
     let ops = db.ops();
 
     ops.sync_cameras(
@@ -1833,7 +1836,8 @@ async fn concurrent_processing_claims_deduplicate() {
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let _pool = db.pool();
     let ops = db.ops();
 
     ops.sync_cameras(
@@ -1914,7 +1918,7 @@ async fn concurrent_processing_claims_deduplicate() {
 #[tokio::test]
 async fn recover_expired_leases_resets_to_retry_wait() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let past_lease = past_ts(1);
@@ -1962,7 +1966,7 @@ async fn recover_expired_leases_resets_to_retry_wait() {
         "UPDATE images SET download_status = 'downloading', download_lease_until = ?, download_attempts = 2",
     )
     .bind(past_lease.as_datetime().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-    .execute(ops.pool())
+    .execute(store.pool())
     .await
     .unwrap();
 
@@ -1981,7 +1985,7 @@ async fn recover_expired_leases_resets_to_retry_wait() {
 #[tokio::test]
 async fn recovery_preserves_unexpired_leases() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let future_lease = future_ts(2);
@@ -2031,7 +2035,7 @@ async fn recovery_preserves_unexpired_leases() {
                 .as_datetime()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         )
-        .execute(ops.pool())
+        .execute(store.pool())
         .await
         .unwrap();
 
@@ -2041,7 +2045,7 @@ async fn recovery_preserves_unexpired_leases() {
     // Verify lease is still intact
     let lease_until: Option<String> =
         sqlx::query_scalar("SELECT download_lease_until FROM images WHERE id = 1")
-            .fetch_one(ops.pool())
+            .fetch_one(store.pool())
             .await
             .unwrap();
     assert!(lease_until.is_some());
@@ -2050,7 +2054,7 @@ async fn recovery_preserves_unexpired_leases() {
 #[tokio::test]
 async fn recovery_preserves_downloaded_and_done_rows() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -2187,7 +2191,7 @@ async fn recovery_preserves_downloaded_and_done_rows() {
 #[tokio::test]
 async fn processing_missing_preserves_download_state() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -2273,7 +2277,7 @@ async fn processing_missing_preserves_download_state() {
 #[tokio::test]
 async fn status_counts_returns_typed_maps() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -2377,7 +2381,7 @@ async fn status_counts_returns_typed_maps() {
 #[tokio::test]
 async fn service_metadata_upserts_and_reads() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
 
     ops.set_metadata(&ServiceMetadataKey::ApplicationVersion, "0.1.0", &now)
@@ -2415,7 +2419,7 @@ async fn state_persists_across_reopen() {
 
     // First session
     {
-        let db = Database::open(&db_path).await.unwrap();
+        let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
         let ops = db.ops();
 
         ops.sync_cameras(
@@ -2467,7 +2471,7 @@ async fn state_persists_across_reopen() {
 
     // Second session — state should be preserved
     {
-        let db = Database::open(&db_path).await.unwrap();
+        let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
         let ops = db.ops();
 
         let img = ops.get_image(ImageId::new(1)).await.unwrap();
@@ -2484,7 +2488,7 @@ async fn state_persists_across_reopen() {
 #[tokio::test]
 async fn camera_record_has_camera_id() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
 
     let cameras = vec![CameraDiscovery {
@@ -2505,7 +2509,7 @@ async fn camera_record_has_camera_id() {
 #[tokio::test]
 async fn search_window_rollback_on_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -2583,7 +2587,7 @@ async fn search_window_rollback_on_failure() {
 
     // No image rows should exist — the valid insert rolled back too.
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 0);
@@ -2599,7 +2603,7 @@ async fn search_window_rollback_on_failure() {
 #[tokio::test]
 async fn replay_same_image_key_is_idempotent_and_preserves_state() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -2688,7 +2692,7 @@ async fn replay_same_image_key_is_idempotent_and_preserves_state() {
 
     // Exactly one image row exists.
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 1);
@@ -2714,7 +2718,7 @@ async fn replay_same_image_key_is_idempotent_and_preserves_state() {
 #[tokio::test]
 async fn downloaded_image_not_reclaimed_for_download() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -2801,14 +2805,16 @@ async fn migration_failure_on_incompatible_schema() {
     pool.close().await;
 
     // Opening should fail because the migration cannot run on this schema.
-    let result = Database::open(&db_path).await;
+    let result = SqliteDataStore::connect(&db_path, 4).await;
     assert!(
         result.is_err(),
-        "expected Database::open to fail on incompatible schema"
+        "expected SqliteDataStore::connect to fail on incompatible schema"
     );
     let err = result.err().unwrap();
     assert_eq!(err.category, ErrorCategory::Database);
-    assert!(err.operation == "migrate" || err.operation == "open");
+    assert!(
+        err.operation == "migrate" || err.operation == "open" || err.operation == "sqlite_migrate"
+    );
 }
 
 #[tokio::test]
@@ -2816,7 +2822,7 @@ async fn foreign_keys_and_wal_configured() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("fk_wal.db");
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let pool = db.pool();
 
     // Verify foreign keys are enabled
@@ -2846,7 +2852,7 @@ async fn migration_recorded_in_migrations_table() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("migration_record.db");
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let pool = db.pool();
 
     // Verify migration history table exists and has the initial migration.
@@ -2899,7 +2905,7 @@ async fn required_indexes_exist() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("indexes.db");
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let pool = db.pool();
 
     let indexes: Vec<String> = sqlx::query_scalar(
@@ -2924,7 +2930,7 @@ async fn camera_record_handles_malformed_timestamp() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("corrupt_camera.db");
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let pool = db.pool();
 
     // Insert a camera with a malformed timestamp
@@ -2965,7 +2971,7 @@ async fn cursor_record_handles_malformed_timestamp() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("corrupt_cursor.db");
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let pool = db.pool();
 
     // Insert a camera first (cursor references it via FK)
@@ -3002,7 +3008,7 @@ async fn cursor_record_handles_malformed_timestamp() {
 #[tokio::test]
 async fn lease_recovery_recovers_lease_equal_to_now() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -3049,7 +3055,7 @@ async fn lease_recovery_recovers_lease_equal_to_now() {
     let now_str = fauna_scan::database::format_timestamp(&now);
     sqlx::query("UPDATE images SET download_status = 'downloading', download_lease_until = ?")
         .bind(&now_str)
-        .execute(ops.pool())
+        .execute(store.pool())
         .await
         .unwrap();
 
@@ -3072,7 +3078,8 @@ async fn concurrent_replay_same_image_key_is_idempotent() {
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let pool = db.pool();
     let ops = db.ops();
 
     ops.sync_cameras(
@@ -3128,7 +3135,7 @@ async fn concurrent_replay_same_image_key_is_idempotent() {
 
     // Only one image row should exist
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(pool)
         .await
         .unwrap();
     assert_eq!(count, 1);
@@ -3139,7 +3146,7 @@ async fn concurrent_replay_same_image_key_is_idempotent() {
 #[tokio::test]
 async fn updated_at_refreshed_on_download_claim() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let later = future_ts(2);
     let camera_id = CameraId::new(1);
@@ -3203,7 +3210,7 @@ async fn updated_at_refreshed_on_download_claim() {
 #[tokio::test]
 async fn updated_at_refreshed_on_download_fail() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let later = future_ts(2);
     let camera_id = CameraId::new(1);
@@ -3277,7 +3284,7 @@ async fn updated_at_refreshed_on_download_fail() {
 #[tokio::test]
 async fn updated_at_refreshed_on_classification_complete() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let later = future_ts(2);
     let camera_id = CameraId::new(1);
@@ -3380,7 +3387,8 @@ async fn empty_search_window_advances_cursor_and_persists() {
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let _pool = db.pool();
     let ops = db.ops();
 
     ops.sync_cameras(
@@ -3415,7 +3423,7 @@ async fn empty_search_window_advances_cursor_and_persists() {
     assert_eq!(cursor.next_search_at, Some(future_ts(2)));
 
     // Reopen and verify cursor persists
-    let db2 = Database::open(&db_path).await.unwrap();
+    let db2 = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let cursor2 = db2.ops().get_cursor(camera_id).await.unwrap().unwrap();
     assert_eq!(cursor2.last_completed_window_end, Some(future_ts(1)));
     assert_eq!(cursor2.next_search_at, Some(future_ts(2)));
@@ -3436,7 +3444,7 @@ fn now_ts_subsec() -> Timestamp {
 #[tokio::test]
 async fn fractional_timestamp_round_trips_correctly() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let ts = now_ts_subsec();
     let _camera_id = CameraId::new(1);
 
@@ -3457,7 +3465,7 @@ async fn fractional_timestamp_round_trips_correctly() {
     let row: (String,) =
         sqlx::query_as("SELECT first_seen_at FROM cameras WHERE picture_track_id = ?")
             .bind("103")
-            .fetch_one(ops.pool())
+            .fetch_one(store.pool())
             .await
             .unwrap();
     // Nanos format includes subseconds
@@ -3490,7 +3498,7 @@ async fn fractional_timestamp_round_trips_correctly() {
 #[tokio::test]
 async fn due_retry_with_fractional_seconds_is_claimable() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -3546,7 +3554,7 @@ async fn due_retry_with_fractional_seconds_is_claimable() {
         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     sqlx::query("UPDATE images SET download_status = 'retry_wait', download_next_attempt_at = ?")
         .bind(&retry_str)
-        .execute(ops.pool())
+        .execute(store.pool())
         .await
         .unwrap();
 
@@ -3566,7 +3574,7 @@ async fn due_retry_with_fractional_seconds_is_claimable() {
 #[tokio::test]
 async fn recovery_updates_updated_at() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let later = future_ts(2);
     let camera_id = CameraId::new(1);
@@ -3616,7 +3624,7 @@ async fn recovery_updates_updated_at() {
         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     sqlx::query("UPDATE images SET download_status = 'downloading', download_lease_until = ?")
         .bind(&past_lease_str)
-        .execute(ops.pool())
+        .execute(store.pool())
         .await
         .unwrap();
 
@@ -3638,7 +3646,7 @@ async fn recovery_updates_updated_at() {
 #[tokio::test]
 async fn equal_timestamp_rediscovery_enriches_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -3712,7 +3720,7 @@ async fn equal_timestamp_rediscovery_enriches_metadata() {
 #[tokio::test]
 async fn mixed_batch_enriches_existing_and_inserts_new() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -3759,7 +3767,7 @@ async fn mixed_batch_enriches_existing_and_inserts_new() {
 
     // Verify first image exists
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(count, 1);
@@ -3801,7 +3809,7 @@ async fn mixed_batch_enriches_existing_and_inserts_new() {
 
     // Verify total count is now 2
     let total_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
     assert_eq!(total_count, 2, "should have 2 images after mixed batch");
@@ -3809,7 +3817,7 @@ async fn mixed_batch_enriches_existing_and_inserts_new() {
     // Verify existing was enriched by checking image_key and codec_type
     let enriched: Vec<(String, Option<String>)> =
         sqlx::query_as(r#"SELECT image_key, codec_type FROM images ORDER BY id"#)
-            .fetch_all(ops.pool())
+            .fetch_all(store.pool())
             .await
             .unwrap();
     // First row should be the enriched existing image
@@ -3829,7 +3837,8 @@ async fn concurrent_replay_same_image_key_is_idempotent_concurrent() {
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let _pool = db.pool();
     let ops = db.ops();
 
     ops.sync_cameras(
@@ -3913,7 +3922,7 @@ async fn concurrent_replay_same_image_key_is_idempotent_concurrent() {
 #[tokio::test]
 async fn lease_recovery_with_fractional_boundary() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -3959,7 +3968,7 @@ async fn lease_recovery_with_fractional_boundary() {
     let now_str = fauna_scan::database::format_timestamp(&now);
     sqlx::query("UPDATE images SET download_status = 'downloading', download_lease_until = ?")
         .bind(&now_str)
-        .execute(ops.pool())
+        .execute(store.pool())
         .await
         .unwrap();
 
@@ -3978,7 +3987,7 @@ async fn lease_recovery_with_fractional_boundary() {
 #[tokio::test]
 async fn list_active_cameras_excludes_inactive() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
 
     let cameras = vec![
@@ -4017,7 +4026,7 @@ async fn list_active_cameras_excludes_inactive() {
 #[tokio::test]
 async fn list_active_cameras_ordered_by_channel_and_track() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
 
     let cameras = vec![
@@ -4055,7 +4064,7 @@ async fn list_active_cameras_ordered_by_channel_and_track() {
 #[tokio::test]
 async fn monotonic_cursor_next_search_at_does_not_regress() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -4131,7 +4140,7 @@ async fn monotonic_cursor_next_search_at_does_not_regress() {
 #[tokio::test]
 async fn monotonic_completed_window_does_not_regress() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -4207,7 +4216,7 @@ async fn monotonic_completed_window_does_not_regress() {
 #[tokio::test]
 async fn successful_overlap_replay_clears_cursor_error() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
 
@@ -4265,7 +4274,7 @@ async fn successful_overlap_replay_clears_cursor_error() {
 #[tokio::test]
 async fn fail_processing_persists_raw_response() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -4351,7 +4360,7 @@ async fn fail_processing_persists_raw_response() {
 #[tokio::test]
 async fn fail_processing_coalesce_preserves_prior_raw_response() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -4462,7 +4471,7 @@ async fn fail_processing_coalesce_preserves_prior_raw_response() {
 #[tokio::test]
 async fn complete_classification_clears_raw_response() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -4589,7 +4598,7 @@ async fn empty_response_preserves_prior_diagnostic() {
     // prior diagnostic response.  The SQL uses COALESCE(NULLIF(?, ''),
     // ...) so that an empty string is treated as absent.
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -4732,7 +4741,8 @@ async fn concurrent_processing_lease_recovery_prevents_stale_completion() {
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let pool = db.pool();
     let ops = db.ops();
 
     // Setup: sync camera and insert image
@@ -4809,7 +4819,7 @@ async fn concurrent_processing_lease_recovery_prevents_stale_completion() {
     let past_lease_str = fauna_scan::database::format_timestamp(&past_lease);
     sqlx::query("UPDATE images SET processing_lease_until = ?")
         .bind(&past_lease_str)
-        .execute(ops.pool())
+        .execute(pool)
         .await
         .unwrap();
 
@@ -4913,7 +4923,7 @@ async fn concurrent_processing_lease_recovery_prevents_stale_completion() {
 #[tokio::test]
 async fn renewal_updates_updated_at_to_renewal_instant() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -5007,7 +5017,7 @@ async fn renewal_updates_updated_at_to_renewal_instant() {
 #[tokio::test]
 async fn retryable_failure_retains_raw_response_and_success_clears_it() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -5134,7 +5144,7 @@ async fn retryable_failure_retains_raw_response_and_success_clears_it() {
 #[tokio::test]
 async fn permanent_failure_retains_raw_response() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -5222,7 +5232,7 @@ async fn permanent_failure_retains_raw_response() {
 #[tokio::test]
 async fn failure_without_response_retains_prior_diagnostic() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
     let now = now_ts();
     let camera_id = CameraId::new(1);
     let lease = lease_ts();
@@ -5339,7 +5349,7 @@ fn gc_format_ts(ts: &Timestamp) -> String {
 }
 
 async fn insert_gc_image(
-    ops: &DatabaseOps,
+    pool: &sqlx::SqlitePool,
     image_id: i64,
     image_key: &str,
     capture_start: &Timestamp,
@@ -5377,12 +5387,12 @@ async fn insert_gc_image(
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(pool)
     .await
     .unwrap();
 }
 
-async fn ensure_gc_camera(ops: &DatabaseOps) {
+async fn ensure_gc_camera(pool: &sqlx::SqlitePool) {
     let now = now_ts();
     sqlx::query(
         r#"INSERT OR IGNORE INTO cameras (channel_number, primary_track_id, picture_track_id,
@@ -5393,12 +5403,12 @@ async fn ensure_gc_camera(ops: &DatabaseOps) {
     .bind(fauna_scan::database::format_timestamp(&now))
     .bind(fauna_scan::database::format_timestamp(&now))
     .bind(fauna_scan::database::format_timestamp(&now))
-    .execute(ops.pool())
+    .execute(pool)
     .await
     .unwrap();
 }
 
-async fn insert_gc_classification(ops: &DatabaseOps, image_id: i64, contains_wildlife: bool) {
+async fn insert_gc_classification(pool: &sqlx::SqlitePool, image_id: i64, contains_wildlife: bool) {
     let now = now_ts();
     let now_str = gc_format_ts(&now);
     let wildlife = if contains_wildlife { 1 } else { 0 };
@@ -5415,15 +5425,15 @@ async fn insert_gc_classification(ops: &DatabaseOps, image_id: i64, contains_wil
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(pool)
     .await
     .unwrap();
 }
 
-#[tokio::test]
-async fn gc_candidates_selects_old_done_negative_images() {
+#[allow(dead_code)]
+async fn gc_selects_old_done_negative_images(pool: &sqlx::SqlitePool) {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, _store, ops) = open_test_db(&dir).await;
 
     // Create a camera so the image's foreign key is valid.
     let now = now_ts();
@@ -5436,13 +5446,13 @@ async fn gc_candidates_selects_old_done_negative_images() {
     .bind(fauna_scan::database::format_timestamp(&now))
     .bind(fauna_scan::database::format_timestamp(&now))
     .bind(fauna_scan::database::format_timestamp(&now))
-    .execute(ops.pool())
+    .execute(pool)
     .await
     .unwrap();
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        pool,
         1,
         "old-img",
         &old_capture,
@@ -5451,7 +5461,7 @@ async fn gc_candidates_selects_old_done_negative_images() {
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 1, false).await;
+    insert_gc_classification(pool, 1, false).await;
 
     let cutoff = now_ts()
         .as_datetime()
@@ -5471,13 +5481,13 @@ async fn gc_candidates_selects_old_done_negative_images() {
 #[tokio::test]
 async fn gc_candidates_excludes_recent_images() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let recent_capture = past_ts(2);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "recent-img",
         &recent_capture,
@@ -5486,7 +5496,7 @@ async fn gc_candidates_excludes_recent_images() {
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 1, false).await;
+    insert_gc_classification(store.pool(), 1, false).await;
 
     let cutoff = now_ts()
         .as_datetime()
@@ -5505,13 +5515,13 @@ async fn gc_candidates_excludes_recent_images() {
 #[tokio::test]
 async fn gc_candidates_excludes_non_done_images() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "unprocessed-img",
         &old_capture,
@@ -5538,13 +5548,13 @@ async fn gc_candidates_excludes_non_done_images() {
 #[tokio::test]
 async fn gc_candidates_excludes_images_without_classification() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "no-class-img",
         &old_capture,
@@ -5571,13 +5581,13 @@ async fn gc_candidates_excludes_images_without_classification() {
 #[tokio::test]
 async fn gc_candidates_excludes_positive_wildlife_images() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "wildlife-img",
         &old_capture,
@@ -5586,7 +5596,7 @@ async fn gc_candidates_excludes_positive_wildlife_images() {
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 1, true).await;
+    insert_gc_classification(store.pool(), 1, true).await;
 
     let cutoff = now_ts()
         .as_datetime()
@@ -5605,13 +5615,13 @@ async fn gc_candidates_excludes_positive_wildlife_images() {
 #[tokio::test]
 async fn gc_candidates_excludes_any_positive_even_with_negative() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "mixed-img",
         &old_capture,
@@ -5633,7 +5643,7 @@ async fn gc_candidates_excludes_any_positive_even_with_negative() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(store.pool())
     .await
     .unwrap();
     sqlx::query(
@@ -5647,7 +5657,7 @@ async fn gc_candidates_excludes_any_positive_even_with_negative() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(store.pool())
     .await
     .unwrap();
 
@@ -5668,15 +5678,15 @@ async fn gc_candidates_excludes_any_positive_even_with_negative() {
 #[tokio::test]
 async fn gc_candidates_paginated_by_image_id() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     // Insert 3 eligible images
     for id in 1..=3 {
         let old_capture = past_ts((id + 5) * 24);
         insert_gc_image(
-            &ops,
+            store.pool(),
             id as i64,
             &format!("img-{}", id),
             &old_capture,
@@ -5685,7 +5695,7 @@ async fn gc_candidates_paginated_by_image_id() {
             "done",
         )
         .await;
-        insert_gc_classification(&ops, id as i64, false).await;
+        insert_gc_classification(store.pool(), id as i64, false).await;
     }
 
     let cutoff = now_ts()
@@ -5729,16 +5739,16 @@ async fn gc_candidates_paginated_by_image_id() {
 #[tokio::test]
 async fn gc_candidates_selects_negative_image_sharing_path_with_positive() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     let shared_path = "/tmp/shared-file.jpg";
 
     // Insert a negative image (eligible) at ID 1.
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "negative-img",
         &old_capture,
@@ -5747,13 +5757,13 @@ async fn gc_candidates_selects_negative_image_sharing_path_with_positive() {
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 1, false).await;
+    insert_gc_classification(store.pool(), 1, false).await;
 
     // Insert a positive wildlife image (NOT eligible) at ID 2 with the
     // SAME local_path.  This simulates corrupted data or a destination
     // collision where two images reference the same file.
     insert_gc_image(
-        &ops,
+        store.pool(),
         2,
         "positive-img",
         &old_capture,
@@ -5762,7 +5772,7 @@ async fn gc_candidates_selects_negative_image_sharing_path_with_positive() {
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 2, true).await;
+    insert_gc_classification(store.pool(), 2, true).await;
 
     let cutoff = now_ts()
         .as_datetime()
@@ -5793,16 +5803,16 @@ async fn gc_candidates_selects_negative_image_sharing_path_with_positive() {
 #[tokio::test]
 async fn gc_candidates_selects_negative_sharing_path_with_positive_different_camera() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     let shared_path = "/tmp/shared-wildlife.jpg";
 
     // Negative image at ID 1.
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "neg-img",
         &old_capture,
@@ -5811,7 +5821,7 @@ async fn gc_candidates_selects_negative_sharing_path_with_positive_different_cam
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 1, false).await;
+    insert_gc_classification(store.pool(), 1, false).await;
 
     // Positive image at ID 2 (different camera).
     sqlx::query(
@@ -5823,12 +5833,12 @@ async fn gc_candidates_selects_negative_sharing_path_with_positive_different_cam
     .bind(fauna_scan::database::format_timestamp(&now_ts()))
     .bind(fauna_scan::database::format_timestamp(&now_ts()))
     .bind(fauna_scan::database::format_timestamp(&now_ts()))
-    .execute(ops.pool())
+    .execute(store.pool())
     .await
     .unwrap();
 
     let camera_id_2: i64 = sqlx::query_scalar("SELECT id FROM cameras WHERE channel_number = 2")
-        .fetch_one(ops.pool())
+        .fetch_one(store.pool())
         .await
         .unwrap();
 
@@ -5849,7 +5859,7 @@ async fn gc_candidates_selects_negative_sharing_path_with_positive_different_cam
     .bind(fauna_scan::database::format_timestamp(&now_ts()))
     .bind(fauna_scan::database::format_timestamp(&now_ts()))
     .bind(fauna_scan::database::format_timestamp(&now_ts()))
-    .execute(ops.pool())
+    .execute(store.pool())
     .await
     .unwrap();
 
@@ -5865,7 +5875,7 @@ async fn gc_candidates_selects_negative_sharing_path_with_positive_different_cam
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(store.pool())
     .await
     .unwrap();
 
@@ -5894,13 +5904,13 @@ async fn gc_candidates_selects_negative_sharing_path_with_positive_different_cam
 #[tokio::test]
 async fn mark_gc_clears_local_path_only() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "mark-img",
         &old_capture,
@@ -5909,7 +5919,7 @@ async fn mark_gc_clears_local_path_only() {
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 1, false).await;
+    insert_gc_classification(store.pool(), 1, false).await;
 
     let cutoff = now_ts()
         .as_datetime()
@@ -5947,13 +5957,13 @@ async fn mark_gc_clears_local_path_only() {
 #[tokio::test]
 async fn mark_gc_idempotent_when_already_cleared() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "idempotent-img",
         &old_capture,
@@ -5962,7 +5972,7 @@ async fn mark_gc_idempotent_when_already_cleared() {
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 1, false).await;
+    insert_gc_classification(store.pool(), 1, false).await;
 
     let cutoff = now_ts()
         .as_datetime()
@@ -5990,13 +6000,13 @@ async fn mark_gc_idempotent_when_already_cleared() {
 #[tokio::test]
 async fn mark_gc_rejects_stale_path() {
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "stale-img",
         &old_capture,
@@ -6005,7 +6015,7 @@ async fn mark_gc_rejects_stale_path() {
         "done",
     )
     .await;
-    insert_gc_classification(&ops, 1, false).await;
+    insert_gc_classification(store.pool(), 1, false).await;
 
     let cutoff = now_ts()
         .as_datetime()
@@ -6038,13 +6048,13 @@ async fn mark_gc_rejects_when_negative_evidence_absent() {
     // When the negative classification is removed (e.g., by a new positive
     // classification that doesn't coexist), the mark should fail.
     let dir = tempfile::tempdir().unwrap();
-    let (_path, ops) = open_test_db(&dir).await;
+    let (_path, store, ops) = open_test_db(&dir).await;
 
-    ensure_gc_camera(&ops).await;
+    ensure_gc_camera(store.pool()).await;
 
     let old_capture = past_ts(5 * 24);
     insert_gc_image(
-        &ops,
+        store.pool(),
         1,
         "no-neg-img",
         &old_capture,
@@ -6054,7 +6064,7 @@ async fn mark_gc_rejects_when_negative_evidence_absent() {
     )
     .await;
     // Only positive classification — no negative evidence
-    insert_gc_classification(&ops, 1, true).await;
+    insert_gc_classification(store.pool(), 1, true).await;
 
     let cutoff = now_ts()
         .as_datetime()

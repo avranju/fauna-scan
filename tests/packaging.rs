@@ -27,10 +27,13 @@ fn checked_in_example_configuration_loads() {
     std::fs::write(&config_path, contents).unwrap();
 
     let config = Config::load(Some(&config_path)).unwrap();
-    assert_eq!(
-        config.general.database_path,
-        state_dir.join("fauna-scan.sqlite3")
-    );
+    let expected_path = state_dir.join("fauna-scan.sqlite3");
+    match &config.database {
+        fauna_scan::configuration::DatabaseConfig::Sqlite { path, .. } => {
+            assert_eq!(path, &expected_path);
+        }
+        _ => panic!("expected SQLite database config"),
+    }
     assert_eq!(config.general.output_directory, output_dir);
     assert_eq!(config.general.non_wildlife_image_retention_days, 4);
     assert_eq!(config.nvr.search.max_results, 50);

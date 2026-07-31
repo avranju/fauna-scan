@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
-use fauna_scan::database::Database;
 use fauna_scan::database::models::{CameraDiscovery, DiscoveredImage, SearchWindowCommit};
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::{ImageKey, ProcessingStatus, Timestamp, TrackId};
 use fauna_scan::error::{AppError, AppResult, ErrorCategory};
 use fauna_scan::service_lifecycle::{
@@ -18,12 +18,12 @@ use nix::unistd::Pid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn test_database() -> (Database, tempfile::TempDir) {
+async fn test_database() -> (Arc<SqliteDataStore>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let database = Database::open(&dir.path().join("lifecycle.db"))
+    let store = SqliteDataStore::connect(&dir.path().join("lifecycle.db"), 4)
         .await
         .unwrap();
-    (database, dir)
+    (Arc::new(store), dir)
 }
 
 #[derive(Clone)]
@@ -136,7 +136,7 @@ fn config_for_classifier(
 async fn wait_for_application_metadata(db_path: &std::path::Path) {
     for _ in 0..200 {
         if db_path.exists()
-            && let Ok(db) = Database::open(db_path).await
+            && let Ok(db) = SqliteDataStore::connect(db_path, 4).await
             && db
                 .ops()
                 .get_metadata(&fauna_scan::database::models::ServiceMetadataKey::ApplicationVersion)
@@ -153,7 +153,7 @@ async fn wait_for_application_metadata(db_path: &std::path::Path) {
 }
 
 async fn seed_downloaded_image(db_path: &std::path::Path, output_dir: &std::path::Path) {
-    let database = Database::open(db_path).await.unwrap();
+    let database = SqliteDataStore::connect(db_path, 4).await.unwrap();
     let now = Timestamp::new(Utc::now());
     let camera_id = database
         .ops()
@@ -230,7 +230,7 @@ fn scan_command(config_path: &std::path::Path) -> std::process::Command {
 
 async fn wait_for_processing_status(db_path: &std::path::Path, status: ProcessingStatus) {
     for _ in 0..300 {
-        if let Ok(database) = Database::open(db_path).await
+        if let Ok(database) = SqliteDataStore::connect(db_path, 4).await
             && let Ok(image) = database
                 .ops()
                 .get_image(fauna_scan::domain::ImageId::new(1))
@@ -797,7 +797,7 @@ async fn fatal_database_failure_propagates_nonzero_and_stops_both_pipelines() {
     let child = command.spawn().unwrap();
     wait_for_application_metadata(&db_path).await;
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     sqlx::query("DROP TABLE images")
         .execute(db.pool())
         .await

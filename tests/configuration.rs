@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use assert_cmd::prelude::*;
-use fauna_scan::configuration::Config;
+use fauna_scan::configuration::{Config, DatabaseConfig};
 use fauna_scan::error::ErrorCategory;
 use predicates::prelude::*;
 use tempfile::TempDir;
@@ -3342,5 +3342,517 @@ start_at = "2026-01-01T00:00:00Z"
         error.message.contains("maximum") || error.message.contains("exceeds"),
         "error should mention exceeding maximum: {}",
         error.message
+    );
+}
+
+// ── PostgreSQL configuration tests ──────────────────────────────────────
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_url_literal_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres://user:pass@localhost/dbname"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let config = Config::load(Some(&path)).unwrap();
+    match config.database {
+        DatabaseConfig::Postgres { url, .. } => {
+            assert_eq!(url.expose(), "postgres://user:pass@localhost/dbname");
+        }
+        _ => panic!("expected PostgreSQL config"),
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_url_file_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let url_file = dir.path().join("url.txt");
+    std::fs::write(&url_file, "postgres://user@host/dbname\n").unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url_file = "{url_file}"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+        url_file = url_file.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let config = Config::load(Some(&path)).unwrap();
+    match config.database {
+        DatabaseConfig::Postgres { url, .. } => {
+            assert_eq!(url.expose(), "postgres://user@host/dbname");
+        }
+        _ => panic!("expected PostgreSQL config"),
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_url_env_resolved() {
+    // Use a subprocess to avoid unsafe env::set_var calls.
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url_env = "FAUNA_SCAN_TEST_PG_URL"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("run")
+        .arg("--quiet")
+        .arg("--")
+        .arg("check-config")
+        .arg("--config")
+        .arg(&path)
+        .env("FAUNA_SCAN_TEST_PG_URL", "postgres://env@host/db")
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+
+    let output = cmd.output().expect("cargo run");
+    assert!(
+        output.status.success(),
+        "check-config should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_multiple_url_sources_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres://a@h/d"
+url_env = "FAUNA_SCAN_TEST_PG_URL"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert!(
+        error.message.contains("only specify one"),
+        "should reject multiple sources: {}",
+        error.message
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_missing_url_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert!(
+        error.message.contains("requires exactly one"),
+        "should require a URL source: {}",
+        error.message
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_invalid_scheme_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "mysql://host/db"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert!(
+        error.message.contains("postgres or postgresql"),
+        "should reject non-postgres scheme: {}",
+        error.message
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_missing_host_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres:///dbname"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert!(
+        error.message.contains("must include a host"),
+        "should reject missing host: {}",
+        error.message
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_missing_database_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres://host"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert!(
+        error.message.contains("must include a database name"),
+        "should reject missing database: {}",
+        error.message
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_path_field_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres://host/db"
+path = "/tmp/db.sqlite3"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert!(
+        error.message.contains("must not use"),
+        "should reject path field: {}",
+        error.message
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_legacy_path_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres://host/db"
+
+[general]
+database_path = "/tmp/legacy.sqlite3"
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert!(
+        error.message.contains("must not use general.database_path"),
+        "should reject legacy path: {}",
+        error.message
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_zero_max_connections_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres://host/db"
+max_connections = 0
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let error = Config::load(Some(&path)).err().unwrap();
+    assert!(
+        error.message.contains("greater than zero"),
+        "should reject zero max_connections: {}",
+        error.message
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_url_redacted_in_debug() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres://admin:s3cret@localhost:5432/fauna"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+    let config = Config::load(Some(&path)).unwrap();
+    let debug_str = format!("{:?}", config.database);
+    assert!(
+        !debug_str.contains("s3cret"),
+        "credentials should be redacted in Debug output: {}",
+        debug_str
+    );
+    assert!(
+        !debug_str.contains("admin:s3cret"),
+        "full credential should be redacted: {}",
+        debug_str
+    );
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_check_config_no_home_required() {
+    // Ensure check-config works without HOME/XDG state for PostgreSQL.
+    // Use a subprocess to avoid unsafe env::remove_var calls.
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+
+    let toml = format!(
+        r#"[database]
+backend = "postgres"
+url = "postgres://host/db"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+scheme = "http"
+host = "p"
+port = 80
+username = "u"
+password = "x"
+start_at = "2026-01-01T00:00:00Z"
+
+[classifier]
+"#,
+        output = output.display(),
+    );
+    let path = write_config(&dir, &toml);
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("run")
+        .arg("--quiet")
+        .arg("--")
+        .arg("check-config")
+        .arg("--config")
+        .arg(&path)
+        .env_remove("HOME")
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .current_dir(env!("CARGO_MANIFEST_DIR"));
+
+    let output = cmd.output().expect("cargo run");
+    assert!(
+        output.status.success(),
+        "check-config should succeed without HOME: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

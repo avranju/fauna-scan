@@ -362,7 +362,7 @@ settlement_delay_seconds = 1
                 .and(predicate::str::contains("search")),
         );
 
-    let database = fauna_scan::database::Database::open(&db_path)
+    let database = fauna_scan::database::sqlite::SqliteDataStore::connect(&db_path, 4)
         .await
         .unwrap();
     assert_eq!(database.ops().list_active_cameras().await.unwrap().len(), 1);
@@ -538,7 +538,7 @@ start_at = "2026-01-01T00:00:00Z"
         ),
     )
     .unwrap();
-    fauna_scan::database::Database::open(&db_path)
+    fauna_scan::database::sqlite::SqliteDataStore::connect(&db_path, 4)
         .await
         .unwrap();
 
@@ -598,7 +598,7 @@ start_at = "2026-01-01T00:00:00Z"
         ),
     )
     .unwrap();
-    let database = fauna_scan::database::Database::open(&db_path)
+    let database = fauna_scan::database::sqlite::SqliteDataStore::connect(&db_path, 4)
         .await
         .unwrap();
     let timestamp = "2026-01-01T00:00:00Z";

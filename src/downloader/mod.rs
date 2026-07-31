@@ -1048,10 +1048,13 @@ mod tests {
 
         crate::configuration::Config {
             general: GeneralConfig {
-                database_path: PathBuf::from("/tmp/fauna-scan.db"),
                 output_directory: PathBuf::from("/tmp/fauna-output"),
                 log_level: crate::cli::LogLevel::Info,
                 non_wildlife_image_retention_days: 4,
+            },
+            database: crate::configuration::DatabaseConfig::Sqlite {
+                path: PathBuf::from("/tmp/fauna-scan.db"),
+                max_connections: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use fauna_scan::database::Database;
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::Timestamp;
 
 #[tokio::main]
@@ -62,15 +62,19 @@ async fn main() {
     // Also exercise a genuinely relative database and candidate path. This
     // target uses harness=false so changing cwd is isolated from other tests.
     std::env::set_current_dir(&dir).unwrap();
-    let database = Database::open(Path::new("relative.db")).await.unwrap();
-    let ops = database.ops();
+    let db_path = Path::new("relative.db");
+    let store = SqliteDataStore::connect(db_path, 4).await.unwrap();
+    let pool = store.pool();
+    let ops = store.ops();
     let now = Timestamp::new(Utc.with_ymd_and_hms(2026, 7, 11, 12, 0, 0).unwrap());
     let now_str = now.to_string();
     sqlx::query(
         "INSERT INTO cameras (channel_number, primary_track_id, picture_track_id, first_seen_at, last_seen_at, created_at, updated_at) VALUES (1, '101', '103', ?, ?, ?, ?)",
     )
     .bind(&now_str).bind(&now_str).bind(&now_str).bind(&now_str)
-    .execute(ops.pool()).await.unwrap();
+    .execute(pool)
+    .await
+    .unwrap();
 
     let shared = Path::new("output").join("shared.jpg");
     let absolute_shared = dir.path().join(&shared);
@@ -93,14 +97,18 @@ async fn main() {
         .bind(id).bind(key).bind(&old_str).bind(&path)
         .bind(identity.to_string_lossy().to_string())
         .bind(&now_str).bind(&now_str).bind(&now_str).bind(&now_str).bind(&now_str)
-        .execute(ops.pool()).await.unwrap();
+        .execute(pool)
+        .await
+        .unwrap();
     }
     for (id, wildlife) in [(1_i64, 1_i64), (2_i64, 0_i64)] {
         sqlx::query(
             "INSERT INTO classifications (image_id, model, prompt_version, contains_wildlife, is_interesting, request_started_at, request_completed_at, created_at) VALUES (?, 'test', 'v1', ?, 0, ?, ?, ?)",
         )
         .bind(id).bind(wildlife).bind(&now_str).bind(&now_str).bind(&now_str)
-        .execute(ops.pool()).await.unwrap();
+        .execute(pool)
+        .await
+        .unwrap();
     }
     let shutdown = fauna_scan::service_lifecycle::ShutdownToken::new();
     let report = fauna_scan::garbage_collector::collect_non_wildlife_images(

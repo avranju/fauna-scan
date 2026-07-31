@@ -1594,10 +1594,13 @@ mod tests {
     fn scanner_options_from_config_requires_an_endpoint() {
         let config = Config {
             general: crate::configuration::GeneralConfig {
-                database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
                 non_wildlife_image_retention_days: 4,
+            },
+            database: crate::configuration::DatabaseConfig::Sqlite {
+                path: PathBuf::from("/tmp/test.db"),
+                max_connections: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),
@@ -1784,7 +1787,8 @@ mod tests {
     #[tokio::test]
     async fn parsing_task_join_error_fails_pass_and_leaves_claim_recoverable() {
         use crate::configuration::ClassifierGenerationConfig;
-        use crate::database::Database;
+
+        use crate::database::sqlite::SqliteDataStore;
         use crate::domain::ProcessingStatus;
         use tempfile::tempdir;
         use wiremock::matchers::{method, path};
@@ -1794,10 +1798,10 @@ mod tests {
         let image_path = directory.path().join("image.jpg");
         std::fs::write(&image_path, [0xff, 0xd8, 0xff, 0xd9]).unwrap();
 
-        let database = Database::open(&directory.path().join("scanner.db"))
-            .await
-            .unwrap();
-        let ops = database.ops();
+        let db_path = directory.path().join("scanner.db");
+        let store = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+        let pool = store.pool().clone();
+        let ops = store.ops();
         let now = Timestamp::new(Utc::now());
         let now_text = now.to_string();
         sqlx::query(
@@ -1812,7 +1816,7 @@ mod tests {
         .bind(&now_text)
         .bind(&now_text)
         .bind(&now_text)
-        .execute(ops.pool())
+        .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
@@ -1830,7 +1834,7 @@ mod tests {
         .bind(&now_text)
         .bind(&now_text)
         .bind(&now_text)
-        .execute(ops.pool())
+        .execute(&pool)
         .await
         .unwrap();
 
@@ -1903,10 +1907,13 @@ mod tests {
         // Request timeout is 120s, lease must be >= 120s.
         let config = Config {
             general: crate::configuration::GeneralConfig {
-                database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
                 non_wildlife_image_retention_days: 4,
+            },
+            database: crate::configuration::DatabaseConfig::Sqlite {
+                path: PathBuf::from("/tmp/test.db"),
+                max_connections: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),
@@ -1976,10 +1983,13 @@ mod tests {
         // processing_lease_seconds exceeds the ~100-year safe bound.
         let config = Config {
             general: crate::configuration::GeneralConfig {
-                database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
                 non_wildlife_image_retention_days: 4,
+            },
+            database: crate::configuration::DatabaseConfig::Sqlite {
+                path: PathBuf::from("/tmp/test.db"),
+                max_connections: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),
@@ -2048,10 +2058,13 @@ mod tests {
         // Lease equal to request timeout should be accepted.
         let config = Config {
             general: crate::configuration::GeneralConfig {
-                database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
                 non_wildlife_image_retention_days: 4,
+            },
+            database: crate::configuration::DatabaseConfig::Sqlite {
+                path: PathBuf::from("/tmp/test.db"),
+                max_connections: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),
@@ -2121,10 +2134,13 @@ mod tests {
         // Lease one second above the timeout should be accepted.
         let config = Config {
             general: crate::configuration::GeneralConfig {
-                database_path: PathBuf::from("/tmp/test.db"),
                 output_directory: PathBuf::from("/tmp/output"),
                 log_level: crate::cli::LogLevel::Error,
                 non_wildlife_image_retention_days: 4,
+            },
+            database: crate::configuration::DatabaseConfig::Sqlite {
+                path: PathBuf::from("/tmp/test.db"),
+                max_connections: 4,
             },
             nvr: crate::configuration::NvrConfig {
                 scheme: "http".to_string(),

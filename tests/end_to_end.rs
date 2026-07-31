@@ -8,6 +8,7 @@ use fauna_scan::configuration::{
     NvrConfig, NvrDownloadConfig, NvrSearchConfig, Secret,
 };
 use fauna_scan::database::Database;
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::{DownloadStatus, ProcessingStatus, Timestamp};
 use fauna_scan::downloader::orchestration::{
     DownloaderOrchestrator, DownloaderOrchestratorOptions,
@@ -17,6 +18,7 @@ use fauna_scan::error::{AppResult, ErrorCategory};
 use fauna_scan::nvr::{ImageDownloadClient, NvrTransport};
 use fauna_scan::scanner::{Scanner, ScannerOptions};
 use serde_json::json;
+use sqlx::SqlitePool;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -210,6 +212,7 @@ impl Respond for ClassifierResponder {
 
 struct RuntimeHarness {
     _database: Database,
+    pool: SqlitePool,
     orchestrator: DownloaderOrchestrator,
     scanner: Scanner,
 }
@@ -220,10 +223,13 @@ fn build_test_config(server: &MockServer, root: &Path, start_at: Timestamp) -> C
     let port = uri.port().expect("mock port");
     Config {
         general: GeneralConfig {
-            database_path: root.join("state/fauna-scan.sqlite3"),
             output_directory: root.join("Pictures/fauna-scan"),
             log_level: fauna_scan::cli::LogLevel::Info,
             non_wildlife_image_retention_days: 4,
+        },
+        database: fauna_scan::configuration::DatabaseConfig::Sqlite {
+            path: root.join("state/fauna-scan.sqlite3"),
+            max_connections: 4,
         },
         nvr: NvrConfig {
             scheme: "http".to_string(),
@@ -283,13 +289,18 @@ fn build_test_config(server: &MockServer, root: &Path, start_at: Timestamp) -> C
 }
 
 async fn build_runtime(config: &Config) -> AppResult<RuntimeHarness> {
-    std::fs::create_dir_all(config.general.database_path.parent().unwrap()).map_err(|e| {
+    let db_path = match &config.database {
+        fauna_scan::configuration::DatabaseConfig::Sqlite { path, .. } => path.clone(),
+        _ => panic!("end-to-end tests require SQLite"),
+    };
+    std::fs::create_dir_all(db_path.parent().unwrap()).map_err(|e| {
         fauna_scan::error::AppError::new(ErrorCategory::Filesystem, "test", e.to_string())
     })?;
     std::fs::create_dir_all(&config.general.output_directory).map_err(|e| {
         fauna_scan::error::AppError::new(ErrorCategory::Filesystem, "test", e.to_string())
     })?;
-    let database = Database::open(&config.general.database_path).await?;
+    let store = SqliteDataStore::connect(&db_path, 4).await?;
+    let database = Database::connect(&config.database).await?;
     let transport = Arc::new(NvrTransport::from_config(&config.nvr)?);
     let download_client = Arc::new(ImageDownloadClient::from_config(
         transport.clone(),
@@ -313,6 +324,7 @@ async fn build_runtime(config: &Config) -> AppResult<RuntimeHarness> {
     );
     Ok(RuntimeHarness {
         _database: database,
+        pool: store.pool().clone(),
         orchestrator,
         scanner,
     })
@@ -386,7 +398,7 @@ async fn full_pipeline_is_restart_safe_and_polls_only_new_images() -> AppResult<
     let first_scan = runtime.scanner.clone().execute_one_pass().await?;
     assert_eq!(first_scan.completed, 53);
 
-    let pool = runtime.orchestrator.database.pool();
+    let pool = &runtime.pool;
     assert_eq!(
         scalar_i64(pool, "SELECT COUNT(*) FROM cameras WHERE enabled = 1").await?,
         2
@@ -487,19 +499,11 @@ async fn full_pipeline_is_restart_safe_and_polls_only_new_images() -> AppResult<
     let poll_scan = restarted.scanner.clone().execute_one_pass().await?;
     assert_eq!(poll_scan.completed, 1);
     assert_eq!(
-        scalar_i64(
-            restarted.orchestrator.database.pool(),
-            "SELECT COUNT(*) FROM images"
-        )
-        .await?,
+        scalar_i64(&restarted.pool, "SELECT COUNT(*) FROM images").await?,
         54
     );
     assert_eq!(
-        scalar_i64(
-            restarted.orchestrator.database.pool(),
-            "SELECT COUNT(*) FROM classifications"
-        )
-        .await?,
+        scalar_i64(&restarted.pool, "SELECT COUNT(*) FROM classifications").await?,
         54
     );
     assert_eq!(

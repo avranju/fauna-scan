@@ -1,105 +1,84 @@
-//! SQLite database schema, migrations, and durable state repositories.
+//! Backend-neutral database abstraction for Fauna Scan.
 //!
-//! Implemented in Phase 3.
+//! Exposes `Database::connect` which selects a concrete backend
+//! (SQLite or PostgreSQL) based on configuration, applies that backend's
+//! embedded migrations, and returns a `Database` handle that yields
+//! `DatabaseOps` — the cloneable façade all application code depends on.
+//!
+//! Concrete implementations live in [`sqlite`] and [`postgres`].
 
 pub mod models;
 pub mod repository;
+pub mod sqlite;
+pub mod web_models;
 
-use std::path::Path;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 use sqlx::Row;
-use sqlx::sqlite::{
-    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteRow,
-};
-
-use crate::domain::{DownloadStatus, ProcessingStatus, Timestamp};
-use crate::error::{AppError, AppResult, ErrorCategory};
+use sqlx::sqlite::SqliteRow;
 
 use self::repository::DatabaseOps;
 
-/// Cloneable wrapper around an async SQLite pool with migrations applied.
+/// Connected database handle that exposes only the backend-neutral
+/// [`DatabaseOps`] façade.
 #[derive(Clone)]
 pub struct Database {
-    pool: SqlitePool,
+    ops: DatabaseOps,
 }
 
 impl Database {
-    /// Open (or create) the SQLite database at `path`, apply migrations,
-    /// and configure connection pragmas.
-    pub async fn open(path: &Path) -> AppResult<Self> {
-        let db_path = path.to_str().ok_or_else(|| {
-            AppError::new(
-                ErrorCategory::Database,
-                "open",
-                "database path contains invalid UTF-8",
-            )
-        })?;
-
-        let mut connect_options = SqliteConnectOptions::new()
-            .filename(db_path)
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(10));
-
-        // WAL mode where supported (in-memory databases don't support it).
-        connect_options = match path.to_str() {
-            Some(p) if !p.starts_with("file::memory:") => {
-                connect_options.journal_mode(SqliteJournalMode::Wal)
+    /// Open the configured backend, apply migrations, and return a handle.
+    pub async fn connect(
+        config: &crate::configuration::DatabaseConfig,
+    ) -> crate::error::AppResult<Self> {
+        match config {
+            crate::configuration::DatabaseConfig::Sqlite {
+                path,
+                max_connections,
+            } => {
+                let store = sqlite::SqliteDataStore::connect(path, *max_connections).await?;
+                Ok(Self { ops: store.ops() })
             }
-            _ => connect_options,
-        };
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(connect_options)
-            .await
-            .map_err(|e| {
-                AppError::with_source(
-                    ErrorCategory::Database,
-                    "open",
-                    format!("failed to open database at {}: {e}", path.display()),
-                    e,
-                )
-            })?;
-
-        // Run embedded migrations.
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .map_err(|e| {
-                AppError::with_source(
-                    ErrorCategory::Database,
-                    "migrate",
-                    format!("migration failed for database at {}: {e}", path.display()),
-                    e,
-                )
-            })?;
-
-        Ok(Self { pool })
+            #[cfg(feature = "postgres")]
+            crate::configuration::DatabaseConfig::Postgres {
+                url,
+                max_connections,
+            } => {
+                let store = postgres::PostgresDataStore::connect(url, *max_connections).await?;
+                Ok(Self { ops: store.ops() })
+            }
+            #[cfg(not(feature = "postgres"))]
+            _ => {
+                use crate::error::{AppError, ErrorCategory};
+                Err(AppError::new(
+                    ErrorCategory::Configuration,
+                    "database_connect",
+                    "PostgreSQL support not compiled in; rebuild with the `postgres` feature",
+                ))
+            }
+        }
     }
 
-    /// Return a reference to the underlying pool for integration tests.
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
-    }
-
-    /// Delegate all repository operations.
+    /// Return the backend-neutral operations façade.
     pub fn ops(&self) -> DatabaseOps {
-        DatabaseOps(self.pool.clone())
+        self.ops.clone()
     }
 }
 
 /// Serialize a `Timestamp` to a fixed-width RFC 3339 UTC string.
 ///
-/// Uses nanosecond precision so that lexicographic comparison in SQLite
-/// is correct even when fractional seconds are present.
-pub fn format_timestamp(ts: &Timestamp) -> String {
+/// Uses nanosecond precision so that lexicographic comparison in both
+/// SQLite and PostgreSQL is correct even when fractional seconds are present.
+pub fn format_timestamp(ts: &crate::domain::Timestamp) -> String {
     ts.as_datetime()
         .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
 }
 
-/// Helper to map sqlx::Error into AppError with a given operation name.
-pub(crate) fn map_sqlx_error(operation: &'static str, e: sqlx::Error) -> AppError {
+/// Helper to map sqlx::Error into AppError with a given operation name
+/// and backend label.
+pub(crate) fn map_sqlx_error(operation: &'static str, e: sqlx::Error) -> crate::error::AppError {
+    use crate::error::{AppError, ErrorCategory};
     match e {
         sqlx::Error::Database(ref db_err) => {
             let msg = db_err.message().to_string();
@@ -111,7 +90,7 @@ pub(crate) fn map_sqlx_error(operation: &'static str, e: sqlx::Error) -> AppErro
                 database_operation = operation,
                 database_error_code = %code,
                 database_error_message = %msg,
-                "SQLite operation failed"
+                "Database operation failed"
             );
             AppError::with_source(
                 ErrorCategory::Database,
@@ -130,11 +109,7 @@ pub(crate) fn map_sqlx_error(operation: &'static str, e: sqlx::Error) -> AppErro
         }
         _ => {
             let msg = e.to_string();
-            tracing::error!(
-                database_operation = operation,
-                database_error_message = %msg,
-                "Database operation failed"
-            );
+            tracing::error!(database_operation = operation, database_error_message = %msg, "Database operation failed");
             AppError::with_source(
                 ErrorCategory::Database,
                 operation,
@@ -146,7 +121,11 @@ pub(crate) fn map_sqlx_error(operation: &'static str, e: sqlx::Error) -> AppErro
 }
 
 /// Helper to parse a TEXT column as a Timestamp, returning an AppError.
-pub(crate) fn parse_timestamp_col(row: &SqliteRow, idx: usize) -> AppResult<Timestamp> {
+pub(crate) fn parse_timestamp_col(
+    row: &SqliteRow,
+    idx: usize,
+) -> crate::error::AppResult<crate::domain::Timestamp> {
+    use crate::error::{AppError, ErrorCategory};
     let s: String = row.try_get(idx).map_err(|e| {
         AppError::with_source(
             ErrorCategory::Database,
@@ -155,7 +134,7 @@ pub(crate) fn parse_timestamp_col(row: &SqliteRow, idx: usize) -> AppResult<Time
             e,
         )
     })?;
-    s.parse::<Timestamp>().map_err(|e| {
+    s.parse::<crate::domain::Timestamp>().map_err(|e| {
         AppError::with_source(
             ErrorCategory::Database,
             "parse_timestamp",
@@ -166,7 +145,11 @@ pub(crate) fn parse_timestamp_col(row: &SqliteRow, idx: usize) -> AppResult<Time
 }
 
 /// Helper to parse a TEXT column as an optional Timestamp.
-pub(crate) fn parse_timestamp_col_opt(row: &SqliteRow, idx: usize) -> AppResult<Option<Timestamp>> {
+pub(crate) fn parse_timestamp_col_opt(
+    row: &SqliteRow,
+    idx: usize,
+) -> crate::error::AppResult<Option<crate::domain::Timestamp>> {
+    use crate::error::{AppError, ErrorCategory};
     let opt: Option<String> = row.try_get(idx).map_err(|e| {
         AppError::with_source(
             ErrorCategory::Database,
@@ -177,7 +160,7 @@ pub(crate) fn parse_timestamp_col_opt(row: &SqliteRow, idx: usize) -> AppResult<
     })?;
     match opt {
         Some(s) => {
-            let ts = s.parse::<Timestamp>().map_err(|e| {
+            let ts = s.parse::<crate::domain::Timestamp>().map_err(|e| {
                 AppError::with_source(
                     ErrorCategory::Database,
                     "parse_timestamp_opt",
@@ -193,16 +176,20 @@ pub(crate) fn parse_timestamp_col_opt(row: &SqliteRow, idx: usize) -> AppResult<
 
 /// Helper to parse a TEXT column as a DownloadStatus, returning an AppError
 /// for unknown values.
-pub(crate) fn parse_download_status(row: &SqliteRow, idx: usize) -> AppResult<DownloadStatus> {
+pub(crate) fn parse_download_status(
+    row: &SqliteRow,
+    idx: usize,
+) -> crate::error::AppResult<crate::domain::DownloadStatus> {
+    use crate::error::{AppError, ErrorCategory};
     let s: String = row.try_get(idx).map_err(|e| {
         AppError::with_source(
             ErrorCategory::Database,
             "parse_download_status",
             format!("failed to parse download_status: {e}"),
-            anyhow::Error::from(e),
+            e,
         )
     })?;
-    s.parse::<DownloadStatus>().map_err(|e_msg| {
+    s.parse::<crate::domain::DownloadStatus>().map_err(|e_msg| {
         AppError::new(
             ErrorCategory::Database,
             "parse_download_status",
@@ -213,20 +200,25 @@ pub(crate) fn parse_download_status(row: &SqliteRow, idx: usize) -> AppResult<Do
 
 /// Helper to parse a TEXT column as a ProcessingStatus, returning an AppError
 /// for unknown values.
-pub(crate) fn parse_processing_status(row: &SqliteRow, idx: usize) -> AppResult<ProcessingStatus> {
+pub(crate) fn parse_processing_status(
+    row: &SqliteRow,
+    idx: usize,
+) -> crate::error::AppResult<crate::domain::ProcessingStatus> {
+    use crate::error::{AppError, ErrorCategory};
     let s: String = row.try_get(idx).map_err(|e| {
         AppError::with_source(
             ErrorCategory::Database,
             "parse_processing_status",
             format!("failed to parse processing_status: {e}"),
-            anyhow::Error::from(e),
+            e,
         )
     })?;
-    s.parse::<ProcessingStatus>().map_err(|e_msg| {
-        AppError::new(
-            ErrorCategory::Database,
-            "parse_processing_status",
-            format!("unknown processing_status value '{s}': {e_msg}"),
-        )
-    })
+    s.parse::<crate::domain::ProcessingStatus>()
+        .map_err(|e_msg| {
+            AppError::new(
+                ErrorCategory::Database,
+                "parse_processing_status",
+                format!("unknown processing_status value '{s}': {e_msg}"),
+            )
+        })
 }

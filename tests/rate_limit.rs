@@ -1,8 +1,10 @@
 use std::time::Duration;
 
 use fauna_scan::configuration::ClassifierRateLimitConfig;
-use fauna_scan::database::Database;
-use fauna_scan::database::repository::{RateLimitReservation, RateLimitedProcessingClaim};
+use fauna_scan::database::repository::{
+    DatabaseOps, RateLimitReservation, RateLimitedProcessingClaim,
+};
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::Timestamp;
 use sqlx::Row;
 use tempfile::tempdir;
@@ -19,7 +21,7 @@ fn policy() -> ClassifierRateLimitConfig {
     }
 }
 
-async fn insert_downloaded_image(database: &Database, now: &Timestamp) {
+async fn insert_downloaded_image(_ops: &DatabaseOps, pool: &sqlx::SqlitePool, now: &Timestamp) {
     let now = now.to_string();
     sqlx::query(
         "INSERT INTO cameras (channel_number, primary_track_id, picture_track_id, \
@@ -30,7 +32,7 @@ async fn insert_downloaded_image(database: &Database, now: &Timestamp) {
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(database.pool())
+    .execute(pool)
     .await
     .unwrap();
     sqlx::query(
@@ -45,7 +47,7 @@ async fn insert_downloaded_image(database: &Database, now: &Timestamp) {
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(database.pool())
+    .execute(pool)
     .await
     .unwrap();
 }
@@ -55,8 +57,9 @@ async fn provider_quota_is_sliding_per_minute_and_persistent_per_day() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");
     let start: Timestamp = "2026-07-25T12:00:00Z".parse().unwrap();
-    let database = Database::open(&path).await.unwrap();
-    let ops = database.ops();
+    let store = SqliteDataStore::connect(&path, 4).await.unwrap();
+    let _pool = store.pool();
+    let ops = store.ops();
     let policy = policy();
 
     assert_eq!(
@@ -76,14 +79,15 @@ async fn provider_quota_is_sliding_per_minute_and_persistent_per_day() {
         RateLimitReservation::DailyExhausted(wait) if wait >= Duration::from_secs(60)
     ));
     drop(ops);
-    drop(database);
+    drop(store);
 
     // A fresh process/database handle must retain the already consumed daily
     // quota even after the minute window has expired.
-    let database = Database::open(&path).await.unwrap();
+    let store2 = SqliteDataStore::connect(&path, 4).await.unwrap();
+    let ops2 = store2.ops();
     let after_minute: Timestamp = "2026-07-25T12:01:01Z".parse().unwrap();
     assert!(matches!(
-        database.ops().reserve_classifier_rate_limit(&policy, 10, &after_minute).await.unwrap(),
+        ops2.reserve_classifier_rate_limit(&policy, 10, &after_minute).await.unwrap(),
         RateLimitReservation::DailyExhausted(wait) if wait > Duration::from_secs(10 * 60 * 60)
     ));
 }
@@ -94,9 +98,10 @@ async fn rate_limited_claim_reserves_only_when_it_claims_work() {
     let path = directory.path().join("state.sqlite3");
     let now: Timestamp = "2026-07-25T12:00:00Z".parse().unwrap();
     let lease: Timestamp = "2026-07-25T12:10:00Z".parse().unwrap();
-    let database = Database::open(&path).await.unwrap();
-    insert_downloaded_image(&database, &now).await;
-    let ops = database.ops();
+    let store = SqliteDataStore::connect(&path, 4).await.unwrap();
+    let pool = store.pool();
+    let ops = store.ops();
+    insert_downloaded_image(&ops, pool, &now).await;
     let policy = policy();
 
     let grant = match ops
@@ -122,7 +127,7 @@ async fn rate_limited_claim_reserves_only_when_it_claims_work() {
          WHERE quota_group = ? AND day = '2026-07-25'",
     )
     .bind(&policy.quota_group)
-    .fetch_one(ops.pool())
+    .fetch_one(pool)
     .await
     .unwrap();
     assert_eq!(usage.get::<i64, _>(0), 1);
@@ -143,7 +148,7 @@ async fn rate_limited_claim_reserves_only_when_it_claims_work() {
          WHERE quota_group = ? AND day = '2026-07-25'",
     )
     .bind(&policy.quota_group)
-    .fetch_one(ops.pool())
+    .fetch_one(pool)
     .await
     .unwrap();
     assert_eq!(usage.get::<i64, _>(0), 0);

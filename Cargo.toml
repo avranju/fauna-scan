@@ -16,12 +16,18 @@ harness = false
 name = "fauna_scan"
 path = "src/lib.rs"
 
+[features]
+default = ["sqlite", "postgres"]
+sqlite = []
+postgres = ["sqlx/postgres"]
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 sqlx = { version = "0.8", default-features = false, features = ["chrono", "runtime-tokio", "sqlite", "migrate", "macros"] }
+async-trait = "0.1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
@@ -49,6 +55,7 @@ http = "1"
 predicates = "3"
 rcgen = "0.14"
 tempfile = "3"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros", "chrono"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-rustls = "0.26"
 wiremock = "0.6"

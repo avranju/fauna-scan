@@ -4,13 +4,15 @@
 //! authentication and image responses, plus temporary SQLite databases
 //! to verify download state transitions, adoption, and crash recovery.
 
+use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use fauna_scan::configuration::{NvrConfig, NvrDownloadConfig, NvrSearchConfig};
+use fauna_scan::database::models::*;
 use fauna_scan::database::repository::DatabaseOps;
-use fauna_scan::database::{Database, models::*};
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::*;
 use fauna_scan::downloader::{DownloadWorker, DownloadWorkerOptions, exponential_backoff};
 use fauna_scan::error::{AppResult, ErrorCategory};
@@ -97,8 +99,9 @@ async fn seed_pending_image_at(
     db_path: &std::path::Path,
     image_key: &str,
     playback_uri: &str,
-) -> (DatabaseOps, ImageId) {
-    let db = Database::open(db_path).await.unwrap();
+) -> (DatabaseOps, SqlitePool, ImageId) {
+    let db = SqliteDataStore::connect(db_path, 4).await.unwrap();
+    let pool = db.pool().clone();
     let ops = db.ops();
     let now = now_ts();
     let camera_id = CameraId::new(1);
@@ -143,7 +146,7 @@ async fn seed_pending_image_at(
         .await
         .unwrap();
 
-    (ops, ImageId::new(1))
+    (ops, pool, ImageId::new(1))
 }
 
 /// Capture the number of active requests at any point.
@@ -426,7 +429,7 @@ async fn http_404_becomes_unavailable_after_retry_limit() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-404-exhaust",
         &format!("{}/picture/1", mock_server.uri()),
@@ -469,7 +472,7 @@ async fn http_404_becomes_unavailable_after_retry_limit() {
     assert_eq!(img.download_attempts, 1);
 
     // Make claimable for second pass.
-    make_claimable(&ops, _image_id).await;
+    make_claimable(&pool, _image_id).await;
 
     // Second pass: attempt 2 → retry_wait (attempts=2 < limit=3).
     let report = worker.run_until_idle().await.unwrap();
@@ -483,7 +486,7 @@ async fn http_404_becomes_unavailable_after_retry_limit() {
     assert_eq!(img.download_attempts, 2);
 
     // Make claimable for third pass.
-    make_claimable(&ops, _image_id).await;
+    make_claimable(&pool, _image_id).await;
 
     // Third pass: attempt 3 → unavailable (attempts=3 >= limit=3).
     let report = worker.run_until_idle().await.unwrap();
@@ -513,7 +516,7 @@ async fn http_410_becomes_unavailable_after_retry_limit() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-410-exhaust",
         &format!("{}/picture/1", mock_server.uri()),
@@ -550,7 +553,7 @@ async fn http_410_becomes_unavailable_after_retry_limit() {
     let counts = ops.status_counts().await.unwrap();
     assert_eq!(counts.download.get(&DownloadStatus::RetryWait), Some(&1));
 
-    make_claimable(&ops, _image_id).await;
+    make_claimable(&pool, _image_id).await;
 
     // Second pass: attempt 2 → retry_wait.
     let report = worker.run_until_idle().await.unwrap();
@@ -558,7 +561,7 @@ async fn http_410_becomes_unavailable_after_retry_limit() {
     let counts = ops.status_counts().await.unwrap();
     assert_eq!(counts.download.get(&DownloadStatus::RetryWait), Some(&1));
 
-    make_claimable(&ops, _image_id).await;
+    make_claimable(&pool, _image_id).await;
 
     // Third pass: attempt 3 → unavailable.
     let report = worker.run_until_idle().await.unwrap();
@@ -616,7 +619,7 @@ async fn http_500_then_success() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-500-then-success",
         &format!("{}/picture/1", mock_server.uri()),
@@ -653,7 +656,7 @@ async fn http_500_then_success() {
     assert_eq!(img.download_attempts, 1);
 
     // Make claimable for second pass.
-    make_claimable(&ops, _image_id).await;
+    make_claimable(&pool, _image_id).await;
 
     // Second pass: should succeed.
     let report = worker.run_until_idle().await.unwrap();
@@ -769,7 +772,7 @@ async fn download_worker_completes_download() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, _pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-download-worker",
         &format!("{}/picture/1", mock_server.uri()),
@@ -815,7 +818,7 @@ async fn download_worker_adopts_existing_file() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) =
+    let (ops, _pool, _image_id) =
         seed_pending_image_at(&db_path, "key-adopt", "http://nvr/picture/1").await;
 
     // Pre-create a valid JPEG at the expected destination.
@@ -888,7 +891,7 @@ async fn download_worker_replaces_invalid_file() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, _pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-replace",
         &format!("{}/picture/1", mock_server.uri()),
@@ -1011,7 +1014,7 @@ async fn download_worker_respects_concurrency_limit() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
     let now = now_ts();
     let camera_id = CameraId::new(1);
@@ -1101,7 +1104,7 @@ async fn download_worker_respects_concurrency_limit() {
 async fn lease_recovery_recovers_downloading_lease() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
     let now = now_ts();
     let camera_id = CameraId::new(1);
@@ -1156,7 +1159,7 @@ async fn lease_recovery_recovers_downloading_lease() {
             .as_datetime()
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
     )
-    .execute(ops.pool())
+    .execute(db.pool())
     .await
     .unwrap();
 
@@ -1186,7 +1189,7 @@ async fn crash_recovery_adopts_file_after_db_failure() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
     let now = now_ts();
     let camera_id = CameraId::new(1);
@@ -1263,7 +1266,7 @@ async fn crash_recovery_adopts_file_after_db_failure() {
                 .as_datetime()
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         )
-        .execute(ops.pool())
+        .execute(db.pool())
         .await
         .unwrap();
 
@@ -1311,7 +1314,7 @@ async fn crash_recovery_adopts_file_after_db_failure() {
 async fn downloaded_image_not_reclaimed_after_file_deleted() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
     let now = now_ts();
     let camera_id = CameraId::new(1);
@@ -1409,7 +1412,7 @@ async fn startup_housekeeping_removes_stale_parts_and_recovers_leases() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, _pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-housekeeping",
         &format!("{}/picture/1", mock_server.uri()),
@@ -1539,7 +1542,7 @@ async fn worker_http_500_exhausted_becomes_failed() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, _pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-500-failed",
         &format!("{}/picture/1", mock_server.uri()),
@@ -1595,7 +1598,7 @@ async fn worker_http_404_becomes_unavailable() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, _pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-404",
         &format!("{}/picture/1", mock_server.uri()),
@@ -1652,7 +1655,7 @@ async fn worker_http_410_becomes_unavailable() {
     let output_dir = temp_dir.path().join("output");
     std::fs::create_dir(&output_dir).unwrap();
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, _pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-410",
         &format!("{}/picture/1", mock_server.uri()),
@@ -1749,7 +1752,7 @@ async fn interrupted_transfer_cleans_up_part_file() {
         let _ = conn.shutdown().await;
     });
 
-    let (ops, _image_id) = seed_pending_image_at(
+    let (ops, _pool, _image_id) = seed_pending_image_at(
         &db_path,
         "key-interrupted",
         &format!("{}/picture/1", server_url),
@@ -2026,7 +2029,7 @@ async fn interrupted_body_transfer_url_safety() {
         server_url
     );
 
-    let (ops, _image_id) =
+    let (ops, _pool, _image_id) =
         seed_pending_image_at(&db_path, "key-interrupted-url-safety", &sentinel_playback).await;
 
     let config = make_nvr_config(&server_url);
@@ -2254,7 +2257,7 @@ fn past_ts(hours: i32) -> Timestamp {
 
 /// Make a retry_wait image immediately claimable by setting
 /// download_next_attempt_at to a past timestamp.
-async fn make_claimable(ops: &DatabaseOps, image_id: ImageId) {
+async fn make_claimable(pool: &SqlitePool, image_id: ImageId) {
     let past = past_ts(1);
     let dt = past
         .as_datetime()
@@ -2262,7 +2265,7 @@ async fn make_claimable(ops: &DatabaseOps, image_id: ImageId) {
     sqlx::query("UPDATE images SET download_next_attempt_at = ?")
         .bind(&dt)
         .bind(image_id.get())
-        .execute(ops.pool())
+        .execute(pool)
         .await
         .unwrap();
 }

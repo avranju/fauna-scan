@@ -16,12 +16,189 @@ use crate::error::{AppError, AppResult, ErrorCategory};
 
 pub use paths::{
     XdgPaths, resolve_real_xdg, resolve_real_xdg_config_path, resolve_real_xdg_state_path,
-    validate_filesystem_paths,
+    validate_database_and_output_paths, validate_filesystem_paths,
 };
 pub use secret::{Secret, SecretSource};
 
 mod paths;
 mod secret;
+
+// ── Database configuration ───────────────────────────────────────────────
+
+/// Resolved database backend configuration.
+#[derive(Debug, Clone)]
+pub enum DatabaseConfig {
+    /// SQLite backend with a local file path.
+    Sqlite { path: PathBuf, max_connections: u32 },
+    /// PostgreSQL backend with a connection URL.
+    #[cfg(feature = "postgres")]
+    Postgres { url: Secret, max_connections: u32 },
+}
+
+/// Raw database configuration fields from TOML.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RawDatabaseConfig {
+    pub backend: Option<String>,
+    pub path: Option<String>,
+    pub max_connections: Option<u32>,
+    pub url: Option<String>,
+    pub url_file: Option<PathBuf>,
+    pub url_env: Option<String>,
+}
+
+impl RawDatabaseConfig {
+    /// Resolve raw database config into a validated `DatabaseConfig`.
+    pub fn resolve<F>(
+        self,
+        legacy_database_path: Option<&str>,
+        get_env: &F,
+        xdg_state: &Path,
+    ) -> AppResult<DatabaseConfig>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let backend = self.backend.as_deref().unwrap_or("sqlite");
+        let max_connections = self.max_connections.unwrap_or(8);
+        if max_connections == 0 {
+            return Err(AppError::new(
+                ErrorCategory::Configuration,
+                "resolve_database_config",
+                "database.max_connections must be greater than zero",
+            ));
+        }
+
+        match backend {
+            "sqlite" | "" => {
+                // Resolve path: explicit > legacy > XDG default
+                let path = match self.path {
+                    Some(p) => {
+                        if legacy_database_path.is_some() {
+                            return Err(AppError::new(
+                                ErrorCategory::Configuration,
+                                "resolve_database_config",
+                                "cannot specify both [database].path and general.database_path",
+                            ));
+                        }
+                        PathBuf::from(p)
+                    }
+                    None => {
+                        if let Some(legacy) = legacy_database_path {
+                            PathBuf::from(legacy)
+                        } else {
+                            // resolve_real_xdg_state_path already includes the filename
+                            xdg_state.to_path_buf()
+                        }
+                    }
+                };
+                Ok(DatabaseConfig::Sqlite {
+                    path,
+                    max_connections,
+                })
+            }
+            #[cfg(feature = "postgres")]
+            "postgres" | "postgresql" => {
+                // PostgreSQL requires exactly one URL source
+                let url_literal = self.url;
+                let url_file = self.url_file;
+                let url_env = self.url_env;
+                let sources = [url_literal.is_some(), url_file.is_some(), url_env.is_some()]
+                    .iter()
+                    .filter(|&&b| b)
+                    .count();
+                if sources == 0 {
+                    return Err(AppError::new(
+                        ErrorCategory::Configuration,
+                        "resolve_database_config",
+                        "PostgreSQL requires exactly one of: url, url_file, or url_env",
+                    ));
+                }
+                if sources > 1 {
+                    return Err(AppError::new(
+                        ErrorCategory::Configuration,
+                        "resolve_database_config",
+                        "PostgreSQL may only specify one URL source (url, url_file, or url_env)",
+                    ));
+                }
+                // Reject SQLite-specific fields for PostgreSQL
+                if self.path.is_some() {
+                    return Err(AppError::new(
+                        ErrorCategory::Configuration,
+                        "resolve_database_config",
+                        "PostgreSQL must not use [database].path",
+                    ));
+                }
+                if legacy_database_path.is_some() {
+                    return Err(AppError::new(
+                        ErrorCategory::Configuration,
+                        "resolve_database_config",
+                        "PostgreSQL must not use general.database_path",
+                    ));
+                }
+                let url_str = match (url_literal, url_file, url_env) {
+                    (Some(url), None, None) => url,
+                    (None, Some(file), None) => std::fs::read_to_string(&file).map_err(|e| {
+                        AppError::with_source(
+                            ErrorCategory::Configuration,
+                            "resolve_database_config",
+                            format!("cannot read url_file {}: {e}", file.display()),
+                            e,
+                        )
+                    })?,
+                    (None, None, Some(env)) => get_env(&env).ok_or_else(|| {
+                        AppError::new(
+                            ErrorCategory::Configuration,
+                            "resolve_database_config",
+                            format!("url_env variable '{}' is not set", env),
+                        )
+                    })?,
+                    _ => unreachable!(),
+                };
+                let url_str = url_str.trim().to_string();
+                let parsed = url_str.parse::<Url>().map_err(|_| {
+                    AppError::new(
+                        ErrorCategory::Configuration,
+                        "resolve_database_config",
+                        "database.url is not a valid URL",
+                    )
+                })?;
+                if parsed.scheme() != "postgres" && parsed.scheme() != "postgresql" {
+                    return Err(AppError::new(
+                        ErrorCategory::Configuration,
+                        "resolve_database_config",
+                        "database.url scheme must be postgres or postgresql",
+                    ));
+                }
+                if parsed.host().is_none() {
+                    return Err(AppError::new(
+                        ErrorCategory::Configuration,
+                        "resolve_database_config",
+                        "database.url must include a host",
+                    ));
+                }
+                if parsed.path().is_empty() || parsed.path() == "/" {
+                    return Err(AppError::new(
+                        ErrorCategory::Configuration,
+                        "resolve_database_config",
+                        "database.url must include a database name",
+                    ));
+                }
+                let secret = Secret::new(url_str);
+                Ok(DatabaseConfig::Postgres {
+                    url: secret,
+                    max_connections,
+                })
+            }
+            _ => Err(AppError::new(
+                ErrorCategory::Configuration,
+                "resolve_database_config",
+                format!(
+                    "unknown database backend: {backend} (expected sqlite, postgres, or postgresql)"
+                ),
+            )),
+        }
+    }
+}
 
 // ── Resolved configuration (returned by Config::load) ──────────────────────
 
@@ -30,6 +207,8 @@ mod secret;
 pub struct Config {
     /// General application settings.
     pub general: GeneralConfig,
+    /// Database backend configuration.
+    pub database: DatabaseConfig,
     /// NVR connection and operational settings.
     pub nvr: NvrConfig,
     /// Classifier (vision LLM) settings.
@@ -70,8 +249,6 @@ impl Default for WebConfig {
 /// Resolved general settings.
 #[derive(Debug, Clone)]
 pub struct GeneralConfig {
-    /// Path to the SQLite database.
-    pub database_path: PathBuf,
     /// Directory for downloaded images.
     pub output_directory: PathBuf,
     /// Application log level.
@@ -226,6 +403,8 @@ pub struct ClassifierEndpointConfig {
 struct RawConfig {
     #[serde(default)]
     general: RawGeneralConfig,
+    #[serde(default)]
+    database: RawDatabaseConfig,
     #[serde(default)]
     nvr: RawNvrConfig,
     #[serde(default)]
@@ -388,12 +567,26 @@ impl Config {
         // Resolve secrets using the real environment
         let get_env = |name: &str| std::env::var(name).ok();
 
-        // ── Resolve general ────────────────────────────────────────────────
-        // Defer state-path resolution until database_path actually needs it.
-        let database_path = match raw.general.database_path.as_ref() {
-            Some(p) => PathBuf::from(p),
-            None => resolve_real_xdg_state_path()?,
+        // ── Resolve database ───────────────────────────────────────────────
+        // Determine backend and whether we need XDG state for the default path.
+        // Only resolve XDG state when the backend is SQLite AND no explicit or
+        // legacy database path is configured.
+        let backend_hint = raw.database.backend.as_deref().unwrap_or("sqlite");
+        let has_explicit_path = raw.database.path.is_some();
+        let has_legacy_path = raw.general.database_path.is_some();
+        let needs_xdg_state = (backend_hint == "sqlite" || backend_hint.is_empty())
+            && !has_explicit_path
+            && !has_legacy_path;
+        let xdg_state = if needs_xdg_state {
+            resolve_real_xdg_state_path()?
+        } else {
+            // For PostgreSQL or when an explicit/legacy path is set, XDG state
+            // is not needed; provide a dummy path so resolve() can still run.
+            PathBuf::from("/dev/null")
         };
+        let database =
+            raw.database
+                .resolve(raw.general.database_path.as_deref(), &get_env, &xdg_state)?;
 
         let output_directory = raw.general.output_directory.as_ref().ok_or_else(|| {
             AppError::new(
@@ -410,8 +603,7 @@ impl Config {
             raw.general.non_wildlife_image_retention_days.unwrap_or(4);
 
         let general = GeneralConfig {
-            database_path,
-            output_directory,
+            output_directory: output_directory.clone(),
             log_level,
             non_wildlife_image_retention_days,
         };
@@ -537,6 +729,7 @@ impl Config {
 
         let config = Config {
             general,
+            database,
             nvr,
             classifier,
             web,
@@ -547,10 +740,7 @@ impl Config {
         validate_config(&config)?;
 
         // ── Filesystem validation (non-mutating) ───────────────────────────
-        validate_filesystem_paths(
-            &config.general.database_path,
-            &config.general.output_directory,
-        )?;
+        validate_database_and_output_paths(&config.database, &config.general.output_directory)?;
 
         Ok(config)
     }
@@ -2944,7 +3134,13 @@ start_at = "2026-01-01T00:00:00Z"
         // Config loads without needing XDG state path resolution
         let config = Config::load(Some(&path)).unwrap();
         assert_eq!(config.nvr.scheme, "http"); // default
-        assert_eq!(config.general.database_path, db_path);
+        // Legacy general.database_path selects SQLite with the given path
+        assert!(
+            matches!(&config.database, crate::configuration::DatabaseConfig::Sqlite { path, .. } if path == &db_path),
+            "expected SQLite config with path {}, got {:?}",
+            db_path.display(),
+            config.database
+        );
     }
 
     #[test]

@@ -1,8 +1,12 @@
 # Copy this file to config.toml beside docker-compose.yml and replace the
 # NVR/classifier placeholders. Secret paths refer to Compose-managed secrets.
 
+[database]
+backend = "sqlite"
+path = "/var/lib/fauna-scan/fauna-scan.sqlite3"
+max_connections = 8
+
 [general]
-database_path = "/var/lib/fauna-scan/fauna-scan.sqlite3"
 output_directory = "/var/lib/fauna-scan/images"
 log_level = "info"
 # Number of days to retain images classified as not containing wildlife.

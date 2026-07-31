@@ -47,7 +47,7 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
 async fn handle_web(config_path: Option<&Path>) -> AppResult<()> {
     let config = Config::load(config_path)?;
     create_runtime_directories(&config)?;
-    let database = Database::open(&config.general.database_path).await?;
+    let database = Database::connect(&config.database).await?;
     let transport = Arc::new(NvrTransport::from_config(&config.nvr)?);
     let state = crate::web::WebState::from_config(database.ops(), &config, transport);
     let shutdown = ShutdownToken::new();
@@ -94,7 +94,7 @@ async fn handle_discover(config_path: Option<&Path>) -> AppResult<()> {
     create_runtime_directories(&config)?;
 
     // Open the database (applies migrations)
-    let database = Database::open(&config.general.database_path).await?;
+    let database = Database::connect(&config.database).await?;
 
     // Build the NVR transport with Digest authentication
     let transport = NvrTransport::from_config(&config.nvr)?;
@@ -158,7 +158,7 @@ async fn handle_download(
     create_runtime_directories(&config)?;
 
     // Open the database (applies migrations)
-    let database = Database::open(&config.general.database_path).await?;
+    let database = Database::connect(&config.database).await?;
 
     // Build the NVR transport with Digest authentication
     let transport = NvrTransport::from_config(&config.nvr)?;
@@ -323,7 +323,7 @@ async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
     // Startup order: directories, database/migrations, lease recovery and
     // housekeeping, clients, initial discovery, then primary tasks.
     create_runtime_directories(&config)?;
-    let database = Database::open(&config.general.database_path).await?;
+    let database = Database::connect(&config.database).await?;
     let ops = database.ops();
     let recovery = ops
         .recover_expired_leases(&crate::domain::Timestamp::new(chrono::Utc::now()))
@@ -361,7 +361,7 @@ async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
-        database = %config.general.database_path.display(),
+        backend = backend_name(&config.database),
         output_directory = %config.general.output_directory.display(),
         "Fauna Scan service starting"
     );
@@ -466,7 +466,7 @@ async fn handle_run(config_path: Option<&Path>) -> AppResult<()> {
 /// Print grouped database state in a stable, exhaustive order.
 async fn handle_status(config_path: Option<&Path>) -> AppResult<()> {
     let config = Config::load(config_path)?;
-    let database = Database::open(&config.general.database_path).await?;
+    let database = Database::connect(&config.database).await?;
     let counts = database.ops().status_counts().await?;
 
     println!("Download status:");
@@ -539,13 +539,12 @@ fn is_recoverable_nvr_error(category: ErrorCategory) -> bool {
 /// configured output directory.  `check-config` does not call this,
 /// keeping it non-mutating.
 ///
-/// When the database path has no parent (e.g. a single-component relative
-/// path like `fauna-scan.sqlite3`), the current directory is used instead
-/// — no explicit directory creation is needed in that case.
+/// For SQLite, creates the database parent directory. For PostgreSQL, only
+/// creates the output directory.
 fn create_runtime_directories(config: &Config) -> AppResult<()> {
-    // Create database parent directory (skip if the path is a single-component
-    // relative path whose parent is "." — i.e. the current directory).
-    if let Some(db_parent) = config.general.database_path.parent()
+    // Create database parent directory only for SQLite.
+    if let crate::configuration::DatabaseConfig::Sqlite { path, .. } = &config.database
+        && let Some(db_parent) = path.parent()
         && db_parent != std::path::Path::new("")
     {
         std::fs::create_dir_all(db_parent).map_err(|e| {
@@ -579,6 +578,17 @@ fn create_runtime_directories(config: &Config) -> AppResult<()> {
     Ok(())
 }
 
+/// Return a human-readable backend name for logging.
+fn backend_name(database: &crate::configuration::DatabaseConfig) -> &'static str {
+    match database {
+        crate::configuration::DatabaseConfig::Sqlite { .. } => "sqlite",
+        #[cfg(feature = "postgres")]
+        crate::configuration::DatabaseConfig::Postgres { .. } => "postgres",
+        #[cfg(not(feature = "postgres"))]
+        _ => "postgres (not compiled)",
+    }
+}
+
 /// Handle the `scan` subcommand.
 ///
 /// Loads configuration, requires at least one enabled classifier endpoint **before**
@@ -598,7 +608,7 @@ async fn handle_scan(args: crate::cli::ScanArgs, config_path: Option<&Path>) -> 
     create_runtime_directories(&config)?;
 
     // Open the database (applies migrations).
-    let database = Database::open(&config.general.database_path).await?;
+    let database = Database::connect(&config.database).await?;
 
     // Build one client per endpoint.
     let classifiers = classifier_clients(&config.classifier)?;

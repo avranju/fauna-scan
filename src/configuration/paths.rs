@@ -523,6 +523,82 @@ pub fn validate_filesystem_paths(database_path: &Path, output_directory: &Path) 
     Ok(())
 }
 
+/// Validate database and output paths based on the resolved database config.
+///
+/// For SQLite, validates the database file path using the existing checks.
+/// For PostgreSQL, only validates the output directory (no filesystem checks
+/// for the database connection URL).
+pub fn validate_database_and_output_paths(
+    database: &crate::configuration::DatabaseConfig,
+    output_directory: &Path,
+) -> AppResult<()> {
+    match database {
+        crate::configuration::DatabaseConfig::Sqlite { path, .. } => {
+            validate_filesystem_paths(path, output_directory)
+        }
+        #[cfg(feature = "postgres")]
+        crate::configuration::DatabaseConfig::Postgres { .. } => {
+            // PostgreSQL does not need filesystem validation for the database.
+            // Only validate the output directory.
+            validate_output_directory(output_directory)
+        }
+    }
+}
+
+/// Validate only the output directory (for PostgreSQL or other backends
+/// that do not require a local database file).
+pub fn validate_output_directory(output_directory: &Path) -> AppResult<()> {
+    match output_directory.symlink_metadata() {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                match output_directory.metadata() {
+                    Ok(_) => {
+                        require_effective_directory_access(output_directory, "output_directory")?
+                    }
+                    Err(e) => {
+                        return Err(AppError::new(
+                            ErrorCategory::Filesystem,
+                            "validate_paths",
+                            format!(
+                                "output_directory is a broken symlink: {} ({})",
+                                output_directory.display(),
+                                safe_io_message(&e)
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                require_effective_directory_access(output_directory, "output_directory")?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let ancestor = nearest_existing_parent(output_directory).ok_or_else(|| {
+                AppError::new(
+                    ErrorCategory::Filesystem,
+                    "validate_paths",
+                    format!(
+                        "no existing parent directory for output_directory: {}",
+                        output_directory.display()
+                    ),
+                )
+            })?;
+            require_effective_directory_access(&ancestor, "output_directory parent")?;
+        }
+        Err(e) => {
+            return Err(AppError::new(
+                ErrorCategory::Filesystem,
+                "validate_paths",
+                format!(
+                    "cannot access output_directory {}: {}",
+                    output_directory.display(),
+                    safe_io_message(&e)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Strip potentially sensitive details from an io::Error message.
 fn safe_io_message(e: &std::io::Error) -> String {
     e.to_string()

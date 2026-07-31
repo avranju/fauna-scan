@@ -1,8 +1,50 @@
 # Fauna Scan
 
 Fauna Scan is a Linux Rust service that discovers Hikvision cameras, searches
-NVR picture metadata, downloads new JPEGs into SQLite-backed durable state, and
-classifies them through one or more OpenAI-compatible vision API endpoints.
+NVR picture metadata, downloads new JPEGs into a backend-neutral durable state
+(SQLite or PostgreSQL), and classifies them through one or more
+OpenAI-compatible vision API endpoints.
+
+## Data backend
+
+Fauna Scan stores all durable state behind a backend-neutral abstraction.
+The default backend is SQLite; PostgreSQL is available for deployments that
+require a shared database server.
+
+### SQLite (default)
+
+SQLite stores state in a single file. The default path is
+`${XDG_STATE_HOME:-$HOME/.local/state}/fauna-scan/fauna-scan.sqlite3`.  No
+external server is required.
+
+### PostgreSQL
+
+PostgreSQL stores state in a remote database server. Configure the backend
+with `config.postgres.example.toml` as a starting point.
+
+#### Secure URL configuration
+
+PostgreSQL credentials must never appear in logs, diagnostics, or committed
+configuration files. Choose exactly one secure source:
+
+| Source        | TOML field     | Example                                    |
+|---------------|----------------|--------------------------------------------|
+| Environment   | `url_env`      | `url_env = "FAUNA_SCAN_POSTGRES_URL"`      |
+| File          | `url_file`     | `url_file = "/run/secrets/postgres_url"`   |
+| Literal       | `url`          | Not recommended for production             |
+
+The connection URL must use the `postgres` or `postgresql` scheme and include
+a host and database name (e.g. `postgres://user@host:5432/fauna_scan`).
+
+#### Backend switching
+
+Switching between SQLite and PostgreSQL does **not** transfer existing data.
+Each backend maintains its own independent state. When you change the backend,
+Fauna Scan starts fresh on the selected backend. Back up the PostgreSQL
+database directly (e.g. with `pg_dump`) instead of copying SQLite files.
+
+Database migrations run automatically on first connect for the selected backend.
+Always back up your database before upgrading.
 
 ## Install and release verification
 
@@ -141,9 +183,10 @@ docker compose logs -f fauna-scan
 With the example Compose configuration, the dashboard is available only on
 the Docker host at `http://127.0.0.1:8787`.
 
-Set `general.database_path` and `general.output_directory` to the container
-paths already used by `config.docker.example.toml`. Compose persists those paths
-in the `fauna-scan-state` and `fauna-scan-images` named volumes. Classifier and
+Set `[database].path` (SQLite) or `[database].url_env` (PostgreSQL) and
+`general.output_directory` to the container paths already used by
+`config.docker.example.toml`. Compose persists those paths in the
+`fauna-scan-state` and `fauna-scan-images` named volumes. Classifier and
 NVR hostnames must be reachable from the container; `localhost` inside the
 container refers to Fauna Scan itself.
 
@@ -156,7 +199,9 @@ period and reuses the persistent volumes.
 The repository's `fauna-scan.service` is a user-level example. Its
 `ProtectHome=read-only` setting means the database and image directory must be
 listed in `ReadWritePaths`; adjust those directives to exactly match the
-configured paths before installation. Install and manage it with:
+configured paths before installation. For PostgreSQL deployments, no local
+database path is needed, but the output directory and any secret files must
+still be accessible. Install and manage it with:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -188,6 +233,7 @@ writable. With hardening enabled, check that every database and output path is
 covered by `ReadWritePaths`.
 
 Before an upgrade, stop the service, install the new binary, and start it
-again. SQLite migrations run automatically and failures are reported rather
-than ignored; retain a backup of the state database. The acceptance evidence
-for this release is in `docs/acceptance-checklist.md`.
+again. Migrations run automatically for the selected backend and failures are
+reported rather than ignored; retain a backup of the state database
+(SQLite file or `pg_dump` for PostgreSQL). The acceptance evidence for this
+release is in `docs/acceptance-checklist.md`.

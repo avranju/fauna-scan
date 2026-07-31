@@ -1,15 +1,32 @@
-# Fauna Scan example configuration. Replace every /home/user path and create
-# the referenced secret files before running `fauna-scan check-config`.
-# For each secret, use exactly one of literal, *_file, or *_env; file-backed
-# secrets are recommended for production and must never be committed.
+# Fauna Scan — PostgreSQL example configuration.
+#
+# This file configures Fauna Scan to use PostgreSQL as the durable state
+# backend.  PostgreSQL must be reachable and the database/schema must exist
+# before starting the service; migrations are applied automatically on first
+# connect.
+#
+# Secret sources:
+#   - url          : literal connection string (not recommended for production)
+#   - url_file     : path to a file containing the connection string
+#   - url_env      : environment variable name whose value is the connection string
+#
+# Exactly one source must be configured.  File or environment sources are
+# recommended for production so credentials are never committed.
+#
+# Switching between SQLite and PostgreSQL does not transfer data.  Each
+# backend maintains its own independent state.  Back up the PostgreSQL
+# database directly (e.g. with `pg_dump`) instead of copying SQLite files.
 
 [database]
-backend = "sqlite"
-path = "/home/user/.local/state/fauna-scan/fauna-scan.sqlite3"
-max_connections = 8
+backend = "postgres"
+# Choose exactly one of the following three options:
+# url = "postgres://user:password@localhost:5432/fauna_scan"
+# url_file = "/run/secrets/postgres_url"
+url_env = "FAUNA_SCAN_POSTGRES_URL"
+max_connections = 16
 
 [general]
-output_directory = "/home/user/Pictures/fauna-scan"
+output_directory = "/var/lib/fauna-scan/images"
 log_level = "info"
 # Number of days to retain images classified as not containing wildlife.
 # Images older than this (measured from capture time) and classified as
@@ -19,7 +36,7 @@ non_wildlife_image_retention_days = 4
 
 [web]
 enabled = true
-listen_address = "127.0.0.1:8787"
+listen_address = "0.0.0.0:8787"
 clip_pre_roll_seconds = 10
 clip_post_roll_seconds = 20
 maximum_clip_duration_seconds = 120
@@ -29,7 +46,7 @@ scheme = "http"
 host = "pigate"
 port = 8080
 username = "admin"
-password_file = "/home/user/.config/fauna-scan/nvr-password"
+password_file = "/run/secrets/nvr_password"
 # password, password_file, and password_env are mutually exclusive.
 start_at = "2026-07-11T00:00:00+05:30"
 request_timeout_seconds = 30
@@ -52,7 +69,6 @@ maximum_image_size_bytes = 25000000
 verify_jpeg = true
 rebase_playback_urls = true
 concurrency = 2
-# Only needed when rebase_playback_urls = false.
 playback_host_allowlist = []
 
 [classifier]
@@ -66,11 +82,10 @@ processing_lease_seconds = 600
 [[classifier.endpoints]]
 # Set to false to keep an endpoint configured but remove it from request rotation.
 enabled = true
-base_url = "http://localhost:8081/v1"
+base_url = "http://classifier:8081/v1"
 endpoint = "/chat/completions"
 model = "vision-model"
-api_key_file = "/home/user/.config/fauna-scan/classifier-api-key"
-# api_key, api_key_file, and api_key_env are mutually exclusive.
+api_key_file = "/run/secrets/classifier_api_key"
 username = ""
 # Set password_file (or password/password_env) only when Basic authentication is used.
 request_timeout_seconds = 120
@@ -92,6 +107,6 @@ max_tokens = 1000
 # max_images_per_request = 10
 
 # [[classifier.endpoints]]
-# base_url = "http://second-classifier:8081/v1"
+# base_url = "http://classifier-2:8081/v1"
 # model = "second-vision-model"
-# api_key_file = "/home/user/.config/fauna-scan/second-classifier-api-key"
+# api_key_file = "/run/secrets/classifier_2_api_key"

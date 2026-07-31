@@ -16,8 +16,8 @@ use chrono::{TimeZone, Utc};
 use fauna_scan::configuration::{
     ClassifierConfig, Config, GeneralConfig, NvrConfig, NvrDownloadConfig, NvrSearchConfig,
 };
-use fauna_scan::database::Database;
 use fauna_scan::database::models::*;
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::*;
 use fauna_scan::downloader::orchestration::{
     DownloaderOrchestrator, DownloaderOrchestratorOptions,
@@ -63,10 +63,13 @@ fn make_test_config(
 
     Config {
         general: GeneralConfig {
-            database_path: db_path.to_path_buf(),
             output_directory: output_dir.to_path_buf(),
             log_level: fauna_scan::cli::LogLevel::Info,
             non_wildlife_image_retention_days: 4,
+        },
+        database: fauna_scan::configuration::DatabaseConfig::Sqlite {
+            path: db_path.to_path_buf(),
+            max_connections: 4,
         },
         nvr: NvrConfig {
             scheme: scheme.to_string(),
@@ -125,7 +128,7 @@ async fn build_orchestrator(
     let config = make_test_config(mock_server, &db_path, &output_dir);
 
     // Open database
-    let database = Database::open(&db_path).await?;
+    let database = SqliteDataStore::connect(&db_path, 4).await?;
 
     // Build transport
     let transport = Arc::new(NvrTransport::from_config(&config.nvr)?);
@@ -377,7 +380,7 @@ fn validate_rejects_zero_search_concurrency() {
 async fn active_cameras_enumeration() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
     let now = ts(2026, 7, 11, 12, 0, 0);
 
@@ -402,7 +405,7 @@ async fn active_cameras_enumeration() {
 
     // Mark camera 2 inactive
     sqlx::query("UPDATE cameras SET enabled = 0 WHERE picture_track_id = '303'")
-        .execute(ops.pool())
+        .execute(db.pool())
         .await
         .unwrap();
 
@@ -418,7 +421,7 @@ async fn active_cameras_enumeration() {
 async fn overlap_window_does_not_regress_next_search_at() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
     let now = ts(2026, 7, 11, 12, 0, 0);
     let camera_id = CameraId::new(1);
@@ -508,7 +511,7 @@ async fn overlap_window_does_not_regress_next_search_at() {
 async fn successful_overlap_replay_clears_cursor_error() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
     let now = ts(2026, 7, 11, 12, 0, 0);
     let camera_id = CameraId::new(1);
@@ -573,7 +576,7 @@ async fn successful_overlap_replay_clears_cursor_error() {
 async fn overlap_deduplication_no_duplicate_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
     let now = ts(2026, 7, 11, 12, 0, 0);
     let camera_id = CameraId::new(1);
@@ -650,7 +653,7 @@ async fn overlap_deduplication_no_duplicate_rows() {
 
     // Still exactly one image row
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
     assert_eq!(count, 1);
@@ -1096,7 +1099,7 @@ async fn search_requests_respect_settlement_and_restart_overlap_is_idempotent() 
     let request_count_before_restart = first_searches.len();
 
     let db_path = temp_dir.path().join("test.db");
-    let database = Database::open(&db_path).await.unwrap();
+    let database = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let output_dir = temp_dir.path().join("output");
     let config = make_test_config(&server.uri(), &db_path, &output_dir);
     let transport = Arc::new(NvrTransport::from_config(&nvr).unwrap());
@@ -1149,7 +1152,7 @@ async fn search_requests_respect_settlement_and_restart_overlap_is_idempotent() 
         .unwrap();
     assert!(after.next_search_at >= before.next_search_at);
     let image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(database.ops().pool())
+        .fetch_one(database.pool())
         .await
         .unwrap();
     assert_eq!(image_count, 1);

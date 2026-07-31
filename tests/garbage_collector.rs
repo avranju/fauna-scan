@@ -5,14 +5,16 @@
 //! and cancellation behavior.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use fauna_scan::database::Database;
 use fauna_scan::database::repository::DatabaseOps;
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::*;
 use fauna_scan::garbage_collector;
 use fauna_scan::service_lifecycle::ShutdownToken;
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 fn now_ts() -> Timestamp {
@@ -33,7 +35,7 @@ fn format_ts(ts: &Timestamp) -> String {
 }
 
 async fn insert_image(
-    ops: &DatabaseOps,
+    pool: &SqlitePool,
     image_id: i64,
     image_key: &str,
     capture_start: &Timestamp,
@@ -78,12 +80,12 @@ async fn insert_image(
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(pool)
     .await
     .unwrap();
 }
 
-async fn insert_classification(ops: &DatabaseOps, image_id: i64, contains_wildlife: bool) {
+async fn insert_classification(pool: &SqlitePool, image_id: i64, contains_wildlife: bool) {
     let now = now_ts();
     let now_str = format_ts(&now);
     let wildlife = if contains_wildlife { 1 } else { 0 };
@@ -100,19 +102,28 @@ async fn insert_classification(ops: &DatabaseOps, image_id: i64, contains_wildli
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(pool)
     .await
     .unwrap();
 }
 
-async fn setup_db(dir: &TempDir) -> (PathBuf, DatabaseOps, PathBuf) {
+async fn setup_db(
+    dir: &TempDir,
+) -> (
+    PathBuf,
+    Arc<SqliteDataStore>,
+    DatabaseOps,
+    SqlitePool,
+    PathBuf,
+) {
     let db_path = dir.path().join("test.db");
     let output_dir = dir.path().join("output");
     std::fs::create_dir_all(&output_dir).unwrap();
 
     // Create a camera record
-    let db = Database::open(&db_path).await.unwrap();
-    let ops = db.ops();
+    let store = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let pool = store.pool().clone();
+    let ops = store.ops();
     let now = now_ts();
     let now_str = format_ts(&now);
 
@@ -125,24 +136,24 @@ async fn setup_db(dir: &TempDir) -> (PathBuf, DatabaseOps, PathBuf) {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
 
-    (db_path, ops, output_dir)
+    (db_path, Arc::new(store), ops, pool, output_dir)
 }
 
 #[tokio::test]
 async fn old_negative_image_is_collected() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24); // 5 days ago
     let file_path = output_dir.join("old.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "old-img",
         &old_capture,
@@ -151,7 +162,7 @@ async fn old_negative_image_is_collected() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400); // 4 days
     let now = now_ts();
@@ -183,14 +194,14 @@ async fn old_negative_image_is_collected() {
 #[tokio::test]
 async fn positive_wildlife_image_is_not_collected() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
     let file_path = output_dir.join("wildlife.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "wildlife-img",
         &old_capture,
@@ -199,7 +210,7 @@ async fn positive_wildlife_image_is_not_collected() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, true).await;
+    insert_classification(&pool, 1, true).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -223,14 +234,14 @@ async fn positive_wildlife_image_is_not_collected() {
 #[tokio::test]
 async fn any_positive_classification_prevents_collection() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
     let file_path = output_dir.join("mixed.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "mixed-img",
         &old_capture,
@@ -252,7 +263,7 @@ async fn any_positive_classification_prevents_collection() {
     .bind(format_ts(&now_ts()))
     .bind(format_ts(&now_ts()))
     .bind(format_ts(&now_ts()))
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
@@ -266,7 +277,7 @@ async fn any_positive_classification_prevents_collection() {
     .bind(format_ts(&now_ts()))
     .bind(format_ts(&now_ts()))
     .bind(format_ts(&now_ts()))
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
 
@@ -292,14 +303,14 @@ async fn any_positive_classification_prevents_collection() {
 #[tokio::test]
 async fn recent_image_is_not_collected() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let recent_capture = past_ts(2); // 2 hours ago
     let file_path = output_dir.join("recent.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "recent-img",
         &recent_capture,
@@ -308,7 +319,7 @@ async fn recent_image_is_not_collected() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -332,7 +343,7 @@ async fn recent_image_is_not_collected() {
 #[tokio::test]
 async fn boundary_capture_time_is_not_collected() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     // Exactly at the cutoff boundary (4 days ago) — should NOT be collected
     // because capture_start_at must be strictly less than cutoff.
@@ -341,7 +352,7 @@ async fn boundary_capture_time_is_not_collected() {
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "boundary-img",
         &cutoff,
@@ -350,7 +361,7 @@ async fn boundary_capture_time_is_not_collected() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -374,14 +385,14 @@ async fn boundary_capture_time_is_not_collected() {
 #[tokio::test]
 async fn non_done_processing_is_not_collected() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
     let file_path = output_dir.join("unprocessed.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "unprocessed-img",
         &old_capture,
@@ -413,14 +424,14 @@ async fn non_done_processing_is_not_collected() {
 #[tokio::test]
 async fn missing_file_is_reconciled() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
     let file_path = output_dir.join("missing.jpg");
     // Don't create the file — simulate already missing
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "missing-img",
         &old_capture,
@@ -429,7 +440,7 @@ async fn missing_file_is_reconciled() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -457,14 +468,14 @@ async fn missing_file_is_reconciled() {
 #[tokio::test]
 async fn metadata_is_preserved_after_collection() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
     let file_path = output_dir.join("metadata.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "metadata-img",
         &old_capture,
@@ -473,7 +484,7 @@ async fn metadata_is_preserved_after_collection() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -513,14 +524,14 @@ async fn metadata_is_preserved_after_collection() {
 #[tokio::test]
 async fn idempotent_collection_clears_already_cleared() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
     let file_path = output_dir.join("idempotent.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "idempotent-img",
         &old_capture,
@@ -529,7 +540,7 @@ async fn idempotent_collection_clears_already_cleared() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -566,14 +577,14 @@ async fn idempotent_collection_clears_already_cleared() {
 #[tokio::test]
 async fn shutdown_prevents_collection() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
     let file_path = output_dir.join("shutdown.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "shutdown-img",
         &old_capture,
@@ -582,7 +593,7 @@ async fn shutdown_prevents_collection() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -617,8 +628,9 @@ async fn collection_works_with_symlinked_output_root() {
     std::os::unix::fs::symlink(&real_output, &symlink_output).unwrap();
 
     // Create a camera record
-    let db = Database::open(&db_path).await.unwrap();
-    let ops = db.ops();
+    let store = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let pool = store.pool().clone();
+    let ops = store.ops();
     let now = now_ts();
     let now_str = format_ts(&now);
 
@@ -631,7 +643,7 @@ async fn collection_works_with_symlinked_output_root() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
 
@@ -642,7 +654,7 @@ async fn collection_works_with_symlinked_output_root() {
     // Store the path under the symlink alias (as the database would).
     let symlink_path = symlink_output.join("old.jpg");
     insert_image(
-        &ops,
+        &pool,
         1,
         "symlink-img",
         &old_capture,
@@ -651,7 +663,7 @@ async fn collection_works_with_symlinked_output_root() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let shutdown = ShutdownToken::new();
@@ -683,7 +695,7 @@ async fn path_traversal_candidate_is_not_collected() {
     // the filesystem safety checks and reported as a filesystem failure,
     // allowing other candidates to continue.
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
 
@@ -700,7 +712,7 @@ async fn path_traversal_candidate_is_not_collected() {
     // This simulates a malicious or corrupted database entry.
     let traversal_path = negative_dir.join("../camera-1/wildlife.jpg");
     insert_image(
-        &ops,
+        &pool,
         1,
         "traversal-img",
         &old_capture,
@@ -709,7 +721,7 @@ async fn path_traversal_candidate_is_not_collected() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -748,7 +760,7 @@ async fn path_traversal_candidate_is_not_collected() {
 #[tokio::test]
 async fn failure_isolation_continues_after_filesystem_error() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
 
@@ -764,7 +776,7 @@ async fn failure_isolation_continues_after_filesystem_error() {
     // Insert a failing candidate (path traversal) at ID 1.
     let traversal_path = negative_dir.join("../camera-1/wildlife.jpg");
     insert_image(
-        &ops,
+        &pool,
         1,
         "traversal-img",
         &old_capture,
@@ -773,13 +785,13 @@ async fn failure_isolation_continues_after_filesystem_error() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     // Insert a valid candidate at ID 2.
     let valid_file_path = output_dir.join("valid.jpg");
     std::fs::write(&valid_file_path, "jpeg-data").unwrap();
     insert_image(
-        &ops,
+        &pool,
         2,
         "valid-img",
         &old_capture,
@@ -788,7 +800,7 @@ async fn failure_isolation_continues_after_filesystem_error() {
         "done",
     )
     .await;
-    insert_classification(&ops, 2, false).await;
+    insert_classification(&pool, 2, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -830,7 +842,7 @@ async fn failure_isolation_continues_after_filesystem_error() {
 #[tokio::test]
 async fn collector_pagination_exceeds_batch_size() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
 
@@ -839,7 +851,7 @@ async fn collector_pagination_exceeds_batch_size() {
         let file_path = output_dir.join(format!("img-{}.jpg", id));
         std::fs::write(&file_path, "jpeg-data").unwrap();
         insert_image(
-            &ops,
+            &pool,
             id as i64,
             &format!("img-{}", id),
             &old_capture,
@@ -848,7 +860,7 @@ async fn collector_pagination_exceeds_batch_size() {
             "done",
         )
         .await;
-        insert_classification(&ops, id as i64, false).await;
+        insert_classification(&pool, id as i64, false).await;
     }
 
     let retention = Duration::from_secs(4 * 86_400);
@@ -898,7 +910,7 @@ async fn collector_pagination_exceeds_batch_size() {
 #[tokio::test]
 async fn cancellation_during_sweep_returns_partial_report() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
 
@@ -908,7 +920,7 @@ async fn cancellation_during_sweep_returns_partial_report() {
         let file_path = output_dir.join(format!("cancel-{}.jpg", id));
         std::fs::write(&file_path, "jpeg-data").unwrap();
         insert_image(
-            &ops,
+            &pool,
             id as i64,
             &format!("cancel-{}", id),
             &old_capture,
@@ -917,7 +929,7 @@ async fn cancellation_during_sweep_returns_partial_report() {
             "done",
         )
         .await;
-        insert_classification(&ops, id as i64, false).await;
+        insert_classification(&pool, id as i64, false).await;
     }
 
     let retention = Duration::from_secs(4 * 86_400);
@@ -997,8 +1009,9 @@ async fn canonical_path_sharing_symlink_root_preserves_wildlife() {
     std::os::unix::fs::symlink(&real_output, &symlink_output).unwrap();
 
     // Create a camera record
-    let db = Database::open(&db_path).await.unwrap();
-    let ops = db.ops();
+    let store = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let pool = store.pool().clone();
+    let ops = store.ops();
     let now = now_ts();
     let now_str = format_ts(&now);
 
@@ -1011,7 +1024,7 @@ async fn canonical_path_sharing_symlink_root_preserves_wildlife() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
 
@@ -1025,7 +1038,7 @@ async fn canonical_path_sharing_symlink_root_preserves_wildlife() {
     // Insert a wildlife-positive image that references the file via the
     // real output root.
     insert_image(
-        &ops,
+        &pool,
         1,
         "wildlife-shared",
         &old_capture,
@@ -1034,11 +1047,11 @@ async fn canonical_path_sharing_symlink_root_preserves_wildlife() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, true).await;
+    insert_classification(&pool, 1, true).await;
     // Simulate a pre-0007 wildlife row with no cached identity. The
     // negative row below uses a distinct symlink-alias string.
     sqlx::query("UPDATE images SET local_file_identity = NULL WHERE id = 1")
-        .execute(ops.pool())
+        .execute(&pool)
         .await
         .unwrap();
 
@@ -1046,7 +1059,7 @@ async fn canonical_path_sharing_symlink_root_preserves_wildlife() {
     // symlinked output root (different string path, same canonical file).
     let symlink_path = symlink_output.join("shared.jpg");
     insert_image(
-        &ops,
+        &pool,
         2,
         "negative-shared",
         &old_capture,
@@ -1055,7 +1068,7 @@ async fn canonical_path_sharing_symlink_root_preserves_wildlife() {
         "done",
     )
     .await;
-    insert_classification(&ops, 2, false).await;
+    insert_classification(&pool, 2, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let shutdown = ShutdownToken::new();
@@ -1115,8 +1128,9 @@ async fn canonical_path_sharing_reverse_symlink_preserves_wildlife() {
     std::os::unix::fs::symlink(&real_output, &symlink_output).unwrap();
 
     // Create a camera record
-    let db = Database::open(&db_path).await.unwrap();
-    let ops = db.ops();
+    let store = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let pool = store.pool().clone();
+    let ops = store.ops();
     let now = now_ts();
     let now_str = format_ts(&now);
 
@@ -1129,7 +1143,7 @@ async fn canonical_path_sharing_reverse_symlink_preserves_wildlife() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
 
@@ -1144,7 +1158,7 @@ async fn canonical_path_sharing_reverse_symlink_preserves_wildlife() {
     // SYMLINK alias (opposite direction from the previous test).
     let symlink_path = symlink_output.join("shared.jpg");
     insert_image(
-        &ops,
+        &pool,
         1,
         "wildlife-symlink",
         &old_capture,
@@ -1153,13 +1167,13 @@ async fn canonical_path_sharing_reverse_symlink_preserves_wildlife() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, true).await;
+    insert_classification(&pool, 1, true).await;
 
     // Insert a no-wildlife image that references the same file via the
     // REAL (canonical) output root.
     let real_path = real_output.join("shared.jpg");
     insert_image(
-        &ops,
+        &pool,
         2,
         "negative-real",
         &old_capture,
@@ -1168,7 +1182,7 @@ async fn canonical_path_sharing_reverse_symlink_preserves_wildlife() {
         "done",
     )
     .await;
-    insert_classification(&ops, 2, false).await;
+    insert_classification(&pool, 2, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let shutdown = ShutdownToken::new();
@@ -1222,8 +1236,9 @@ async fn canonical_path_sharing_relative_absolute_preserves_wildlife() {
     std::fs::create_dir_all(&output).unwrap();
 
     // Create a camera record
-    let db = Database::open(&db_path).await.unwrap();
-    let ops = db.ops();
+    let store = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let pool = store.pool().clone();
+    let ops = store.ops();
     let now = now_ts();
     let now_str = format_ts(&now);
 
@@ -1236,7 +1251,7 @@ async fn canonical_path_sharing_relative_absolute_preserves_wildlife() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
 
@@ -1253,7 +1268,7 @@ async fn canonical_path_sharing_relative_absolute_preserves_wildlife() {
     // Insert a wildlife-positive image that references the file via the
     // absolute path.
     insert_image(
-        &ops,
+        &pool,
         1,
         "wildlife-abs",
         &old_capture,
@@ -1265,10 +1280,10 @@ async fn canonical_path_sharing_relative_absolute_preserves_wildlife() {
     // Simulate a pre-0007 row: the positive image has no persisted identity,
     // so collection must reconcile it before trusting aliases.
     sqlx::query("UPDATE images SET local_file_identity = NULL WHERE id = 1")
-        .execute(ops.pool())
+        .execute(&pool)
         .await
         .unwrap();
-    insert_classification(&ops, 1, true).await;
+    insert_classification(&pool, 1, true).await;
 
     // Insert a no-wildlife image that references the same file via a
     // relative path (relative to the parent of output).
@@ -1298,7 +1313,7 @@ async fn canonical_path_sharing_relative_absolute_preserves_wildlife() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
@@ -1312,7 +1327,7 @@ async fn canonical_path_sharing_relative_absolute_preserves_wildlife() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
 
@@ -1374,8 +1389,9 @@ async fn retargeted_output_alias_preserves_legacy_wildlife_bytes() {
     std::fs::create_dir_all(&disk2).unwrap();
     std::os::unix::fs::symlink(&disk1, &output_alias).unwrap();
 
-    let db = Database::open(&db_path).await.unwrap();
-    let ops = db.ops();
+    let store = SqliteDataStore::connect(&db_path, 4).await.unwrap();
+    let pool = store.pool().clone();
+    let ops = store.ops();
     let now = now_ts();
     let now_str = format_ts(&now);
     sqlx::query(
@@ -1387,7 +1403,7 @@ async fn retargeted_output_alias_preserves_legacy_wildlife_bytes() {
     .bind(&now_str)
     .bind(&now_str)
     .bind(&now_str)
-    .execute(ops.pool())
+    .execute(&pool)
     .await
     .unwrap();
 
@@ -1397,7 +1413,7 @@ async fn retargeted_output_alias_preserves_legacy_wildlife_bytes() {
     std::fs::write(&old_path, wildlife_bytes).unwrap();
     let positive_alias_path = output_alias.join("shared.jpg");
     insert_image(
-        &ops,
+        &pool,
         1,
         "legacy-wildlife",
         &old_capture,
@@ -1406,14 +1422,14 @@ async fn retargeted_output_alias_preserves_legacy_wildlife_bytes() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, true).await;
+    insert_classification(&pool, 1, true).await;
 
     // Reproduce the pre-0007 state: local_path is the alias while its
     // canonical identity points at the old target.
     let stale_identity = old_path.to_str().unwrap();
     sqlx::query("UPDATE images SET local_file_identity = ? WHERE id = 1")
         .bind(stale_identity)
-        .execute(ops.pool())
+        .execute(&pool)
         .await
         .unwrap();
 
@@ -1423,7 +1439,7 @@ async fn retargeted_output_alias_preserves_legacy_wildlife_bytes() {
 
     let current_path = disk2.join("shared.jpg");
     insert_image(
-        &ops,
+        &pool,
         2,
         "aliased-negative",
         &old_capture,
@@ -1432,7 +1448,7 @@ async fn retargeted_output_alias_preserves_legacy_wildlife_bytes() {
         "done",
     )
     .await;
-    insert_classification(&ops, 2, false).await;
+    insert_classification(&pool, 2, false).await;
 
     let report = garbage_collector::collect_non_wildlife_images(
         &ops,
@@ -1470,7 +1486,7 @@ async fn retargeted_output_alias_preserves_legacy_wildlife_bytes() {
 #[tokio::test]
 async fn shared_wildlife_file_is_preserved() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
 
     let old_capture = past_ts(5 * 24);
 
@@ -1481,7 +1497,7 @@ async fn shared_wildlife_file_is_preserved() {
 
     // Insert a no-wildlife image (candidate) at ID 1.
     insert_image(
-        &ops,
+        &pool,
         1,
         "negative-candidate",
         &old_capture,
@@ -1490,11 +1506,11 @@ async fn shared_wildlife_file_is_preserved() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
 
     // Insert a no-wildlife image (candidate) at ID 2.
     insert_image(
-        &ops,
+        &pool,
         2,
         "negative-candidate-2",
         &old_capture,
@@ -1503,7 +1519,7 @@ async fn shared_wildlife_file_is_preserved() {
         "done",
     )
     .await;
-    insert_classification(&ops, 2, false).await;
+    insert_classification(&pool, 2, false).await;
 
     let retention = Duration::from_secs(4 * 86_400);
     let now = now_ts();
@@ -1511,7 +1527,7 @@ async fn shared_wildlife_file_is_preserved() {
 
     // Insert a wildlife-positive image at ID 3 that references the same file.
     insert_image(
-        &ops,
+        &pool,
         3,
         "wildlife-candidate",
         &old_capture,
@@ -1520,7 +1536,7 @@ async fn shared_wildlife_file_is_preserved() {
         "done",
     )
     .await;
-    insert_classification(&ops, 3, true).await;
+    insert_classification(&pool, 3, true).await;
 
     let report = garbage_collector::collect_non_wildlife_images(
         &ops,
@@ -1555,13 +1571,13 @@ async fn shared_wildlife_file_is_preserved() {
 #[tokio::test]
 async fn classification_committed_at_unlink_boundary_preserves_shared_file() {
     let dir = tempfile::tempdir().unwrap();
-    let (_db_path, ops, output_dir) = setup_db(&dir).await;
+    let (_db_path, _store, ops, pool, output_dir) = setup_db(&dir).await;
     let old_capture = past_ts(5 * 24);
     let file_path = output_dir.join("boundary.jpg");
     std::fs::write(&file_path, "jpeg-data").unwrap();
 
     insert_image(
-        &ops,
+        &pool,
         1,
         "boundary-negative",
         &old_capture,
@@ -1570,11 +1586,11 @@ async fn classification_committed_at_unlink_boundary_preserves_shared_file() {
         "done",
     )
     .await;
-    insert_classification(&ops, 1, false).await;
+    insert_classification(&pool, 1, false).await;
     // This row shares the bytes but is not a candidate until it receives a
     // classification at the controlled boundary.
     insert_image(
-        &ops,
+        &pool,
         2,
         "boundary-wildlife",
         &old_capture,
@@ -1604,7 +1620,7 @@ async fn classification_committed_at_unlink_boundary_preserves_shared_file() {
     });
 
     hook.wait_for_candidate().await;
-    insert_classification(&ops, 2, true).await;
+    insert_classification(&pool, 2, true).await;
     hook.release_candidate();
     // The collector will pause at the end of its short batch; release that
     // barrier as well so the task can finish.
@@ -1624,10 +1640,13 @@ async fn classification_committed_at_unlink_boundary_preserves_shared_file() {
 fn scanner_options_rejects_zero_retention() {
     let config = fauna_scan::configuration::Config {
         general: fauna_scan::configuration::GeneralConfig {
-            database_path: PathBuf::from("/tmp/test.db"),
             output_directory: PathBuf::from("/tmp/output"),
             log_level: fauna_scan::cli::LogLevel::Error,
             non_wildlife_image_retention_days: 0,
+        },
+        database: fauna_scan::configuration::DatabaseConfig::Sqlite {
+            path: PathBuf::from("/tmp/test.db"),
+            max_connections: 4,
         },
         nvr: fauna_scan::configuration::NvrConfig {
             scheme: "http".to_string(),

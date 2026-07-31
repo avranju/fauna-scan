@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use crate::database::repository::DatabaseOps;
+use crate::database::repository::{DatabaseOps, GcOperation, GcOutcome};
 use crate::domain::ImageId;
 use crate::domain::Timestamp;
 use crate::error::{AppError, AppResult, ErrorCategory};
@@ -261,27 +261,27 @@ pub async fn collect_non_wildlife_images(
 
             let candidate_path = candidate.local_path.clone();
             let output_root = output_directory.to_path_buf();
+            let operation: GcOperation = Box::new(move || {
+                Box::pin(async move {
+                    match filesystem::remove_managed_image_file(&output_root, &candidate_path).await
+                    {
+                        Ok(LocalFileRemoval::Removed) => Ok(GcOutcome::Removed),
+                        Ok(LocalFileRemoval::AlreadyMissing) => Ok(GcOutcome::AlreadyMissing),
+                        Err(e) => Err(e),
+                    }
+                })
+            });
             let collection_result = database
-                .with_gc_candidate(
-                    candidate,
-                    &cutoff,
-                    canonical_identity.as_deref(),
-                    move || async move {
-                        filesystem::remove_managed_image_file(&output_root, &candidate_path).await
-                    },
-                )
+                .with_gc_candidate(candidate, &cutoff, canonical_identity.as_deref(), operation)
                 .await;
 
             match collection_result {
-                Ok(None) => {
+                Err(e) if e.category == ErrorCategory::Database => {
+                    // Ineligible or shared-wildlife — advance cursor and continue.
                     tracing::debug!(
                         image_id = candidate.image_id.get(),
                         "Candidate became ineligible or shares a wildlife-positive file"
                     );
-                }
-                Ok(Some(LocalFileRemoval::Removed)) => report.files_removed += 1,
-                Ok(Some(LocalFileRemoval::AlreadyMissing)) => {
-                    report.missing_files_reconciled += 1;
                 }
                 Err(e) if e.category == ErrorCategory::Filesystem => {
                     tracing::warn!(
@@ -291,6 +291,8 @@ pub async fn collect_non_wildlife_images(
                     );
                     report.filesystem_failures += 1;
                 }
+                Ok(GcOutcome::Removed) => report.files_removed += 1,
+                Ok(GcOutcome::AlreadyMissing) => report.missing_files_reconciled += 1,
                 Err(e) => return Err(e),
             }
 

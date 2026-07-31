@@ -6,7 +6,7 @@
 
 use assert_cmd::Command;
 use fauna_scan::configuration::{NvrConfig, NvrDownloadConfig, NvrSearchConfig};
-use fauna_scan::database::{Database, models::ServiceMetadataKey};
+use fauna_scan::database::{models::ServiceMetadataKey, sqlite::SqliteDataStore};
 use fauna_scan::domain::Timestamp;
 use fauna_scan::error::{AppResult, ErrorCategory};
 use fauna_scan::nvr::{CameraDiscoveryClient, NvrTransport};
@@ -72,7 +72,7 @@ async fn build_transport(config: &NvrConfig) -> AppResult<NvrTransport> {
 
 /// Seed a database at the given path with an enabled camera and a metadata value.
 async fn seed_discovered_camera_at(db_path: &std::path::Path) -> Timestamp {
-    let db = Database::open(db_path).await.unwrap();
+    let db = SqliteDataStore::connect(db_path, 4).await.unwrap();
     let observed = now_ts();
 
     // Sync one camera so it exists as enabled.
@@ -269,7 +269,7 @@ start_at = "2026-07-11T00:00:00Z"
     let _observed = seed_discovered_camera_at(&db_path).await;
 
     // Verify initial state by reopening.
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let enabled_before: i64 =
         sqlx::query_scalar("SELECT enabled FROM cameras WHERE picture_track_id = '103'")
             .fetch_one(db.pool())
@@ -300,7 +300,7 @@ start_at = "2026-07-11T00:00:00Z"
         .stderr(predicate::str::contains("parse_camera_discovery_xml"));
 
     // Reopen the database and verify state is unchanged.
-    let db2 = Database::open(&db_path).await.unwrap();
+    let db2 = SqliteDataStore::connect(&db_path, 4).await.unwrap();
 
     let enabled_after: i64 =
         sqlx::query_scalar("SELECT enabled FROM cameras WHERE picture_track_id = '103'")
@@ -424,7 +424,7 @@ async fn discover_sync_and_deactivation() {
     // Seed a database.
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
 
     // First sync: two cameras.
     let cameras1 = client.discover().await.unwrap();
@@ -497,7 +497,7 @@ async fn discover_metadata_persistence() {
 
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
 
     // Discover and sync.
     let cameras = client.discover().await.unwrap();

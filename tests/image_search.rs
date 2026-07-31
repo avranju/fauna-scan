@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use fauna_scan::configuration::{NvrConfig, NvrDownloadConfig, NvrSearchConfig};
-use fauna_scan::database::Database;
 use fauna_scan::database::models::*;
 use fauna_scan::database::repository::DatabaseOps;
+use fauna_scan::database::sqlite::SqliteDataStore;
 use fauna_scan::domain::*;
 use fauna_scan::error::{AppResult, ErrorCategory};
 use fauna_scan::nvr::NvrTransport;
@@ -408,7 +408,7 @@ async fn single_page_search_commits_image_and_advances_cursor() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -440,7 +440,7 @@ async fn single_page_search_commits_image_and_advances_cursor() {
     assert_eq!(outcome.records_inserted, 1);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
     assert_eq!(count, 1);
@@ -519,7 +519,7 @@ async fn paginated_search_fetches_all_pages_and_commits() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -552,7 +552,7 @@ async fn paginated_search_fetches_all_pages_and_commits() {
 
     // Verify 4 images
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
     assert_eq!(count, 4);
@@ -583,7 +583,7 @@ async fn paginated_search_fetches_all_pages_and_commits() {
     assert_ne!(uuid1, uuid2);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
     assert_eq!(count, 4);
@@ -604,7 +604,7 @@ async fn empty_search_advances_cursor_without_images() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -636,7 +636,7 @@ async fn empty_search_advances_cursor_without_images() {
     assert_eq!(outcome.records_inserted, 0);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
     assert_eq!(count, 0);
@@ -663,7 +663,7 @@ async fn malformed_xml_fails_and_retains_cursor() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -731,7 +731,7 @@ async fn nvr_failure_fails_and_retains_cursor() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -795,7 +795,9 @@ async fn digest_authentication_failure_records_cursor_error() {
     let transport = build_transport(&config).await.unwrap();
 
     let dir = tempfile::tempdir().unwrap();
-    let db = Database::open(&dir.path().join("test.db")).await.unwrap();
+    let db = SqliteDataStore::connect(&dir.path().join("test.db"), 4)
+        .await
+        .unwrap();
     let ops = db.ops();
     let camera_id = CameraId::new(1);
     ops.sync_cameras(
@@ -853,7 +855,7 @@ async fn timeout_fails_and_retains_cursor() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -917,7 +919,7 @@ async fn more_zero_items_fails_and_retains_cursor() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -977,7 +979,7 @@ async fn repeated_page_fails_and_retains_cursor() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -1036,7 +1038,7 @@ async fn malformed_sibling_retains_valid_items() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -1068,7 +1070,7 @@ async fn malformed_sibling_retains_valid_items() {
     assert_eq!(outcome.records_inserted, 1);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
     assert_eq!(count, 1);
@@ -1089,7 +1091,7 @@ async fn media_filtering_keeps_only_pictures() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -1136,7 +1138,7 @@ async fn duplicate_timestamps_distinct_uris_produce_two_rows() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
@@ -1168,7 +1170,7 @@ async fn duplicate_timestamps_distinct_uris_produce_two_rows() {
     assert_eq!(outcome.records_inserted, 2);
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
-        .fetch_one(ops.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap();
     assert_eq!(count, 2);
@@ -1189,7 +1191,7 @@ async fn cursor_error_recorded_on_failure() {
 
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = Database::open(&db_path).await.unwrap();
+    let db = SqliteDataStore::connect(&db_path, 4).await.unwrap();
     let ops = db.ops();
 
     let camera_id = CameraId::new(1);
