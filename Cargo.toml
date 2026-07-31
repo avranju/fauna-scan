@@ -7,6 +7,10 @@ edition = "2024"
 name = "fauna-scan"
 path = "src/main.rs"
 
+[[bin]]
+name = "sqlite-to-pg"
+path = "sqlite-to-pg/main.rs"
+
 [[test]]
 name = "test_relative_output_root"
 path = "tests/test_relative_output_root.rs"
