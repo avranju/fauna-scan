@@ -479,16 +479,20 @@ impl Scanner {
                 .classifier_cooldown_remaining(&cooldown_group, &now)
                 .await?
             {
-                // Yield this worker rather than sleeping inside a finite
-                // scanner pass. The continuous scanner's polling interval
-                // will revisit it after the durable deadline, while workers
-                // for independent endpoints continue draining work.
+                // Keep this worker alive until the durable deadline. A
+                // scanner pass completes only after every endpoint worker
+                // exits; yielding here would strand this endpoint whenever
+                // another endpoint has a sustained backlog.
                 tracing::info!(
                     cooldown_group = %cooldown_group,
                     wait_seconds = wait.as_secs(),
-                    "Classifier endpoint is cooling down after HTTP 429; yielding pass"
+                    "Classifier endpoint is cooling down after HTTP 429; waiting"
                 );
-                return Ok(report);
+                tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(report),
+                    _ = worker_stop.cancelled() => return Ok(report),
+                    _ = sleep(wait) => continue 'claims,
+                }
             }
             let lease_until = Timestamp::new(
                 now.as_datetime()

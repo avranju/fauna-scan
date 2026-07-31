@@ -731,7 +731,19 @@ async fn http_429_cools_down_endpoint_before_claiming_another_image() {
     let (_db_path, ops, pool, output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
     let scanner = build_scanner(ops, pool.clone(), &mock_server, &output_dir, 5).await;
 
-    let report = scanner.clone().execute_one_pass().await.unwrap();
+    let shutdown = ShutdownToken::new();
+    let runner = scanner.clone();
+    let runner_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .execute_one_pass_with_shutdown(&runner_shutdown)
+            .await
+    });
+    while mock_server.received_requests().await.unwrap().is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    shutdown.cancel();
+    let report = task.await.unwrap().unwrap();
     assert_eq!(report.claimed, 1);
     assert_eq!(report.retry_scheduled, 1);
     assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
@@ -787,7 +799,29 @@ async fn http_429_refunds_daily_rate_limit_quota() {
         },
     );
 
-    let report = scanner.clone().execute_one_pass().await.unwrap();
+    let shutdown = ShutdownToken::new();
+    let runner = scanner.clone();
+    let runner_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .execute_one_pass_with_shutdown(&runner_shutdown)
+            .await
+    });
+    loop {
+        let cooldown_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM classifier_cooldowns WHERE cooldown_group = ?",
+        )
+        .bind(&policy.quota_group)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if cooldown_count == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    shutdown.cancel();
+    let report = task.await.unwrap().unwrap();
     assert_eq!(report.retry_scheduled, 1);
     let usage = sqlx::query(
         "SELECT requests, tokens FROM classifier_rate_limit_daily_usage \
