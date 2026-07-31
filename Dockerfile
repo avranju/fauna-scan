@@ -18,7 +18,7 @@ COPY migrations ./migrations/
 COPY migrations-postgres ./migrations-postgres/
 COPY src ./src/
 
-RUN cargo build --locked --release
+RUN cargo build --locked --release --bin fauna-scan
 
 FROM debian:bookworm-slim
 
