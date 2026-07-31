@@ -1080,6 +1080,7 @@ mod tests {
                 poll_overlap_seconds: 120,
                 camera_refresh_interval_seconds: 3600,
                 settlement_delay_seconds: 10,
+                capture_time_window: None,
             },
             download: crate::configuration::NvrDownloadConfig {
                 retry_limit: 3,

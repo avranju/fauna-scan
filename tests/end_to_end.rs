@@ -248,6 +248,7 @@ fn build_test_config(server: &MockServer, root: &Path, start_at: Timestamp) -> C
                 poll_overlap_seconds: 120,
                 camera_refresh_interval_seconds: 3600,
                 settlement_delay_seconds: 0,
+                capture_time_window: None,
             },
             download: NvrDownloadConfig {
                 retry_limit: 2,

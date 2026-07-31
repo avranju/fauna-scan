@@ -1632,6 +1632,16 @@ impl<'a> ImageSearchClient<'a> {
                             continue;
                         }
 
+                        if self
+                            .search_config
+                            .capture_time_window
+                            .as_ref()
+                            .is_some_and(|window| !window.contains(&match_item.capture_start_at))
+                        {
+                            records_skipped += 1;
+                            continue;
+                        }
+
                         let canonical =
                             match canonical_playback_path_and_query(&match_item.playback_uri) {
                                 Ok(c) => c,

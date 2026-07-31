@@ -1253,6 +1253,7 @@ fn lease_equal_to_timeout_is_rejected() {
                 poll_overlap_seconds: 120,
                 camera_refresh_interval_seconds: 3600,
                 settlement_delay_seconds: 10,
+                capture_time_window: None,
             },
             download: fauna_scan::configuration::NvrDownloadConfig {
                 retry_limit: 10,
@@ -1326,6 +1327,7 @@ fn lease_one_second_above_timeout_is_accepted() {
                 poll_overlap_seconds: 120,
                 camera_refresh_interval_seconds: 3600,
                 settlement_delay_seconds: 10,
+                capture_time_window: None,
             },
             download: fauna_scan::configuration::NvrDownloadConfig {
                 retry_limit: 10,

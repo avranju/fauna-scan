@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
-use fauna_scan::configuration::{NvrConfig, NvrDownloadConfig, NvrSearchConfig};
+use fauna_scan::configuration::{Config, NvrConfig, NvrDownloadConfig, NvrSearchConfig};
 use fauna_scan::database::models::*;
 use fauna_scan::database::repository::DatabaseOps;
 use fauna_scan::database::sqlite::SqliteDataStore;
@@ -32,6 +32,48 @@ fn future_ts(hours: i32) -> Timestamp {
         Utc.with_ymd_and_hms(2026, 7, 11, 12 + hours as u32, 0, 0)
             .unwrap(),
     )
+}
+
+fn overnight_capture_window() -> fauna_scan::configuration::CaptureTimeWindow {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("output");
+    std::fs::create_dir(&output).unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[database]
+path = "{database}"
+
+[general]
+output_directory = "{output}"
+
+[nvr]
+host = "nvr"
+port = 80
+username = "user"
+password = "password"
+start_at = "2026-01-01T00:00:00Z"
+
+[nvr.search.capture_time_window]
+start_time = "19:00"
+end_time = "07:00"
+utc_offset = "+10:00"
+
+[classifier]
+"#,
+            database = dir.path().join("test.db").display(),
+            output = output.display(),
+        ),
+    )
+    .unwrap();
+
+    Config::load(Some(&config_path))
+        .unwrap()
+        .nvr
+        .search
+        .capture_time_window
+        .unwrap()
 }
 
 /// Build an `NvrConfig` pointing at the given mock server URL.
@@ -60,6 +102,7 @@ fn make_nvr_config(mock_base: &str) -> NvrConfig {
             poll_overlap_seconds: 120,
             camera_refresh_interval_seconds: 3600,
             settlement_delay_seconds: 10,
+            capture_time_window: None,
         },
         download: NvrDownloadConfig {
             retry_limit: 10,
@@ -97,6 +140,7 @@ fn build_search_client(
             poll_overlap_seconds: 120,
             camera_refresh_interval_seconds: 3600,
             settlement_delay_seconds: 10,
+            capture_time_window: None,
         },
         nvr_identity: configured_nvr_identity("http", "127.0.0.1", 0),
         camera_id,
@@ -1074,6 +1118,56 @@ async fn malformed_sibling_retains_valid_items() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn capture_time_window_excludes_out_of_window_pictures_before_persistence() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/ISAPI/ContentMgmt/search"))
+        .respond_with(echo_success("http://nvr/pic/outside-window.jpg"))
+        .mount(&mock_server)
+        .await;
+
+    let config = make_nvr_config(&mock_server.uri());
+    let transport = build_transport(&config).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqliteDataStore::connect(&dir.path().join("test.db"), 4)
+        .await
+        .unwrap();
+    let ops = db.ops();
+    let camera_id = CameraId::new(1);
+    ops.sync_cameras(
+        &[CameraDiscovery {
+            channel_number: 1,
+            primary_track_id: "101".to_string(),
+            picture_track_id: "103".to_string(),
+            name: None,
+            raw_discovery_identifier: None,
+        }],
+        &now_ts(),
+    )
+    .await
+    .unwrap();
+
+    let mut client = build_search_client(transport, ops, camera_id);
+    client.search_config.capture_time_window = Some(overnight_capture_window());
+    let outcome = client
+        .search_one_window(&SearchWindow {
+            start: now_ts(),
+            end: future_ts(1),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.records_found, 1);
+    assert_eq!(outcome.records_skipped, 1);
+    assert_eq!(outcome.records_inserted, 0);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM images")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[tokio::test]

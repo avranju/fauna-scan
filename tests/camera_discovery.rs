@@ -51,6 +51,7 @@ fn make_nvr_config(mock_base: &str) -> NvrConfig {
             poll_overlap_seconds: 120,
             camera_refresh_interval_seconds: 3600,
             settlement_delay_seconds: 10,
+            capture_time_window: None,
         },
         download: NvrDownloadConfig {
             retry_limit: 10,

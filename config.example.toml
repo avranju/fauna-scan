@@ -44,6 +44,14 @@ poll_overlap_seconds = 120
 camera_refresh_interval_seconds = 3600
 settlement_delay_seconds = 10
 
+# Optional daily capture-time filter. Times are evaluated against the NVR's
+# clock using this fixed UTC offset; start is inclusive and end is exclusive.
+# A start later than end crosses midnight (for example, 19:00 to 07:00).
+# [nvr.search.capture_time_window]
+# start_time = "19:00"
+# end_time = "07:00"
+# utc_offset = "+05:30"
+
 [nvr.download]
 retry_limit = 10
 retry_initial_delay_seconds = 5

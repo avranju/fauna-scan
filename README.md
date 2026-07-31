@@ -93,6 +93,25 @@ Use `scheme = "https"` and leave invalid TLS certificates disabled unless the
 operator explicitly understands the risk. `start_at` accepts RFC 3339 and is
 converted to UTC. Playback URLs are rebased to the configured NVR origin by
 default; if rebasing is disabled, use the explicit playback host allowlist.
+
+### Capture-time filtering
+
+To consider only images captured during a daily time window, configure an
+optional `[nvr.search.capture_time_window]` table:
+
+```toml
+[nvr.search.capture_time_window]
+start_time = "19:00"
+end_time = "07:00"
+utc_offset = "+05:30"
+```
+
+Times use 24-hour `HH:MM` notation and are evaluated using the explicit fixed
+UTC offset for the NVR's clock (`Z` is also accepted). The start is inclusive,
+the end is exclusive, and an end earlier than the start crosses midnight. Thus
+this example accepts captures from 7 PM through 6:59:59 AM and ignores all
+other search results before they are persisted or downloaded. Omit the table
+to retain the existing behavior of accepting images at all times.
 Classifier Basic authentication uses `username` plus `password_file`; API-key
 and Basic authentication may be combined. Configure classifier servers with
 one or more `[[classifier.endpoints]]` tables. Each endpoint requires

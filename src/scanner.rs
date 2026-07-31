@@ -509,40 +509,36 @@ impl Scanner {
                     })?,
             );
             let (claim, rate_limit_grant) = if let Some(limit) = &rate_limit {
-                loop {
-                    match self
-                        .database
-                        .claim_next_processing_with_rate_limit(
-                            limit,
-                            classifier.max_tokens(),
-                            &Timestamp::new(Utc::now()),
-                            &lease_until,
-                        )
-                        .await?
-                    {
-                        RateLimitedProcessingClaim::Claimed { claim, grant } => {
-                            break (claim, Some(grant));
+                match self
+                    .database
+                    .claim_next_processing_with_rate_limit(
+                        limit,
+                        classifier.max_tokens(),
+                        &Timestamp::new(Utc::now()),
+                        &lease_until,
+                    )
+                    .await?
+                {
+                    RateLimitedProcessingClaim::Claimed { claim, grant } => (claim, Some(grant)),
+                    RateLimitedProcessingClaim::NoWork => return Ok(report),
+                    RateLimitedProcessingClaim::Wait(wait) => {
+                        // A per-minute limit is temporary. Keep this worker alive:
+                        // returning here would only recreate it after every other
+                        // endpoint drains the queue, which may never happen under a
+                        // sustained backlog.
+                        tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint temporarily rate limited; waiting");
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return Ok(report),
+                            _ = worker_stop.cancelled() => return Ok(report),
+                            _ = sleep(wait) => continue 'claims,
                         }
-                        RateLimitedProcessingClaim::NoWork => return Ok(report),
-                        RateLimitedProcessingClaim::Wait(wait) => {
-                            // A per-minute limit is temporary. Keep this worker alive:
-                            // returning here would only recreate it after every other
-                            // endpoint drains the queue, which may never happen under a
-                            // sustained backlog.
-                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint temporarily rate limited; waiting");
-                            tokio::select! {
-                                _ = shutdown.cancelled() => return Ok(report),
-                                _ = worker_stop.cancelled() => return Ok(report),
-                                _ = sleep(wait) => continue 'claims,
-                            }
-                        }
-                        RateLimitedProcessingClaim::DailyExhausted(wait) => {
-                            // Waiting for the UTC daily reset could hold a scanner pass
-                            // open for hours. Yield so unrestricted endpoints can finish
-                            // their current work and later polling can recreate this one.
-                            tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint daily quota exhausted; yielding pass");
-                            return Ok(report);
-                        }
+                    }
+                    RateLimitedProcessingClaim::DailyExhausted(wait) => {
+                        // Waiting for the UTC daily reset could hold a scanner pass
+                        // open for hours. Yield so unrestricted endpoints can finish
+                        // their current work and later polling can recreate this one.
+                        tracing::info!(quota_group = %limit.quota_group, wait_seconds = wait.as_secs(), "Classifier endpoint daily quota exhausted; yielding pass");
+                        return Ok(report);
                     }
                 }
             } else {
@@ -1704,6 +1700,7 @@ mod tests {
                     poll_overlap_seconds: 120,
                     camera_refresh_interval_seconds: 3600,
                     settlement_delay_seconds: 10,
+                    capture_time_window: None,
                 },
                 download: crate::configuration::NvrDownloadConfig {
                     retry_limit: 10,
@@ -2017,6 +2014,7 @@ mod tests {
                     poll_overlap_seconds: 120,
                     camera_refresh_interval_seconds: 3600,
                     settlement_delay_seconds: 10,
+                    capture_time_window: None,
                 },
                 download: crate::configuration::NvrDownloadConfig {
                     retry_limit: 10,
@@ -2093,6 +2091,7 @@ mod tests {
                     poll_overlap_seconds: 120,
                     camera_refresh_interval_seconds: 3600,
                     settlement_delay_seconds: 10,
+                    capture_time_window: None,
                 },
                 download: crate::configuration::NvrDownloadConfig {
                     retry_limit: 10,
@@ -2168,6 +2167,7 @@ mod tests {
                     poll_overlap_seconds: 120,
                     camera_refresh_interval_seconds: 3600,
                     settlement_delay_seconds: 10,
+                    capture_time_window: None,
                 },
                 download: crate::configuration::NvrDownloadConfig {
                     retry_limit: 10,
@@ -2244,6 +2244,7 @@ mod tests {
                     poll_overlap_seconds: 120,
                     camera_refresh_interval_seconds: 3600,
                     settlement_delay_seconds: 10,
+                    capture_time_window: None,
                 },
                 download: crate::configuration::NvrDownloadConfig {
                     retry_limit: 10,

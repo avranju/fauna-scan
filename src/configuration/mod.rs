@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use chrono::{FixedOffset, Timelike};
 use serde::Deserialize;
 use url::Url;
 
@@ -290,6 +291,11 @@ pub struct NvrConfig {
 /// Resolved NVR search settings.
 #[derive(Debug, Clone)]
 pub struct NvrSearchConfig {
+    /// Optional daily capture-time filter applied to NVR search results.
+    ///
+    /// A matching image is accepted only when its capture start time falls in
+    /// this half-open interval in the configured fixed UTC offset.
+    pub capture_time_window: Option<CaptureTimeWindow>,
     /// Search window size in minutes.
     pub window_minutes: u64,
     /// Maximum results per page.
@@ -302,6 +308,37 @@ pub struct NvrSearchConfig {
     pub camera_refresh_interval_seconds: u64,
     /// Settlement delay in seconds.
     pub settlement_delay_seconds: u64,
+}
+
+/// A daily, half-open capture-time interval used to filter NVR search results.
+///
+/// The interval is evaluated using `utc_offset`, which should match the NVR's
+/// configured clock. Equal start and end times are rejected because an
+/// all-day window would be ambiguous; omit this setting to disable filtering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureTimeWindow {
+    start_seconds: u32,
+    end_seconds: u32,
+    utc_offset: FixedOffset,
+}
+
+impl CaptureTimeWindow {
+    /// Return whether an image captured at `capture_start_at` belongs to this
+    /// window. Start is inclusive and end is exclusive. A start later than
+    /// end denotes an overnight window (for example, 19:00–07:00).
+    pub fn contains(&self, capture_start_at: &Timestamp) -> bool {
+        let local_time = capture_start_at
+            .as_datetime()
+            .with_timezone(&self.utc_offset)
+            .time();
+        let seconds = local_time.num_seconds_from_midnight();
+
+        if self.start_seconds < self.end_seconds {
+            self.start_seconds <= seconds && seconds < self.end_seconds
+        } else {
+            seconds >= self.start_seconds || seconds < self.end_seconds
+        }
+    }
 }
 
 /// Resolved NVR download settings.
@@ -453,12 +490,21 @@ struct RawNvrConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawNvrSearchConfig {
+    capture_time_window: Option<RawCaptureTimeWindow>,
     window_minutes: Option<u64>,
     max_results: Option<u64>,
     poll_interval_seconds: Option<u64>,
     poll_overlap_seconds: Option<u64>,
     camera_refresh_interval_seconds: Option<u64>,
     settlement_delay_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawCaptureTimeWindow {
+    start_time: Option<String>,
+    end_time: Option<String>,
+    utc_offset: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -664,7 +710,13 @@ impl Config {
 
         // NVR search
         let search_raw = raw.nvr.search.unwrap_or_default();
+        let capture_time_window = search_raw
+            .capture_time_window
+            .as_ref()
+            .map(resolve_capture_time_window)
+            .transpose()?;
         let search = NvrSearchConfig {
+            capture_time_window,
             window_minutes: search_raw.window_minutes.unwrap_or(60),
             max_results: search_raw.max_results.unwrap_or(50),
             poll_interval_seconds: search_raw.poll_interval_seconds.unwrap_or(60),
@@ -959,6 +1011,116 @@ fn validate_classifier_endpoint(endpoint: Option<&str>, label: &str) -> AppResul
 }
 
 // ── Semantic validation ────────────────────────────────────────────────────
+
+/// Resolve a configured daily capture-time filter.
+fn resolve_capture_time_window(raw: &RawCaptureTimeWindow) -> AppResult<CaptureTimeWindow> {
+    let start_time = raw.start_time.as_deref().ok_or_else(|| {
+        AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            "nvr.search.capture_time_window.start_time is required",
+        )
+    })?;
+    let end_time = raw.end_time.as_deref().ok_or_else(|| {
+        AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            "nvr.search.capture_time_window.end_time is required",
+        )
+    })?;
+    let utc_offset = raw.utc_offset.as_deref().ok_or_else(|| {
+        AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            "nvr.search.capture_time_window.utc_offset is required",
+        )
+    })?;
+
+    let start_seconds = parse_clock_time(start_time, "start_time")?;
+    let end_seconds = parse_clock_time(end_time, "end_time")?;
+    if start_seconds == end_seconds {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            "nvr.search.capture_time_window.start_time and end_time must differ",
+        ));
+    }
+
+    Ok(CaptureTimeWindow {
+        start_seconds,
+        end_seconds,
+        utc_offset: parse_utc_offset(utc_offset)?,
+    })
+}
+
+/// Parse a 24-hour `HH:MM` time without accepting ambiguous formats.
+fn parse_clock_time(value: &str, field: &str) -> AppResult<u32> {
+    let bytes = value.as_bytes();
+    let valid_shape = bytes.len() == 5
+        && bytes[2] == b':'
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4].is_ascii_digit();
+    if !valid_shape {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            format!("nvr.search.capture_time_window.{field} must use 24-hour HH:MM format"),
+        ));
+    }
+    let hours = u32::from(bytes[0] - b'0') * 10 + u32::from(bytes[1] - b'0');
+    let minutes = u32::from(bytes[3] - b'0') * 10 + u32::from(bytes[4] - b'0');
+    if hours > 23 || minutes > 59 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            format!("nvr.search.capture_time_window.{field} must use 24-hour HH:MM format"),
+        ));
+    }
+    Ok(hours * 3_600 + minutes * 60)
+}
+
+/// Parse an explicit fixed UTC offset such as `+05:30`, `-07:00`, or `Z`.
+fn parse_utc_offset(value: &str) -> AppResult<FixedOffset> {
+    if value == "Z" {
+        return Ok(FixedOffset::east_opt(0).expect("zero is a valid UTC offset"));
+    }
+
+    let bytes = value.as_bytes();
+    let valid_shape = bytes.len() == 6
+        && matches!(bytes[0], b'+' | b'-')
+        && bytes[3] == b':'
+        && bytes[1].is_ascii_digit()
+        && bytes[2].is_ascii_digit()
+        && bytes[4].is_ascii_digit()
+        && bytes[5].is_ascii_digit();
+    if !valid_shape {
+        return invalid_utc_offset();
+    }
+    let hours = i32::from(bytes[1] - b'0') * 10 + i32::from(bytes[2] - b'0');
+    let minutes = i32::from(bytes[4] - b'0') * 10 + i32::from(bytes[5] - b'0');
+    if hours > 23 || minutes > 59 {
+        return invalid_utc_offset();
+    }
+    let seconds = hours * 3_600 + minutes * 60;
+    let seconds = if bytes[0] == b'-' { -seconds } else { seconds };
+    FixedOffset::east_opt(seconds).ok_or_else(|| {
+        AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            "nvr.search.capture_time_window.utc_offset must be Z or a UTC offset in ±HH:MM format",
+        )
+    })
+}
+
+fn invalid_utc_offset<T>() -> AppResult<T> {
+    Err(AppError::new(
+        ErrorCategory::Configuration,
+        "load_config",
+        "nvr.search.capture_time_window.utc_offset must be Z or a UTC offset in ±HH:MM format",
+    ))
+}
 
 fn validate_config(config: &Config) -> AppResult<()> {
     if config.web.listen_address.port() == 0 {
@@ -1802,6 +1964,100 @@ fn validate_playback_host_entry(entry: &str) -> AppResult<String> {
     // other representations.  Return the parsed host's canonical string
     // representation so stored entries match what URL parsing produces.
     Ok(parsed_host.to_string().to_lowercase())
+}
+
+// ── Capture time window tests ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod capture_time_window_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn window() -> CaptureTimeWindow {
+        resolve_capture_time_window(&RawCaptureTimeWindow {
+            start_time: Some("19:00".to_string()),
+            end_time: Some("07:00".to_string()),
+            utc_offset: Some("+05:30".to_string()),
+        })
+        .unwrap()
+    }
+
+    fn captured_at(hour: u32, minute: u32) -> Timestamp {
+        Timestamp::new(Utc.with_ymd_and_hms(2026, 7, 11, hour, minute, 0).unwrap())
+    }
+
+    #[test]
+    fn overnight_window_uses_configured_nvr_clock_and_half_open_bounds() {
+        let window = window();
+        assert!(window.contains(&captured_at(13, 30)), "19:00 is included");
+        assert!(window.contains(&captured_at(1, 29)), "06:59 is included");
+        assert!(!window.contains(&captured_at(1, 30)), "07:00 is excluded");
+        assert!(!window.contains(&captured_at(12, 0)), "17:30 is excluded");
+    }
+
+    #[test]
+    fn capture_time_window_is_loaded_from_nvr_search_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        std::fs::create_dir(&output).unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[general]
+output_directory = "{output}"
+
+[nvr]
+host = "nvr"
+port = 80
+username = "user"
+password = "password"
+start_at = "2026-01-01T00:00:00Z"
+
+[nvr.search.capture_time_window]
+start_time = "19:00"
+end_time = "07:00"
+utc_offset = "Z"
+
+[classifier]
+"#,
+                output = output.display()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(Some(&config_path)).unwrap();
+        let window = config.nvr.search.capture_time_window.unwrap();
+        assert!(window.contains(&captured_at(19, 0)));
+        assert!(!window.contains(&captured_at(7, 0)));
+    }
+
+    #[test]
+    fn capture_time_window_requires_unambiguous_valid_values() {
+        let invalid_time = resolve_capture_time_window(&RawCaptureTimeWindow {
+            start_time: Some("7 PM".to_string()),
+            end_time: Some("07:00".to_string()),
+            utc_offset: Some("Z".to_string()),
+        })
+        .unwrap_err();
+        assert!(invalid_time.message.contains("start_time"));
+
+        let equal_bounds = resolve_capture_time_window(&RawCaptureTimeWindow {
+            start_time: Some("19:00".to_string()),
+            end_time: Some("19:00".to_string()),
+            utc_offset: Some("Z".to_string()),
+        })
+        .unwrap_err();
+        assert!(equal_bounds.message.contains("must differ"));
+
+        let invalid_offset = resolve_capture_time_window(&RawCaptureTimeWindow {
+            start_time: Some("19:00".to_string()),
+            end_time: Some("07:00".to_string()),
+            utc_offset: Some("UTC".to_string()),
+        })
+        .unwrap_err();
+        assert!(invalid_offset.message.contains("utc_offset"));
+    }
 }
 
 // ── Configuration tests for Phase 7 fields ───────────────────────────────
