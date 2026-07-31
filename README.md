@@ -101,7 +101,12 @@ one or more `[[classifier.endpoints]]` tables. Each endpoint requires
 configuration. Endpoint settings do not inherit from other endpoints;
 credentials, timeouts, prompts, and generation settings are resolved
 independently. Images are claimed atomically and distributed among enabled
-workers. An empty endpoint list disables classification.
+workers. An empty endpoint list disables classification. On HTTP 429, Fauna
+Scan durably cools down the affected provider quota group (when `rate_limit`
+is configured) or otherwise that endpoint/model, honoring a numeric
+`Retry-After` header when supplied and using the configured retry backoff as a
+fallback. Other classifier endpoints continue to process work during that
+cooldown.
 
 ## Commands
 

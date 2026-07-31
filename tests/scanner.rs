@@ -712,6 +712,40 @@ async fn retryable_then_success() {
     assert_eq!(img.processing_status, ProcessingStatus::Done);
 }
 
+/// A 429 cools down the endpoint, so a backlog does not generate one 429 per
+/// image in a single scanner pass.
+#[tokio::test]
+async fn http_429_cools_down_endpoint_before_claiming_another_image() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "60")
+                .set_body_string("rate limited"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let (_db_path, ops, pool, output_dir) = setup_downloaded_images(&dir, 2, &minimal_jpeg()).await;
+    let scanner = build_scanner(ops, pool.clone(), &mock_server, &output_dir, 5).await;
+
+    let report = scanner.clone().execute_one_pass().await.unwrap();
+    assert_eq!(report.claimed, 1);
+    assert_eq!(report.retry_scheduled, 1);
+    assert_eq!(mock_server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(
+        scanner
+            .database
+            .get_image(ImageId::new(2))
+            .await
+            .unwrap()
+            .processing_status,
+        ProcessingStatus::New
+    );
+}
+
 /// A provider 429 keeps the rolling-minute attempt but refunds the daily
 /// quota because the provider did not generate a response.
 #[tokio::test]
@@ -773,6 +807,14 @@ async fn http_429_refunds_daily_rate_limit_quota() {
     .await
     .unwrap();
     assert_eq!(event_count, 1);
+    let cooldown: String = sqlx::query_scalar(
+        "SELECT cooldown_until FROM classifier_cooldowns WHERE cooldown_group = ?",
+    )
+    .bind(&policy.quota_group)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(cooldown.parse::<fauna_scan::domain::Timestamp>().is_ok());
 }
 
 // ── Retry exhaustion test ─────────────────────────────────────────────────

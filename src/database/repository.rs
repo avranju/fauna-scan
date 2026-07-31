@@ -157,6 +157,23 @@ pub trait DataStore: Send + Sync {
         lease_until: &Timestamp,
     ) -> AppResult<Option<ProcessingClaim>>;
 
+    /// Return the remaining provider/endpoint cooldown, if it is still active.
+    /// Cooldowns are durable so a restart cannot cause another 429 burst.
+    async fn classifier_cooldown_remaining(
+        &self,
+        cooldown_group: &str,
+        now: &Timestamp,
+    ) -> AppResult<Option<Duration>>;
+
+    /// Extend a provider/endpoint cooldown. A concurrent shorter cooldown must
+    /// never move the existing deadline backwards.
+    async fn set_classifier_cooldown(
+        &self,
+        cooldown_group: &str,
+        cooldown_until: &Timestamp,
+        updated_at: &Timestamp,
+    ) -> AppResult<()>;
+
     /// Guard a processing failure transition.
     async fn fail_processing(
         &self,
@@ -443,6 +460,27 @@ impl DatabaseOps {
         lease_until: &Timestamp,
     ) -> AppResult<Option<ProcessingClaim>> {
         self.inner.claim_next_processing(now, lease_until).await
+    }
+
+    pub async fn classifier_cooldown_remaining(
+        &self,
+        cooldown_group: &str,
+        now: &Timestamp,
+    ) -> AppResult<Option<Duration>> {
+        self.inner
+            .classifier_cooldown_remaining(cooldown_group, now)
+            .await
+    }
+
+    pub async fn set_classifier_cooldown(
+        &self,
+        cooldown_group: &str,
+        cooldown_until: &Timestamp,
+        updated_at: &Timestamp,
+    ) -> AppResult<()> {
+        self.inner
+            .set_classifier_cooldown(cooldown_group, cooldown_until, updated_at)
+            .await
     }
 
     pub async fn fail_processing(

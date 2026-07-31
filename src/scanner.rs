@@ -312,6 +312,16 @@ impl Scanner {
             .zip(self.rate_limits.iter().cloned())
             .enumerate()
         {
+            // A configured quota group is the logical upstream identity. For
+            // unrestricted endpoints use the stable URL/model pair, which is
+            // distinct for the OpenRouter and Cerebras routes behind
+            // llama-swap even though their transport URL is the same.
+            let cooldown_group = rate_limit
+                .as_ref()
+                .map(|limit| limit.quota_group.clone())
+                .unwrap_or_else(|| {
+                    format!("{}::{}", classifier.endpoint_url(), classifier.model())
+                });
             let scanner = self.clone();
             let shutdown = shutdown.clone();
             let worker_stop = worker_stop.clone();
@@ -321,6 +331,7 @@ impl Scanner {
                         endpoint_index,
                         classifier,
                         rate_limit,
+                        cooldown_group,
                         &shutdown,
                         &worker_stop,
                     )
@@ -446,6 +457,7 @@ impl Scanner {
         endpoint_index: usize,
         classifier: Arc<ClassifierClient>,
         rate_limit: Option<crate::configuration::ClassifierRateLimitConfig>,
+        cooldown_group: String,
         shutdown: &ShutdownToken,
         worker_stop: &ShutdownToken,
     ) -> AppResult<ScannerPassReport> {
@@ -457,11 +469,27 @@ impl Scanner {
             "Classifier endpoint worker started"
         );
         let mut report = ScannerPassReport::default();
-        loop {
+        'claims: loop {
             if shutdown.is_cancelled() || worker_stop.is_cancelled() {
                 return Ok(report);
             }
             let now = Timestamp::new(Utc::now());
+            if let Some(wait) = self
+                .database
+                .classifier_cooldown_remaining(&cooldown_group, &now)
+                .await?
+            {
+                // Yield this worker rather than sleeping inside a finite
+                // scanner pass. The continuous scanner's polling interval
+                // will revisit it after the durable deadline, while workers
+                // for independent endpoints continue draining work.
+                tracing::info!(
+                    cooldown_group = %cooldown_group,
+                    wait_seconds = wait.as_secs(),
+                    "Classifier endpoint is cooling down after HTTP 429; yielding pass"
+                );
+                return Ok(report);
+            }
             let lease_until = Timestamp::new(
                 now.as_datetime()
                     .checked_add_signed(
@@ -501,7 +529,7 @@ impl Scanner {
                             tokio::select! {
                                 _ = shutdown.cancelled() => return Ok(report),
                                 _ = worker_stop.cancelled() => return Ok(report),
-                                _ = sleep(wait) => {}
+                                _ = sleep(wait) => continue 'claims,
                             }
                         }
                         RateLimitedProcessingClaim::DailyExhausted(wait) => {
@@ -535,7 +563,12 @@ impl Scanner {
                 "Classifier endpoint worker claimed image"
             );
             match self
-                .process_claim(&claim, classifier.clone(), rate_limit_grant)
+                .process_claim(
+                    &claim,
+                    classifier.clone(),
+                    rate_limit_grant,
+                    &cooldown_group,
+                )
                 .await?
             {
                 ScannerOutcome::Completed => report.completed += 1,
@@ -569,6 +602,7 @@ impl Scanner {
         claim: &ProcessingClaim,
         classifier: Arc<ClassifierClient>,
         rate_limit_grant: Option<RateLimitGrant>,
+        cooldown_group: &str,
     ) -> AppResult<ScannerOutcome> {
         let image_id = claim.image_id;
         let generation = claim.generation;
@@ -804,6 +838,53 @@ impl Scanner {
                                 image_id = image_id.get(),
                                 refunded,
                                 "Refunded daily classifier quota after HTTP 429"
+                            );
+                        }
+                        if classifier_err.http_status() == Some(429) {
+                            // Retry-After is provider input. Honour it, but
+                            // bound it before timestamp arithmetic so a bad
+                            // header cannot overflow or disable an endpoint
+                            // indefinitely.
+                            const MAX_PROVIDER_COOLDOWN: Duration = Duration::from_secs(86_400);
+                            let cooldown = classifier_err
+                                .retry_after()
+                                .map(|wait| wait.min(MAX_PROVIDER_COOLDOWN))
+                                .unwrap_or_else(|| {
+                                    scanner_backoff(
+                                        attempt,
+                                        self.options.retry_initial_delay,
+                                        self.options.retry_max_delay,
+                                    )
+                                });
+                            let cooldown_set_at = Timestamp::new(Utc::now());
+                            let cooldown_until = Timestamp::new(
+                                cooldown_set_at
+                                    .as_datetime()
+                                    .checked_add_signed(
+                                        chrono::Duration::from_std(cooldown).expect(
+                                            "bounded cooldown fits in chrono::Duration",
+                                        ),
+                                    )
+                                    .ok_or_else(|| {
+                                        AppError::new(
+                                            ErrorCategory::Internal,
+                                            "process_claim",
+                                            "classifier cooldown deadline computation overflowed Chrono bounds",
+                                        )
+                                    })?,
+                            );
+                            self.database
+                                .set_classifier_cooldown(
+                                    cooldown_group,
+                                    &cooldown_until,
+                                    &cooldown_set_at,
+                                )
+                                .await?;
+                            tracing::info!(
+                                cooldown_group,
+                                wait_seconds = cooldown.as_secs(),
+                                cooldown_until = %cooldown_until,
+                                "Classifier endpoint entered cooldown after HTTP 429"
                             );
                         }
                         tracing::warn!(

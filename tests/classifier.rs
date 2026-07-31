@@ -579,7 +579,11 @@ async fn http_429_is_retryable() {
 
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(429).set_body_string("Rate limited"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "37")
+                .set_body_string("Rate limited"),
+        )
         .mount(&mock_server)
         .await;
 
@@ -591,6 +595,7 @@ async fn http_429_is_retryable() {
     let err = result.unwrap_err();
     assert_eq!(err.category(), ErrorCategory::ClassifierTransport);
     assert!(err.is_retryable());
+    assert_eq!(err.retry_after(), Some(std::time::Duration::from_secs(37)));
 }
 
 /// HTTP 401 is permanent Authentication.

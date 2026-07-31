@@ -1764,6 +1764,59 @@ impl DataStore for SqliteDataStore {
         }
     }
 
+    async fn classifier_cooldown_remaining(
+        &self,
+        cooldown_group: &str,
+        now: &Timestamp,
+    ) -> AppResult<Option<Duration>> {
+        let now_str = format_timestamp(now);
+        let cooldown_until: Option<String> = sqlx::query_scalar(
+            "SELECT cooldown_until FROM classifier_cooldowns \
+             WHERE cooldown_group = ? AND cooldown_until > ?",
+        )
+        .bind(cooldown_group)
+        .bind(now_str)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error("classifier_cooldown_remaining", e))?;
+        let Some(cooldown_until) = cooldown_until else {
+            return Ok(None);
+        };
+        let cooldown_until = cooldown_until.parse::<Timestamp>().map_err(|_| {
+            AppError::new(
+                ErrorCategory::Database,
+                "classifier_cooldown_remaining",
+                "stored classifier cooldown timestamp is invalid",
+            )
+        })?;
+        let remaining = (*cooldown_until.as_datetime() - *now.as_datetime())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        Ok(Some(remaining.max(Duration::from_millis(1))))
+    }
+
+    async fn set_classifier_cooldown(
+        &self,
+        cooldown_group: &str,
+        cooldown_until: &Timestamp,
+        updated_at: &Timestamp,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "INSERT INTO classifier_cooldowns (cooldown_group, cooldown_until, updated_at) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(cooldown_group) DO UPDATE SET \
+               cooldown_until = MAX(classifier_cooldowns.cooldown_until, excluded.cooldown_until), \
+               updated_at = excluded.updated_at",
+        )
+        .bind(cooldown_group)
+        .bind(format_timestamp(cooldown_until))
+        .bind(format_timestamp(updated_at))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error("set_classifier_cooldown", e))?;
+        Ok(())
+    }
+
     async fn fail_processing(
         &self,
         image_id: ImageId,

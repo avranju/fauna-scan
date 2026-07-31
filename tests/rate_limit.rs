@@ -93,6 +93,42 @@ async fn provider_quota_is_sliding_per_minute_and_persistent_per_day() {
 }
 
 #[tokio::test]
+async fn classifier_cooldown_is_durable_and_never_shortened() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("state.sqlite3");
+    let now: Timestamp = "2026-07-25T12:00:00Z".parse().unwrap();
+    let first_until: Timestamp = "2026-07-25T12:01:00Z".parse().unwrap();
+    let shorter_until: Timestamp = "2026-07-25T12:00:10Z".parse().unwrap();
+    let store = SqliteDataStore::connect(&path, 4).await.unwrap();
+    let ops = store.ops();
+
+    ops.set_classifier_cooldown("openrouter-qwen", &first_until, &now)
+        .await
+        .unwrap();
+    ops.set_classifier_cooldown("openrouter-qwen", &shorter_until, &now)
+        .await
+        .unwrap();
+    assert!(matches!(
+        ops.classifier_cooldown_remaining("openrouter-qwen", &now)
+            .await
+            .unwrap(),
+        Some(wait) if wait == Duration::from_secs(60)
+    ));
+    drop(ops);
+    drop(store);
+
+    let store = SqliteDataStore::connect(&path, 4).await.unwrap();
+    assert!(matches!(
+        store
+            .ops()
+            .classifier_cooldown_remaining("openrouter-qwen", &now)
+            .await
+            .unwrap(),
+        Some(wait) if wait == Duration::from_secs(60)
+    ));
+}
+
+#[tokio::test]
 async fn rate_limited_claim_reserves_only_when_it_claims_work() {
     let directory = tempdir().unwrap();
     let path = directory.path().join("state.sqlite3");

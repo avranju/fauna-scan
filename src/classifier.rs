@@ -6,6 +6,7 @@
 //! raw responses, and reports retryable versus permanent failures.
 
 use std::fmt;
+use std::time::Duration;
 
 use base64::Engine;
 use bytes::Bytes;
@@ -76,6 +77,8 @@ pub struct ClassifierError {
     disposition: RetryDisposition,
     /// Raw response from the server, retained for diagnostics.
     raw_response: Option<String>,
+    /// Provider-supplied delay from an HTTP 429 `Retry-After` header.
+    retry_after: Option<Duration>,
 }
 
 // ── ClassifierClient ───────────────────────────────────────────────────────
@@ -146,6 +149,7 @@ async fn read_response_body_bounded(
                             error: app_err,
                             disposition: oversized_response_disposition(status),
                             raw_response: None,
+                            retry_after: None,
                         });
                     }
                 };
@@ -160,6 +164,7 @@ async fn read_response_body_bounded(
                         error: app_err,
                         disposition: oversized_response_disposition(status),
                         raw_response: None,
+                        retry_after: None,
                     });
                 }
                 buf.extend_from_slice(&chunk);
@@ -175,6 +180,7 @@ async fn read_response_body_bounded(
                     error: app_err,
                     disposition: RetryDisposition::Retryable,
                     raw_response: None,
+                    retry_after: None,
                 });
             }
         }
@@ -262,6 +268,7 @@ impl ClassifierClient {
             error: e,
             disposition: RetryDisposition::Permanent,
             raw_response: None,
+            retry_after: None,
         })?;
 
         // Build the HTTP request (but do not send it).
@@ -277,6 +284,7 @@ impl ClassifierClient {
             error: e,
             disposition: RetryDisposition::Permanent,
             raw_response: None,
+            retry_after: None,
         })?;
 
         Ok(PreparedClassificationRequest { request })
@@ -324,11 +332,24 @@ impl ClassifierClient {
                     error: app_err,
                     disposition: RetryDisposition::Retryable,
                     raw_response: None,
+                    retry_after: None,
                 });
             }
         };
 
         let status = response.status().as_u16();
+        // Capture this before consuming the body. The scanner uses it to
+        // cool down the entire provider/endpoint, not merely this image.
+        let retry_after = (status == 429)
+            .then(|| {
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs)
+            })
+            .flatten();
 
         // Early Content-Length check — if the header is present and already
         // exceeds the limit, reject immediately without reading the body.
@@ -353,6 +374,7 @@ impl ClassifierClient {
                 error: app_err,
                 disposition: oversized_response_disposition(status),
                 raw_response: None,
+                retry_after,
             });
         }
 
@@ -393,6 +415,7 @@ impl ClassifierClient {
                 error: app_err,
                 disposition,
                 raw_response: Some(raw_response),
+                retry_after,
             });
         }
 
@@ -426,6 +449,7 @@ impl ClassifierClient {
                     error: app_err,
                     disposition: RetryDisposition::Retryable,
                     raw_response: None,
+                    retry_after: None,
                 });
             }
         };
@@ -443,6 +467,7 @@ impl ClassifierClient {
                     error: app_err,
                     disposition: RetryDisposition::Retryable,
                     raw_response: Some(raw_response),
+                    retry_after: None,
                 });
             }
         };
@@ -455,6 +480,7 @@ impl ClassifierClient {
                     error: e,
                     disposition: RetryDisposition::Retryable,
                     raw_response: Some(raw_response),
+                    retry_after: None,
                 });
             }
         };
@@ -468,6 +494,7 @@ impl ClassifierClient {
                         error: e,
                         disposition: RetryDisposition::Retryable,
                         raw_response: Some(raw_response),
+                        retry_after: None,
                     });
                 }
             };
@@ -1649,6 +1676,7 @@ impl ClassifierError {
             error,
             disposition,
             raw_response,
+            retry_after: None,
         }
     }
 
@@ -1677,6 +1705,11 @@ impl ClassifierError {
         self.raw_response.as_deref()
     }
 
+    /// Return the provider-supplied 429 cooldown, if one was present.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+
     /// Return the underlying AppError.
     pub fn into_parts(self) -> (AppError, RetryDisposition, Option<String>) {
         (self.error, self.disposition, self.raw_response)
@@ -1690,6 +1723,7 @@ impl fmt::Debug for ClassifierError {
             .field("operation", &self.error.operation)
             .field("disposition", &self.disposition)
             .field("http_status", &self.error.http_status)
+            .field("retry_after", &self.retry_after)
             .field(
                 "raw_response_len",
                 &self.raw_response.as_ref().map(|r| r.len()),
@@ -2554,6 +2588,7 @@ mod tests {
             error: app_err,
             disposition: RetryDisposition::Retryable,
             raw_response: Some("raw body content SENTINEL-RAW".to_string()),
+            retry_after: None,
         };
 
         let debug_output = format!("{err:?}");
@@ -2578,6 +2613,7 @@ mod tests {
             error: app_err,
             disposition: RetryDisposition::Retryable,
             raw_response: Some("raw body content".to_string()),
+            retry_after: None,
         };
 
         let display_output = format!("{err}");
@@ -2596,6 +2632,7 @@ mod tests {
             error: app_err,
             disposition: RetryDisposition::Retryable,
             raw_response: None,
+            retry_after: None,
         };
 
         let debug_output = format!("{err:?}");
