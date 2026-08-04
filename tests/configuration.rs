@@ -1036,7 +1036,7 @@ log_level = "info"
 
 [nvr]
 scheme = "http"
-host = "pigate"
+host = "nvr.example.invalid"
 port = 8080
 username = "admin"
 password = "test-pass"

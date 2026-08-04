@@ -1,0 +1,38 @@
+name: Publish Docker image
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" \
+            | docker login ghcr.io \
+              --username "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Build Docker image
+        run: docker build -t "$IMAGE_NAME:$IMAGE_TAG" -t "$IMAGE_NAME:latest" .
+
+      - name: Push Docker image
+        run: |
+          docker push "$IMAGE_NAME:$IMAGE_TAG"
+          docker push "$IMAGE_NAME:latest"

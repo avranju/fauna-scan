@@ -5,6 +5,21 @@ NVR picture metadata, downloads new JPEGs into a backend-neutral durable state
 (SQLite or PostgreSQL), and classifies them through one or more
 OpenAI-compatible vision API endpoints.
 
+## Privacy and security
+
+Fauna Scan processes surveillance data. It persists camera metadata, NVR
+image URLs, downloaded JPEGs, and classification results in its configured
+database and output directory. When classification is enabled, each image sent
+for classification is transmitted to the configured OpenAI-compatible endpoint.
+Only configure providers and storage locations you trust, and ensure that your
+use of camera footage complies with applicable consent, privacy, and retention
+requirements.
+
+The web dashboard has no built-in authentication. Keep its listener on
+loopback, as in the default configuration, or put it behind an authenticated
+TLS reverse proxy. Protect the configuration and secret files, database, and
+image output directory from unauthorized access.
+
 ## Data backend
 
 Fauna Scan stores all durable state behind a backend-neutral abstraction.
@@ -185,12 +200,12 @@ collected files are not redownloaded.
 
 ## Docker Compose deployment
 
-The Compose deployment pulls `git.nerdworks.dev/avranju/fauna-scan:latest` from
+The Compose deployment pulls `ghcr.io/avranju/fauna-scan:latest` from
 the registry. Log in first if the registry requires authentication, then prepare
 the container-specific configuration and secret files:
 
 ```bash
-docker login git.nerdworks.dev
+docker login ghcr.io
 cp config.docker.example.toml config.toml
 mkdir -p secrets
 install -m 600 /dev/null secrets/nvr-password

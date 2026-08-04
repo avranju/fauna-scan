@@ -1,6 +1,6 @@
 services:
   fauna-scan:
-    image: git.nerdworks.dev/avranju/fauna-scan:latest
+    image: ghcr.io/avranju/fauna-scan:latest
     pull_policy: always
     restart: unless-stopped
     ports:

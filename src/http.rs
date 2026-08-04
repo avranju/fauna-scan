@@ -268,9 +268,9 @@ mod tests {
 
     #[test]
     fn origin_normalizes_host_casing() {
-        let url = Url::parse("http://PiGate:8080/path").unwrap();
+        let url = Url::parse("http://NVR.EXAMPLE.INVALID:8080/path").unwrap();
         let origin = Origin::from_url(&url).unwrap();
-        assert_eq!(origin.host(), "pigate");
+        assert_eq!(origin.host(), "nvr.example.invalid");
     }
 
     #[test]

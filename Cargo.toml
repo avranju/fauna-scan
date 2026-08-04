@@ -1,7 +1,15 @@
 [package]
 name = "fauna-scan"
 version = "0.1.0"
+description = "Discover Hikvision NVR images and classify wildlife with OpenAI-compatible vision APIs"
+license = "MIT"
+repository = "https://github.com/avranju/fauna-scan"
+homepage = "https://github.com/avranju/fauna-scan"
+readme = "README.md"
+keywords = ["wildlife", "hikvision", "nvr", "computer-vision", "camera"]
+categories = ["command-line-utilities", "multimedia::images"]
 edition = "2024"
+rust-version = "1.97"
 default-run = "fauna-scan"
 
 [[bin]]

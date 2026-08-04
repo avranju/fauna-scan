@@ -323,22 +323,22 @@ async fn embedded_credentials_in_url_rejected() {
 #[tokio::test]
 async fn origin_normalization() {
     let _http = SharedHttpClient::build(HttpClientConfig::from_seconds(5, 10, false)).unwrap();
-    let origin = Origin::from_url(&Url::parse("http://PiGate:80/").unwrap()).unwrap();
+    let origin = Origin::from_url(&Url::parse("http://NVR.EXAMPLE.INVALID:80/").unwrap()).unwrap();
 
     // Same host with different casing — should match
-    let url1 = Url::parse("http://pigate/ISAPI/Streaming/channels").unwrap();
+    let url1 = Url::parse("http://nvr.example.invalid/ISAPI/Streaming/channels").unwrap();
     assert!(origin.matches(&url1));
 
     // Default port 80 — should match explicit 80
-    let url2 = Url::parse("http://PiGate:80/ISAPI/Streaming/channels").unwrap();
+    let url2 = Url::parse("http://NVR.EXAMPLE.INVALID:80/ISAPI/Streaming/channels").unwrap();
     assert!(origin.matches(&url2));
 
     // Different port — should not match
-    let url3 = Url::parse("http://pigate:8080/ISAPI/Streaming/channels").unwrap();
+    let url3 = Url::parse("http://nvr.example.invalid:8080/ISAPI/Streaming/channels").unwrap();
     assert!(!origin.matches(&url3));
 
     // HTTPS — should not match
-    let url4 = Url::parse("https://pigate/ISAPI/Streaming/channels").unwrap();
+    let url4 = Url::parse("https://nvr.example.invalid/ISAPI/Streaming/channels").unwrap();
     assert!(!origin.matches(&url4));
 }
 

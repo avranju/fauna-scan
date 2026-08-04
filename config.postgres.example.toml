@@ -43,7 +43,7 @@ maximum_clip_duration_seconds = 120
 
 [nvr]
 scheme = "http"
-host = "pigate"
+host = "nvr.example.invalid"
 port = 8080
 username = "admin"
 password_file = "/run/secrets/nvr_password"

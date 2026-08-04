@@ -128,7 +128,7 @@ non_wildlife_image_retention_days = 4
 
 [nvr]
 scheme = "http"
-host = "pigate"
+host = "nvr.example.invalid"
 port = 8080
 username = "admin"
 password_file = "/home/user/.config/fauna-scan/nvr-password"
@@ -567,7 +567,7 @@ For example:
 
 ```text
 Returned:
-http://pigate:8080/picture/Streaming/tracks/103/?starttime=...
+http://nvr.example.invalid:8080/picture/Streaming/tracks/103/?starttime=...
 
 Configured NVR:
 http://192.168.1.50:8080
@@ -1747,4 +1747,3 @@ The implementation should avoid:
 * Unbounded task spawning.
 * Blindly trusting playback URI hosts.
 * Assuming every successful HTTP response contains the expected XML or JPEG data.
-

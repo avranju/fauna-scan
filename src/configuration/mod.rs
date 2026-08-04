@@ -2080,7 +2080,7 @@ output_directory = "/tmp/fauna-output"
 
 [nvr]
 scheme = "http"
-host = "pigate"
+host = "nvr.example.invalid"
 port = 8080
 username = "admin"
 password = "test-pass"
@@ -2102,7 +2102,7 @@ output_directory = "/tmp/fauna-output"
 
 [nvr]
 scheme = "http"
-host = "pigate"
+host = "nvr.example.invalid"
 port = 8080
 username = "admin"
 password = "test-pass"
@@ -2124,7 +2124,7 @@ output_directory = "/tmp/fauna-output"
 
 [nvr]
 scheme = "http"
-host = "pigate"
+host = "nvr.example.invalid"
 port = 8080
 username = "admin"
 password = "test-pass"
@@ -2555,7 +2555,7 @@ mod tests {
     }
 
     fn minimal_valid_toml() -> &'static str {
-        "[general]\noutput_directory = \"/tmp/fauna-output\"\n\n[nvr]\nscheme = \"http\"\nhost = \"pigate\"\nport = 8080\nusername = \"admin\"\npassword = \"test-pass\"\nstart_at = \"2026-07-11T00:00:00Z\"\n\n[classifier]\n"
+        "[general]\noutput_directory = \"/tmp/fauna-output\"\n\n[nvr]\nscheme = \"http\"\nhost = \"nvr.example.invalid\"\nport = 8080\nusername = \"admin\"\npassword = \"test-pass\"\nstart_at = \"2026-07-11T00:00:00Z\"\n\n[classifier]\n"
     }
 
     #[test]
@@ -2564,7 +2564,7 @@ mod tests {
         let path = write_config(&dir, minimal_valid_toml());
         let config = Config::load(Some(&path)).unwrap();
         assert_eq!(config.nvr.scheme, "http");
-        assert_eq!(config.nvr.host, "pigate");
+        assert_eq!(config.nvr.host, "nvr.example.invalid");
         assert_eq!(config.nvr.port, 8080);
         assert!(config.classifier.endpoints.is_empty());
     }
@@ -3040,7 +3040,7 @@ log_level = "info"
 
 [nvr]
 scheme = "http"
-host = "pigate"
+host = "nvr.example.invalid"
 port = 8080
 username = "admin"
 password = "test-pass"
@@ -3092,7 +3092,7 @@ max_tokens = 1000
         let config = Config::load(Some(&path)).unwrap();
 
         assert_eq!(config.nvr.scheme, "http");
-        assert_eq!(config.nvr.host, "pigate");
+        assert_eq!(config.nvr.host, "nvr.example.invalid");
         assert_eq!(config.nvr.port, 8080);
         assert_eq!(config.nvr.request_timeout_seconds, 30);
         assert_eq!(config.nvr.connect_timeout_seconds, 10);

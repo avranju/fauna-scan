@@ -2850,8 +2850,8 @@ mod tests {
 
     #[test]
     fn nvr_identity_normalizes_hostname() {
-        let identity = configured_nvr_identity("https", "pigate", 443);
-        assert_eq!(identity, "https://pigate:443");
+        let identity = configured_nvr_identity("https", "nvr.example.invalid", 443);
+        assert_eq!(identity, "https://nvr.example.invalid:443");
     }
 
     // ── Malformed item validation tests ──────────────────────────────────

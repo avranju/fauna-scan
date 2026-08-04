@@ -1258,7 +1258,7 @@ mod tests {
 
     #[test]
     fn validate_host_accepts_simple_hostname() {
-        let result = validate_host("pigate");
+        let result = validate_host("nvr.example.invalid");
         assert!(result.is_ok());
     }
 
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn transport_from_config_accepts_valid_hostname() {
-        let result = validate_host("pigate");
+        let result = validate_host("nvr.example.invalid");
         assert!(result.is_ok());
     }
 
@@ -1373,7 +1373,7 @@ mod tests {
 
     #[test]
     fn is_legacy_ipv4_hostname() {
-        assert!(!is_legacy_ipv4("pigate"));
+        assert!(!is_legacy_ipv4("nvr.example.invalid"));
         assert!(!is_legacy_ipv4("example.com"));
     }
 
@@ -1494,7 +1494,7 @@ mod tests {
 
     #[test]
     fn validate_host_accepts_canonical_hostname() {
-        let result = validate_host("pigate");
+        let result = validate_host("nvr.example.invalid");
         assert!(result.is_ok());
 
         let result = validate_host("NVR-Server.local");
@@ -1526,9 +1526,9 @@ mod tests {
 
     #[test]
     fn build_origin_url_http_simple_host() {
-        let url = build_origin_url("http", "pigate", 8080).unwrap();
+        let url = build_origin_url("http", "nvr.example.invalid", 8080).unwrap();
         assert_eq!(url.scheme(), "http");
-        assert_eq!(url.host_str(), Some("pigate"));
+        assert_eq!(url.host_str(), Some("nvr.example.invalid"));
         assert_eq!(url.port(), Some(8080));
     }
 
