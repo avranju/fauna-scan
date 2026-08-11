@@ -43,7 +43,7 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
     }
 }
 
-/// Serve the dashboard against durable state without running worker pipelines.
+/// Serve the API against durable state without running worker pipelines.
 async fn handle_web(config_path: Option<&Path>) -> AppResult<()> {
     let config = Config::load(config_path)?;
     create_runtime_directories(&config)?;

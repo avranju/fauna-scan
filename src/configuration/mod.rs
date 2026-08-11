@@ -214,16 +214,16 @@ pub struct Config {
     pub nvr: NvrConfig,
     /// Classifier (vision LLM) settings.
     pub classifier: ClassifierConfig,
-    /// Optional local web interface settings.
+    /// Optional local API server settings.
     pub web: WebConfig,
     /// The configuration file path that was loaded.
     pub source_path: PathBuf,
 }
 
-/// Resolved web interface settings.
+/// Resolved API server settings.
 #[derive(Debug, Clone)]
 pub struct WebConfig {
-    /// Whether `run` should serve the web interface.
+    /// Whether `run` should serve the API.
     pub enabled: bool,
     /// Address on which the Axum server listens.
     pub listen_address: SocketAddr,
@@ -231,7 +231,7 @@ pub struct WebConfig {
     pub clip_pre_roll_seconds: u64,
     /// Seconds included after an image timestamp in recording searches.
     pub clip_post_roll_seconds: u64,
-    /// Maximum total recording-search interval accepted from the browser.
+    /// Maximum total recording-search interval accepted from an API client.
     pub maximum_clip_duration_seconds: u64,
 }
 

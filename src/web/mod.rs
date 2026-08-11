@@ -1,8 +1,8 @@
-//! Axum-powered read-only web interface and JSON API.
+//! Axum-powered read-only JSON API.
 //!
-//! Exposes a REST API for browsing images, cameras, health, and activity,
-//! plus static assets and an HTML dashboard.  All data access goes through
-//! `DatabaseOps` — the backend-neutral façade — so the web layer is
+//! Exposes a REST API for browsing images, cameras, health, and activity.
+//! All data access goes through `DatabaseOps` — the backend-neutral façade —
+//! so the web layer is
 //! agnostic to whether the backing store is SQLite or PostgreSQL.
 
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine;
@@ -31,10 +31,6 @@ use crate::domain::{ImageId, Timestamp, TrackId};
 use crate::error::{AppError, AppResult, ErrorCategory};
 use crate::nvr::{NvrTransport, RecordingSearchClient};
 use crate::service_lifecycle::ShutdownToken;
-
-const INDEX_HTML: &str = include_str!("assets/index.html");
-const APP_CSS: &str = include_str!("assets/app.css");
-const APP_JS: &str = include_str!("assets/app.js");
 
 // ── Web state ──────────────────────────────────────────────────────────────
 
@@ -67,7 +63,7 @@ impl WebState {
 
 // ── Server startup ─────────────────────────────────────────────────────────
 
-/// Serve the UI until the shared service shutdown token is cancelled.
+/// Serve the API until the shared service shutdown token is cancelled.
 pub async fn serve(state: WebState, shutdown: ShutdownToken) -> AppResult<()> {
     let listen_address = state.web.listen_address;
     let app = router(state);
@@ -77,11 +73,11 @@ pub async fn serve(state: WebState, shutdown: ShutdownToken) -> AppResult<()> {
             AppError::with_source(
                 ErrorCategory::Configuration,
                 "web_bind",
-                format!("failed to bind web interface on {listen_address}"),
+                format!("failed to bind API server on {listen_address}"),
                 error,
             )
         })?;
-    tracing::info!(address = %listen_address, "Web interface listening");
+    tracing::info!(address = %listen_address, "API server listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
@@ -89,7 +85,7 @@ pub async fn serve(state: WebState, shutdown: ShutdownToken) -> AppResult<()> {
             AppError::with_source(
                 ErrorCategory::Network,
                 "web_serve",
-                "web interface server failed",
+                "API server failed",
                 error,
             )
         })
@@ -97,15 +93,6 @@ pub async fn serve(state: WebState, shutdown: ShutdownToken) -> AppResult<()> {
 
 pub fn router(state: WebState) -> Router {
     Router::new()
-        // SPA fallback routes
-        .route("/", get(index))
-        .route("/images", get(index))
-        .route("/images/{id}", get(index))
-        .route("/activity", get(index))
-        .route("/about", get(index))
-        // Static assets
-        .route("/assets/app.css", get(css))
-        .route("/assets/app.js", get(javascript))
         // API endpoints
         .route("/api/v1/config", get(api_config))
         .route("/api/v1/health", get(api_health))
@@ -121,35 +108,6 @@ pub fn router(state: WebState) -> Router {
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
-}
-
-// ── Static asset handlers ──────────────────────────────────────────────────
-
-async fn index() -> Response {
-    let mut response = Html(INDEX_HTML).into_response();
-    security_headers(response.headers_mut());
-    response
-}
-
-async fn css() -> Response {
-    static_asset(APP_CSS, "text/css; charset=utf-8")
-}
-
-async fn javascript() -> Response {
-    static_asset(APP_JS, "text/javascript; charset=utf-8")
-}
-
-fn static_asset(body: &'static str, content_type: &'static str) -> Response {
-    let mut response = Response::new(Body::from(body));
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    response.headers_mut().insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=3600"),
-    );
-    security_headers(response.headers_mut());
-    response
 }
 
 fn security_headers(headers: &mut HeaderMap) {
@@ -1171,15 +1129,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_has_security_headers() {
+    async fn ui_routes_are_not_served() {
         let (_root, state) = test_state().await;
         let response = router(state)
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().contains_key("content-security-policy"));
-        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -85,7 +85,7 @@ run:
 run-debug:
 	fauna-scan --log-level debug --config "${XDG_CONFIG_HOME:-$HOME/.config}/fauna-scan/config.toml" run
 
-# Serve only the web interface
+# Serve only the API
 web:
 	fauna-scan --config "${XDG_CONFIG_HOME:-$HOME/.config}/fauna-scan/config.toml" web
 
