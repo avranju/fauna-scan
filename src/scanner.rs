@@ -1478,6 +1478,15 @@ pub fn classification_input(
             e,
         )
     })?;
+    let bounding_boxes_json = serde_json::to_string(&output.classification.bounding_boxes)
+        .map_err(|e| {
+            AppError::with_source(
+                ErrorCategory::Internal,
+                "classification_input",
+                format!("failed to serialize bounding boxes: {e}"),
+                e,
+            )
+        })?;
 
     Ok(ClassificationInput {
         model: model.to_string(),
@@ -1486,6 +1495,7 @@ pub fn classification_input(
         is_interesting: output.classification.is_interesting,
         summary: Some(output.classification.summary),
         species_json: Some(species_json),
+        bounding_boxes_json: Some(bounding_boxes_json),
         confidence: Some(output.classification.overall_confidence),
         classification_json: Some(output.classification_json),
         raw_response: Some(output.raw_response),
@@ -1924,7 +1934,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"{"choices":[{"message":{"content":"{\"contains_animal\":false,\"contains_wildlife\":false,\"is_interesting\":false,\"species\":[],\"overall_confidence\":0.1,\"summary\":\"none\",\"uncertainties\":[]}"}}]}"#,
+                r#"{"choices":[{"message":{"content":"{\"contains_animal\":false, \"bounding_boxes\": [],\"contains_wildlife\":false,\"is_interesting\":false,\"species\":[],\"overall_confidence\":0.1,\"summary\":\"none\",\"uncertainties\":[]}"}}]}"#,
             ))
             .mount(&server)
             .await;

@@ -245,10 +245,20 @@ async fn wait_for_processing_status(db_path: &std::path::Path, status: Processin
 }
 
 fn classifier_success_body() -> String {
+    let classification = serde_json::json!({
+        "contains_animal": true,
+        "contains_wildlife": true,
+        "is_interesting": true,
+        "species": [],
+        "bounding_boxes": [{"x_min": 0.2, "y_min": 0.2, "x_max": 0.8, "y_max": 0.8}],
+        "overall_confidence": 0.9,
+        "summary": "ok",
+        "uncertainties": []
+    });
     serde_json::json!({
         "choices": [{
             "message": {
-                "content": r#"{"contains_animal":true,"contains_wildlife":true,"is_interesting":true,"species":[],"overall_confidence":0.9,"summary":"ok","uncertainties":[]}"#
+                "content": classification.to_string()
             }
         }]
     })

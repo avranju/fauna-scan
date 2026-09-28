@@ -311,7 +311,7 @@ model = "tertiary-model"
     assert_eq!(endpoint.endpoint, "/chat/completions");
     assert_eq!(endpoint.model, "secondary-model");
     assert_eq!(endpoint.request_timeout_seconds, 60);
-    assert_eq!(endpoint.prompt_version, "wildlife-v1");
+    assert_eq!(endpoint.prompt_version, "wildlife-v2");
     assert_eq!(endpoint.generation.temperature, 0.4);
     assert_eq!(endpoint.generation.max_tokens, 500);
     assert_eq!(endpoint.api_key.as_ref().unwrap().expose(), "secondary-key");

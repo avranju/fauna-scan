@@ -195,6 +195,7 @@ impl Respond for ClassifierResponder {
             .fetch_add(1, Ordering::SeqCst);
         let content = json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [{"name": "small mammal", "confidence": 0.8}],

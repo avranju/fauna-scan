@@ -56,7 +56,7 @@ The design uses these existing Fauna Scan concepts:
 
 - `cameras` contains channel, primary-video track, picture track, name, enabled state, and discovery timestamps.
 - `images` contains capture time, NVR `playback_uri`, rebased `canonical_playback_uri`, local path, download state, processing state, attempts, errors, retry times, and lease times.
-- `classifications` contains model, prompt version, wildlife and interesting flags, summary, species JSON, confidence, normalized classification JSON, raw response, and request timestamps.
+- `classifications` contains model, prompt version, wildlife and interesting flags, summary, species JSON, bounding boxes JSON, confidence, normalized classification JSON, raw response, and request timestamps.
 - `search_cursors` contains the per-camera completed search window, next search time, last poll time, and last error.
 - `service_metadata` records milestones such as last successful camera discovery, downloader poll, and scanner pass.
 - The downloader can process more than one image concurrently. Each configured classifier endpoint owns one worker, so more than one classification may be active.
@@ -372,6 +372,7 @@ The primary result panel shows:
 - Overall confidence.
 - Full model summary without truncation.
 - Uncertainties or other normalized structured fields when present.
+- Image-relative animal bounding boxes when present; historical classifications have a null value.
 - Model, prompt version, request start/end, and request duration.
 
 If several classification records exist, a selector ordered newest first changes the displayed result. The default is the newest completed classification, not the row with the highest confidence. Never merge fields from different classifications.
@@ -745,7 +746,7 @@ All JSON endpoints are under `/api/v1`. Timestamps are RFC 3339 UTC strings. IDs
 | `GET /api/v1/overview` | Filtered counters, activity buckets, and recent interesting images |
 | `GET /api/v1/images` | Filtered, sorted, cursor-paginated image projection |
 | `GET /api/v1/images/:id` | Complete safe image detail and classifications |
-| `GET /api/v1/images/:id/content` | Full local JPEG |
+| `GET /api/v1/images/:id/content` | Full local JPEG; `?draw-bounding-box=true` draws the newest classification's boxes |
 | `GET /api/v1/images/:id/thumbnail` | Generated/cached thumbnail |
 | `GET /api/v1/images/:id/recording` | Resolve or read cached NVR recording descriptor |
 | `GET /api/v1/images/:id/clip` | Browser-compatible bounded clip stream, if supported |

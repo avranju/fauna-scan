@@ -5,6 +5,8 @@
 //! so the web layer is
 //! agnostic to whether the backing store is SQLite or PostgreSQL.
 
+mod bounding_boxes;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -20,10 +22,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 use url::Url;
 
+use crate::classifier::BoundingBox;
 use crate::configuration::{Config, NvrConfig, WebConfig};
 use crate::database::repository::DatabaseOps;
 use crate::database::web_models::*;
@@ -41,6 +45,7 @@ pub struct WebState {
     web: WebConfig,
     nvr: NvrConfig,
     recording_search: Arc<RecordingSearchClient>,
+    bounding_box_render_limit: Arc<Semaphore>,
     #[allow(dead_code)]
     started_at: Timestamp,
 }
@@ -55,6 +60,9 @@ impl WebState {
             recording_search: Arc::new(RecordingSearchClient::new(
                 transport,
                 config.nvr.search.max_results,
+            )),
+            bounding_box_render_limit: Arc::new(Semaphore::new(
+                config.web.max_concurrent_bounding_box_renders,
             )),
             started_at: Timestamp::new(Utc::now()),
         }
@@ -101,7 +109,7 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/images", get(api_images))
         .route("/api/v1/images/{id}", get(api_image))
         .route("/api/v1/images/{id}/content", get(api_image_content))
-        .route("/api/v1/images/{id}/thumbnail", get(api_image_content))
+        .route("/api/v1/images/{id}/thumbnail", get(api_image_thumbnail))
         .route("/api/v1/images/{id}/recording", get(api_recording))
         .route("/api/v1/activity", get(api_activity))
         .fallback(not_found)
@@ -589,6 +597,7 @@ async fn api_image(
                 "interesting": c.is_interesting,
                 "summary": c.summary,
                 "species": c.species,
+                "bounding_boxes": c.bounding_boxes,
                 "confidence": c.confidence,
                 "structured": c.structured,
                 "request_started_at": c.request_started_at,
@@ -639,9 +648,31 @@ async fn api_image(
 
 // ── API: image content ─────────────────────────────────────────────────────
 
+#[derive(Default, Deserialize)]
+struct ImageContentParams {
+    #[serde(rename = "draw-bounding-box")]
+    draw_bounding_box: Option<bool>,
+}
+
 async fn api_image_content(
     State(state): State<WebState>,
     AxumPath(id): AxumPath<i64>,
+    Query(params): Query<ImageContentParams>,
+) -> Result<Response, WebError> {
+    serve_image_content(state, id, params.draw_bounding_box == Some(true)).await
+}
+
+async fn api_image_thumbnail(
+    State(state): State<WebState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Response, WebError> {
+    serve_image_content(state, id, false).await
+}
+
+async fn serve_image_content(
+    state: WebState,
+    id: i64,
+    draw_bounding_box: bool,
 ) -> Result<Response, WebError> {
     let lookup = state
         .ops
@@ -672,7 +703,43 @@ async fn api_image_content(
         });
     }
 
-    let bytes = tokio::fs::read(&path)
+    let boxes = if draw_bounding_box {
+        lookup
+            .bounding_boxes_json
+            .as_deref()
+            .map(|json| {
+                serde_json::from_str::<Vec<BoundingBox>>(json).map_err(|_| WebError {
+                    status: StatusCode::UNPROCESSABLE_ENTITY,
+                    code: "invalid_bounding_boxes",
+                    message: "The image's bounding box data is invalid".into(),
+                })
+            })
+            .transpose()?
+            .filter(|boxes| !boxes.is_empty())
+    } else {
+        None
+    };
+
+    // Acquire before reading the JPEG so waiting requests do not retain image
+    // bytes. Move the permit into the blocking task so cancellation of the
+    // HTTP request cannot release it while a render is still running.
+    let render = if let Some(boxes) = boxes {
+        let permit = state
+            .bounding_box_render_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| WebError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "image_rendering_unavailable",
+                message: "Image rendering is unavailable".into(),
+            })?;
+        Some((boxes, permit))
+    } else {
+        None
+    };
+
+    let mut bytes = tokio::fs::read(&path)
         .await
         .map_err(|_| WebError::not_found("Local image file could not be read"))?;
 
@@ -685,13 +752,37 @@ async fn api_image_content(
         });
     }
 
+    if let Some((boxes, permit)) = render {
+        let color = state.web.bounding_box_color;
+        let stroke_width = state.web.bounding_box_width_pixels;
+        bytes = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            bounding_boxes::render_jpeg_with_boxes(&bytes, &boxes, color, stroke_width)
+        })
+        .await
+        .map_err(|_| WebError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "image_processing_failed",
+            message: "Could not draw image bounding boxes".into(),
+        })?
+        .map_err(|_| WebError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "invalid_image",
+            message: "The local JPEG could not be drawn".into(),
+        })?;
+    }
+
     let mut response = Response::new(Body::from(bytes));
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
     response.headers_mut().insert(
         CACHE_CONTROL,
-        HeaderValue::from_static("private, max-age=300"),
+        HeaderValue::from_static(if draw_bounding_box {
+            "private, no-store"
+        } else {
+            "private, max-age=300"
+        }),
     );
     response.headers_mut().insert(
         CONTENT_DISPOSITION,
@@ -1058,6 +1149,7 @@ mod tests {
             web: WebConfig::default(),
             nvr,
             recording_search: Arc::new(RecordingSearchClient::new(transport, 50)),
+            bounding_box_render_limit: Arc::new(Semaphore::new(2)),
             started_at: "2026-07-21T10:00:00Z".parse().unwrap(),
         };
         (root, state)

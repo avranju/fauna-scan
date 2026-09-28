@@ -11,6 +11,27 @@ Fauna Scan processes surveillance data. It persists camera metadata, NVR
 image URLs, downloaded JPEGs, and classification results in its configured
 database and output directory. When classification is enabled, each image sent
 for classification is transmitted to the configured OpenAI-compatible endpoint.
+
+Classifications include `bounding_boxes`: one image-relative box per visible
+animal (including domestic animals), with `x_min`, `y_min`, `x_max`, and `y_max`
+in the range `0.0` to `1.0`. The origin is the image's top-left corner. An
+image without animals has an empty array. Validated boxes are stored in
+`classifications.bounding_boxes_json` and included in `classification_json`;
+the image detail API returns them as `classifications[].bounding_boxes`.
+Historical classifications return `null` for boxes; new classifications with
+no animals return `[]`. Existing `prompt_version` settings
+should be changed to `wildlife-v2` for new classifications using this contract;
+completed images are not automatically classified again.
+
+Request `/api/v1/images/IMAGE_ID/content?draw-bounding-box=true` to draw the
+newest classification's boxes on the returned JPEG. The original JPEG is
+returned when there are no boxes. Set `[web].bounding_box_color` to a `#RRGGBB`
+color (default `#FFFF00`, yellow) and `[web].bounding_box_width_pixels` to a
+stroke width from 1 to 64 (default 3). These settings only affect rendered
+responses; stored images are unchanged. Use
+`[web].max_concurrent_bounding_box_renders` to limit simultaneous annotated
+JPEG renders (1 to 16, default 2). Requests above the limit wait before the
+image file is read.
 Only configure providers and storage locations you trust, and ensure that your
 use of camera footage complies with applicable consent, privacy, and retention
 requirements.

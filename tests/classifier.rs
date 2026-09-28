@@ -104,7 +104,7 @@ fn valid_openai_response() -> String {
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": "{\"contains_animal\": true, \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [{\"name\": \"Indian palm squirrel\", \"confidence\": 0.82}], \"overall_confidence\": 0.82, \"summary\": \"A small squirrel is moving along the garden wall.\", \"uncertainties\": []}"
+                "content": "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [{\"name\": \"Indian palm squirrel\", \"confidence\": 0.82}], \"overall_confidence\": 0.82, \"summary\": \"A small squirrel is moving along the garden wall.\", \"uncertainties\": []}"
             },
             "finish_reason": "stop"
         }],
@@ -128,7 +128,7 @@ fn valid_openai_response_markdown() -> String {
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": "```json\n{\"contains_animal\": false, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.3, \"summary\": \"A garden with a bird feeder.\", \"uncertainties\": [\"image quality moderate\"]}\n```"
+                "content": "```json\n{\"contains_animal\": false, \"bounding_boxes\": [], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.3, \"summary\": \"A garden with a bird feeder.\", \"uncertainties\": [\"image quality moderate\"]}\n```"
             },
             "finish_reason": "stop"
         }],
@@ -148,13 +148,13 @@ fn valid_openai_response_structured_output_string() -> String {
         "object": "chat.completion",
         "created": 1234567890,
         "model": "test-model",
-        "output_parsed": "{\"contains_animal\": true, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [{\"name\": \"house cat\", \"confidence\": 0.95}], \"overall_confidence\": 0.95, \"summary\": \"A domestic cat sitting on a windowsill.\", \"uncertainties\": []}",
+        "output_parsed": "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [{\"name\": \"house cat\", \"confidence\": 0.95}], \"overall_confidence\": 0.95, \"summary\": \"A domestic cat sitting on a windowsill.\", \"uncertainties\": []}",
         "choices": [{
             "index": 0,
             "message": {
                 "role": "assistant",
                 "content": null,
-                "parsed": "{\"contains_animal\": true, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [{\"name\": \"house cat\", \"confidence\": 0.95}], \"overall_confidence\": 0.95, \"summary\": \"A domestic cat sitting on a windowsill.\", \"uncertainties\": []}"
+                "parsed": "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [{\"name\": \"house cat\", \"confidence\": 0.95}], \"overall_confidence\": 0.95, \"summary\": \"A domestic cat sitting on a windowsill.\", \"uncertainties\": []}"
             },
             "finish_reason": "stop"
         }],
@@ -271,7 +271,7 @@ async fn valid_openai_response_message_parsed_as_string() {
             "message": {
                 "role": "assistant",
                 "content": null,
-                "parsed": "{\"contains_animal\": true, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [{\"name\": \"robin\", \"confidence\": 0.7}], \"overall_confidence\": 0.7, \"summary\": \"A robin on the ground.\", \"uncertainties\": []}"
+                "parsed": "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [{\"name\": \"robin\", \"confidence\": 0.7}], \"overall_confidence\": 0.7, \"summary\": \"A robin on the ground.\", \"uncertainties\": []}"
             },
             "finish_reason": "stop"
         }],

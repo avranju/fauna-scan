@@ -101,7 +101,7 @@ fn valid_openai_response() -> String {
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": "{\"contains_animal\": true, \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [{\"name\": \"Indian palm squirrel\", \"confidence\": 0.82}], \"overall_confidence\": 0.82, \"summary\": \"A small squirrel.\", \"uncertainties\": []}"
+                "content": "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [{\"name\": \"Indian palm squirrel\", \"confidence\": 0.82}], \"overall_confidence\": 0.82, \"summary\": \"A small squirrel.\", \"uncertainties\": []}"
             },
             "finish_reason": "stop"
         }]
@@ -1712,7 +1712,7 @@ async fn scanner_pass_collects_old_negative_image() {
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": "{\"contains_animal\": false, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.1, \"summary\": \"Nothing wildlife.\", \"uncertainties\": []}"
+                "content": "{\"contains_animal\": false, \"bounding_boxes\": [], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.1, \"summary\": \"Nothing wildlife.\", \"uncertainties\": []}"
             },
             "finish_reason": "stop"
         }]

@@ -167,7 +167,7 @@ retry_limit = 5
 retry_initial_delay_seconds = 10
 retry_max_delay_seconds = 300
 processing_lease_seconds = 600
-prompt_version = "wildlife-v1"
+prompt_version = "wildlife-v2"
 
 [classifier.generation]
 temperature = 0.1
@@ -697,6 +697,7 @@ contains_wildlife
 is_interesting
 summary
 species_json
+bounding_boxes_json
 confidence
 classification_json
 raw_response
@@ -1147,6 +1148,7 @@ The classifier shall determine:
 * Confidence.
 * A concise description of the scene.
 * Any uncertainty or visibility problems.
+* One image-relative bounding box for each visible animal, including domestic animals.
 
 Humans, vehicles, vegetation movement, shadows, rain, insects near the lens, and camera artifacts should not be classified as wildlife unless an actual animal is visible.
 
@@ -1173,6 +1175,9 @@ The classifier shall be instructed to return a JSON object matching this logical
       "confidence": 0.82
     }
   ],
+  "bounding_boxes": [
+    { "x_min": 0.31, "y_min": 0.22, "x_max": 0.58, "y_max": 0.71 }
+  ],
   "overall_confidence": 0.82,
   "summary": "A small squirrel is moving along the garden wall.",
   "uncertainties": []
@@ -1184,6 +1189,8 @@ Requirements:
 * Boolean fields shall be actual JSON booleans.
 * Confidence values shall be between `0.0` and `1.0`.
 * `species` shall be an array.
+* `bounding_boxes` shall be an array with one tight box per visible animal, or an empty array when `contains_animal` is false.
+* Box coordinates use the full image as the frame, with the top-left corner at `(0, 0)` and the bottom-right corner at `(1, 1)`. Each coordinate shall be within `0.0` and `1.0`; `x_min < x_max` and `y_min < y_max`.
 * Unknown species may use a broad label such as `bird`, `snake`, or `small mammal`.
 * The response shall not claim a precise species when the image does not support one.
 * Additional fields may be retained in `classification_json`.

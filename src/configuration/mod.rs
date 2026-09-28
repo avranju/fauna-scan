@@ -233,6 +233,12 @@ pub struct WebConfig {
     pub clip_post_roll_seconds: u64,
     /// Maximum total recording-search interval accepted from an API client.
     pub maximum_clip_duration_seconds: u64,
+    /// RGB color used for image bounding boxes.
+    pub bounding_box_color: [u8; 3],
+    /// Bounding box stroke width in image pixels.
+    pub bounding_box_width_pixels: u32,
+    /// Maximum number of JPEG bounding box renders running at once.
+    pub max_concurrent_bounding_box_renders: usize,
 }
 
 impl Default for WebConfig {
@@ -243,6 +249,9 @@ impl Default for WebConfig {
             clip_pre_roll_seconds: 10,
             clip_post_roll_seconds: 20,
             maximum_clip_duration_seconds: 120,
+            bounding_box_color: [255, 255, 0],
+            bounding_box_width_pixels: 3,
+            max_concurrent_bounding_box_renders: 2,
         }
     }
 }
@@ -458,6 +467,9 @@ struct RawWebConfig {
     clip_pre_roll_seconds: Option<u64>,
     clip_post_roll_seconds: Option<u64>,
     maximum_clip_duration_seconds: Option<u64>,
+    bounding_box_color: Option<String>,
+    bounding_box_width_pixels: Option<u32>,
+    max_concurrent_bounding_box_renders: Option<usize>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -777,6 +789,18 @@ impl Config {
             clip_pre_roll_seconds: raw.web.clip_pre_roll_seconds.unwrap_or(10),
             clip_post_roll_seconds: raw.web.clip_post_roll_seconds.unwrap_or(20),
             maximum_clip_duration_seconds: raw.web.maximum_clip_duration_seconds.unwrap_or(120),
+            bounding_box_color: raw
+                .web
+                .bounding_box_color
+                .as_deref()
+                .map(parse_bounding_box_color)
+                .transpose()?
+                .unwrap_or([255, 255, 0]),
+            bounding_box_width_pixels: raw.web.bounding_box_width_pixels.unwrap_or(3),
+            max_concurrent_bounding_box_renders: raw
+                .web
+                .max_concurrent_bounding_box_renders
+                .unwrap_or(2),
         };
 
         let config = Config {
@@ -931,7 +955,7 @@ where
         prompt_version: raw
             .prompt_version
             .clone()
-            .unwrap_or_else(|| "wildlife-v1".to_string()),
+            .unwrap_or_else(|| "wildlife-v2".to_string()),
         generation: ClassifierGenerationConfig {
             temperature: generation.temperature.unwrap_or(0.1),
             max_tokens: generation.max_tokens.unwrap_or(1000),
@@ -1122,6 +1146,23 @@ fn invalid_utc_offset<T>() -> AppResult<T> {
     ))
 }
 
+fn parse_bounding_box_color(value: &str) -> AppResult<[u8; 3]> {
+    let invalid = || {
+        AppError::new(
+            ErrorCategory::Configuration,
+            "load_config",
+            "web.bounding_box_color must be a #RRGGBB hexadecimal color",
+        )
+    };
+    let hex = value.strip_prefix('#').ok_or_else(invalid)?;
+    if hex.len() != 6 || !hex.is_ascii() {
+        return Err(invalid());
+    }
+    let component =
+        |range: std::ops::Range<usize>| u8::from_str_radix(&hex[range], 16).map_err(|_| invalid());
+    Ok([component(0..2)?, component(2..4)?, component(4..6)?])
+}
+
 fn validate_config(config: &Config) -> AppResult<()> {
     if config.web.listen_address.port() == 0 {
         return Err(AppError::new(
@@ -1142,6 +1183,20 @@ fn validate_config(config: &Config) -> AppResult<()> {
             ErrorCategory::Configuration,
             "validate_config",
             "web.maximum_clip_duration_seconds must not exceed 86400",
+        ));
+    }
+    if !(1..=64).contains(&config.web.bounding_box_width_pixels) {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "web.bounding_box_width_pixels must be between 1 and 64",
+        ));
+    }
+    if !(1..=16).contains(&config.web.max_concurrent_bounding_box_renders) {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "web.max_concurrent_bounding_box_renders must be between 1 and 16",
         ));
     }
     let default_clip_duration = config

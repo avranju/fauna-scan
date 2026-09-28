@@ -762,7 +762,7 @@ impl PostgresDataStore {
         );
 
         // Fetch classifications for this image
-        let class_rows = sqlx::query("SELECT id, model, prompt_version, contains_wildlife, is_interesting, summary, species_json, confidence, classification_json, request_started_at, request_completed_at, created_at FROM classifications WHERE image_id = $1 ORDER BY request_completed_at DESC, id DESC")
+        let class_rows = sqlx::query("SELECT id, model, prompt_version, contains_wildlife, is_interesting, summary, species_json, confidence, classification_json, request_started_at, request_completed_at, created_at, bounding_boxes_json FROM classifications WHERE image_id = $1 ORDER BY request_completed_at DESC, id DESC")
             .bind(image_id.get())
             .fetch_all(&self.pool)
             .await
@@ -801,6 +801,8 @@ impl PostgresDataStore {
                     .map_err(|e| map_sqlx_error("web_image_detail_class", e))?,
                 cr.try_get(11)
                     .map_err(|e| map_sqlx_error("web_image_detail_class", e))?,
+                cr.try_get(12)
+                    .map_err(|e| map_sqlx_error("web_image_detail_class", e))?,
             ));
         }
 
@@ -835,7 +837,7 @@ impl PostgresDataStore {
         &self,
         image_id: ImageId,
     ) -> AppResult<Option<WebImageContentLookup>> {
-        let row = sqlx::query("SELECT local_path, download_status FROM images WHERE id = $1")
+        let row = sqlx::query("SELECT images.local_path, images.download_status, (SELECT c.bounding_boxes_json FROM classifications c WHERE c.image_id = images.id ORDER BY c.request_completed_at DESC, c.id DESC LIMIT 1) FROM images WHERE images.id = $1")
             .bind(image_id.get())
             .fetch_optional(&self.pool)
             .await
@@ -847,6 +849,9 @@ impl PostgresDataStore {
                     .map_err(|e| map_sqlx_error("web_image_content_lookup", e))?,
                 download_status: r
                     .try_get(1)
+                    .map_err(|e| map_sqlx_error("web_image_content_lookup", e))?,
+                bounding_boxes_json: r
+                    .try_get(2)
                     .map_err(|e| map_sqlx_error("web_image_content_lookup", e))?,
             })),
             None => Ok(None),
@@ -1732,14 +1737,15 @@ impl DataStore for PostgresDataStore {
         let class_row = sqlx::query(
             r#"INSERT INTO classifications (image_id, model, prompt_version, contains_wildlife, is_interesting,
                    summary, species_json, confidence, classification_json, raw_response,
-                   request_started_at, request_completed_at, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                   request_started_at, request_completed_at, created_at, bounding_boxes_json)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                RETURNING id"#,
         ).bind(image_id.get()).bind(&classification.model).bind(&classification.prompt_version)
         .bind(if classification.contains_wildlife { 1i64 } else { 0i64 }).bind(if classification.is_interesting { 1i64 } else { 0i64 })
         .bind(&classification.summary).bind(&classification.species_json)
         .bind(classification.confidence).bind(&classification.classification_json)
         .bind(&classification.raw_response).bind(&started_str).bind(&completed_req_str).bind(&completed_str)
+        .bind(&classification.bounding_boxes_json)
         .fetch_one(tx.as_mut()).await.map_err(|e| map_sqlx_error("complete_classification_insert", e))?;
 
         let class_id: i64 = class_row
@@ -2199,7 +2205,7 @@ impl DataStore for PostgresDataStore {
         model: &str,
         prompt_version: &str,
     ) -> AppResult<ClassificationRecord> {
-        let row = sqlx::query("SELECT id, image_id, model, prompt_version, contains_wildlife, is_interesting, summary, species_json, confidence, classification_json, raw_response, request_started_at, request_completed_at, created_at FROM classifications WHERE image_id = $1 AND model = $2 AND prompt_version = $3")
+        let row = sqlx::query("SELECT id, image_id, model, prompt_version, contains_wildlife, is_interesting, summary, species_json, confidence, classification_json, raw_response, request_started_at, request_completed_at, created_at, bounding_boxes_json FROM classifications WHERE image_id = $1 AND model = $2 AND prompt_version = $3")
             .bind(image_id.get()).bind(model).bind(prompt_version).fetch_one(&self.pool).await.map_err(|e| map_sqlx_error("get_classification", e))?;
         let contains_wildlife_raw: i64 = row
             .try_get(4)
@@ -2244,6 +2250,9 @@ impl DataStore for PostgresDataStore {
                 .map_err(|e| map_sqlx_error("get_classification", e))?,
             classification_json: row
                 .try_get(9)
+                .map_err(|e| map_sqlx_error("get_classification", e))?,
+            bounding_boxes_json: row
+                .try_get(14)
                 .map_err(|e| map_sqlx_error("get_classification", e))?,
             raw_response: row
                 .try_get(10)

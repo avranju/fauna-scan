@@ -717,7 +717,7 @@ impl SqliteDataStore {
         let class_rows: Vec<_> = sqlx::query(
             r#"SELECT id, model, prompt_version, contains_wildlife, is_interesting,
                       summary, species_json, confidence, classification_json,
-                      request_started_at, request_completed_at, created_at
+                      request_started_at, request_completed_at, created_at, bounding_boxes_json
                  FROM classifications
                  WHERE image_id = ?
                  ORDER BY request_completed_at DESC, id DESC"#,
@@ -753,6 +753,8 @@ impl SqliteDataStore {
                 format_timestamp(&parse_timestamp_col(cr, 9)?),
                 format_timestamp(&parse_timestamp_col(cr, 10)?),
                 format_timestamp(&parse_timestamp_col(cr, 11)?),
+                cr.try_get(12)
+                    .map_err(|e| map_sqlx_error("web_image_detail_class", e))?,
             ));
         }
 
@@ -795,11 +797,17 @@ impl SqliteDataStore {
         &self,
         image_id: ImageId,
     ) -> AppResult<Option<WebImageContentLookup>> {
-        let row = sqlx::query(r#"SELECT local_path, download_status FROM images WHERE id = ?"#)
-            .bind(image_id.get())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error("web_image_content_lookup", e))?;
+        let row = sqlx::query(
+            r#"SELECT images.local_path, images.download_status,
+                      (SELECT c.bounding_boxes_json FROM classifications c
+                       WHERE c.image_id = images.id
+                       ORDER BY c.request_completed_at DESC, c.id DESC LIMIT 1)
+               FROM images WHERE images.id = ?"#,
+        )
+        .bind(image_id.get())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_sqlx_error("web_image_content_lookup", e))?;
 
         match row {
             Some(r) => {
@@ -809,9 +817,13 @@ impl SqliteDataStore {
                 let download_status: String = r
                     .try_get(1)
                     .map_err(|e| map_sqlx_error("web_image_content_lookup", e))?;
+                let bounding_boxes_json: Option<String> = r
+                    .try_get(2)
+                    .map_err(|e| map_sqlx_error("web_image_content_lookup", e))?;
                 Ok(Some(WebImageContentLookup {
                     local_path,
                     download_status,
+                    bounding_boxes_json,
                 }))
             }
             None => Ok(None),
@@ -1940,8 +1952,8 @@ impl DataStore for SqliteDataStore {
             r#"INSERT INTO classifications (
                    image_id, model, prompt_version, contains_wildlife, is_interesting,
                    summary, species_json, confidence, classification_json, raw_response,
-                   request_started_at, request_completed_at, created_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                   request_started_at, request_completed_at, created_at, bounding_boxes_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(image_id.get())
         .bind(&classification.model)
@@ -1956,6 +1968,7 @@ impl DataStore for SqliteDataStore {
         .bind(&started_str)
         .bind(&completed_req_str)
         .bind(created_str)
+        .bind(&classification.bounding_boxes_json)
         .execute(tx.as_mut())
         .await
         .map_err(|e| map_sqlx_error("complete_classification_insert", e))?;
@@ -2493,7 +2506,7 @@ impl DataStore for SqliteDataStore {
         let row = sqlx::query(
             r#"SELECT id, image_id, model, prompt_version, contains_wildlife, is_interesting,
                       summary, species_json, confidence, classification_json, raw_response,
-                      request_started_at, request_completed_at, created_at
+                      request_started_at, request_completed_at, created_at, bounding_boxes_json
                  FROM classifications
                  WHERE image_id = ? AND model = ? AND prompt_version = ?"#,
         )
@@ -2536,6 +2549,9 @@ impl DataStore for SqliteDataStore {
                 .map_err(|e| map_sqlx_error("get_classification", e))?,
             classification_json: row
                 .try_get(9)
+                .map_err(|e| map_sqlx_error("get_classification", e))?,
+            bounding_boxes_json: row
+                .try_get(14)
                 .map_err(|e| map_sqlx_error("get_classification", e))?,
             raw_response: row
                 .try_get(10)

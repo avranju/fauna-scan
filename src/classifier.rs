@@ -29,6 +29,15 @@ pub struct SpeciesPrediction {
     pub confidence: f64,
 }
 
+/// Animal location in image-relative coordinates (origin at the top left).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BoundingBox {
+    pub x_min: f64,
+    pub y_min: f64,
+    pub x_max: f64,
+    pub y_max: f64,
+}
+
 /// Validated wildlife classification result returned by the classifier.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WildlifeClassification {
@@ -40,6 +49,8 @@ pub struct WildlifeClassification {
     pub is_interesting: bool,
     /// Predicted species or broad animal types with confidence.
     pub species: Vec<SpeciesPrediction>,
+    /// One box per visible animal, including domestic animals.
+    pub bounding_boxes: Vec<BoundingBox>,
     /// Overall confidence score (0.0 to 1.0).
     pub overall_confidence: f64,
     /// Concise scene description.
@@ -822,6 +833,9 @@ close encounters, or scenic wildlife moments.
 - Humans, vehicles, vegetation movement, shadows, rain, insects near the lens, \
 and camera artifacts should NOT be classified as wildlife.
 - Be cautious with species identification — use broad labels when uncertain.
+- Give one tight bounding box for each visible animal, including domestic animals.
+- Bounding box coordinates are normalized from 0.0 to 1.0 relative to the full image, with (0, 0) at the top left. Use x_min < x_max and y_min < y_max.
+- Return an empty bounding_boxes array when no animal is visible.
 - Report uncertainties about visibility, image quality, or identification confidence.
 - Confidence values must be between 0.0 and 1.0.
 
@@ -839,6 +853,7 @@ fn user_prompt(version: &str) -> String {
         - contains_wildlife: boolean\n\
         - is_interesting: boolean\n\
         - species: array of {{ name: string, confidence: number }}\n\
+        - bounding_boxes: array of {{ x_min, y_min, x_max, y_max }} normalized to 0.0–1.0; one per visible animal, empty when none\n\
         - overall_confidence: number between 0.0 and 1.0\n\
         - summary: brief description of the scene\n\
         - uncertainties: array of uncertainty strings",
@@ -1020,6 +1035,18 @@ fn build_strict_json_schema() -> Value {
         ("additionalProperties".to_string(), Value::Bool(false)),
     ]));
 
+    let bounding_box_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "x_min": {"type": "number", "minimum": 0, "maximum": 1, "description": "Left edge divided by image width"},
+            "y_min": {"type": "number", "minimum": 0, "maximum": 1, "description": "Top edge divided by image height"},
+            "x_max": {"type": "number", "minimum": 0, "maximum": 1, "description": "Right edge divided by image width"},
+            "y_max": {"type": "number", "minimum": 0, "maximum": 1, "description": "Bottom edge divided by image height"}
+        },
+        "required": ["x_min", "y_min", "x_max", "y_max"],
+        "additionalProperties": false
+    });
+
     Value::Object(serde_json::Map::from_iter([
         ("type".to_string(), Value::String("object".to_string())),
         (
@@ -1065,6 +1092,14 @@ fn build_strict_json_schema() -> Value {
                         ("type".to_string(), Value::String("array".to_string())),
                         ("items".to_string(), species_item_schema),
                     ])),
+                ),
+                (
+                    "bounding_boxes".to_string(),
+                    serde_json::json!({
+                        "type": "array",
+                        "description": "One tight box per visible animal, including domestic animals; empty if no animal is visible",
+                        "items": bounding_box_schema
+                    }),
                 ),
                 (
                     "overall_confidence".to_string(),
@@ -1116,6 +1151,7 @@ fn build_strict_json_schema() -> Value {
                 Value::String("contains_wildlife".to_string()),
                 Value::String("is_interesting".to_string()),
                 Value::String("species".to_string()),
+                Value::String("bounding_boxes".to_string()),
                 Value::String("overall_confidence".to_string()),
                 Value::String("summary".to_string()),
                 Value::String("uncertainties".to_string()),
@@ -1424,6 +1460,13 @@ fn validate_classification(value: Value) -> Result<(WildlifeClassification, Stri
                 "contains_wildlife must be a boolean",
             )
         })?;
+    if contains_wildlife && !contains_animal {
+        return Err(AppError::new(
+            ErrorCategory::ClassifierResponse,
+            "validate_classification",
+            "contains_wildlife cannot be true when contains_animal is false",
+        ));
+    }
 
     // Validate is_interesting.
     let is_interesting = obj
@@ -1465,6 +1508,34 @@ fn validate_classification(value: Value) -> Result<(WildlifeClassification, Stri
         .iter()
         .map(validate_species_item)
         .collect::<Result<Vec<SpeciesPrediction>, AppError>>()?;
+
+    let bounding_boxes = obj
+        .get("bounding_boxes")
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorCategory::ClassifierResponse,
+                "validate_classification",
+                "missing required field: bounding_boxes",
+            )
+        })?
+        .as_array()
+        .ok_or_else(|| {
+            AppError::new(
+                ErrorCategory::ClassifierResponse,
+                "validate_classification",
+                "bounding_boxes must be an array",
+            )
+        })?
+        .iter()
+        .map(validate_bounding_box)
+        .collect::<Result<Vec<BoundingBox>, AppError>>()?;
+    if contains_animal != !bounding_boxes.is_empty() {
+        return Err(AppError::new(
+            ErrorCategory::ClassifierResponse,
+            "validate_classification",
+            "bounding_boxes must contain at least one box exactly when contains_animal is true",
+        ));
+    }
 
     // Validate overall_confidence.
     let overall_confidence = obj
@@ -1549,6 +1620,7 @@ fn validate_classification(value: Value) -> Result<(WildlifeClassification, Stri
         contains_wildlife,
         is_interesting,
         species,
+        bounding_boxes,
         overall_confidence,
         summary,
         uncertainties,
@@ -1565,6 +1637,47 @@ fn validate_classification(value: Value) -> Result<(WildlifeClassification, Stri
     })?;
 
     Ok((classification, classification_json))
+}
+
+fn validate_bounding_box(value: &Value) -> Result<BoundingBox, AppError> {
+    let obj = value.as_object().ok_or_else(|| {
+        AppError::new(
+            ErrorCategory::ClassifierResponse,
+            "validate_bounding_box",
+            "bounding box must be a JSON object",
+        )
+    })?;
+    let coordinate = |name: &str| -> Result<f64, AppError> {
+        let number = obj.get(name).and_then(Value::as_f64).ok_or_else(|| {
+            AppError::new(
+                ErrorCategory::ClassifierResponse,
+                "validate_bounding_box",
+                format!("bounding box {name} must be a number"),
+            )
+        })?;
+        if !number.is_finite() || !(0.0..=1.0).contains(&number) {
+            return Err(AppError::new(
+                ErrorCategory::ClassifierResponse,
+                "validate_bounding_box",
+                format!("bounding box {name} must be between 0.0 and 1.0"),
+            ));
+        }
+        Ok(number)
+    };
+    let bounding_box = BoundingBox {
+        x_min: coordinate("x_min")?,
+        y_min: coordinate("y_min")?,
+        x_max: coordinate("x_max")?,
+        y_max: coordinate("y_max")?,
+    };
+    if bounding_box.x_min >= bounding_box.x_max || bounding_box.y_min >= bounding_box.y_max {
+        return Err(AppError::new(
+            ErrorCategory::ClassifierResponse,
+            "validate_bounding_box",
+            "bounding box must have x_min < x_max and y_min < y_max",
+        ));
+    }
+    Ok(bounding_box)
 }
 
 /// Validate a single species item in the species array.
@@ -2148,6 +2261,7 @@ mod tests {
     fn extract_direct_classification_object() {
         let root = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [{"name": "squirrel", "confidence": 0.8}],
@@ -2165,6 +2279,7 @@ mod tests {
         let root = serde_json::json!({
             "output_parsed": {
                 "contains_animal": true,
+                "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
                 "contains_wildlife": false,
                 "is_interesting": false,
                 "species": [],
@@ -2180,7 +2295,7 @@ mod tests {
     #[test]
     fn extract_output_parsed_string() {
         let root = serde_json::json!({
-            "output_parsed": "{\"contains_animal\": true, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.5, \"summary\": \"A cat\", \"uncertainties\": []}"
+            "output_parsed": "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.5, \"summary\": \"A cat\", \"uncertainties\": []}"
         });
         let result = extract_classification_value(root).unwrap();
         assert_eq!(result["contains_wildlife"], false);
@@ -2189,7 +2304,7 @@ mod tests {
     #[test]
     fn extract_output_parsed_string_with_markdown_fence() {
         let root = serde_json::json!({
-            "output_parsed": "```json\n{\"contains_animal\": true, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.5, \"summary\": \"A cat\", \"uncertainties\": []}\n```"
+            "output_parsed": "```json\n{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.5, \"summary\": \"A cat\", \"uncertainties\": []}\n```"
         });
         let result = extract_classification_value(root).unwrap();
         assert_eq!(result["contains_wildlife"], false);
@@ -2200,7 +2315,7 @@ mod tests {
         let root = serde_json::json!({
             "choices": [{
                 "message": {
-                    "content": "{\"contains_animal\": true, \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [], \"overall_confidence\": 0.9, \"summary\": \"A deer\", \"uncertainties\": []}"
+                    "content": "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [], \"overall_confidence\": 0.9, \"summary\": \"A deer\", \"uncertainties\": []}"
                 }
             }]
         });
@@ -2213,7 +2328,7 @@ mod tests {
         let root = serde_json::json!({
             "choices": [{
                 "message": {
-                    "content": "```json\n{\"contains_animal\": true, \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [], \"overall_confidence\": 0.9, \"summary\": \"A deer\", \"uncertainties\": []}\n```"
+                    "content": "```json\n{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [], \"overall_confidence\": 0.9, \"summary\": \"A deer\", \"uncertainties\": []}\n```"
                 }
             }]
         });
@@ -2228,6 +2343,7 @@ mod tests {
                 "message": {
                     "parsed": {
                         "contains_animal": true,
+                        "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
                         "contains_wildlife": true,
                         "is_interesting": true,
                         "species": [],
@@ -2247,7 +2363,7 @@ mod tests {
         let root = serde_json::json!({
             "choices": [{
                 "message": {
-                    "parsed": "{\"contains_animal\": true, \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [], \"overall_confidence\": 0.9, \"summary\": \"A deer\", \"uncertainties\": []}"
+                    "parsed": "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [], \"overall_confidence\": 0.9, \"summary\": \"A deer\", \"uncertainties\": []}"
                 }
             }]
         });
@@ -2260,7 +2376,7 @@ mod tests {
         let root = serde_json::json!({
             "choices": [{
                 "message": {
-                    "parsed": "```json\n{\"contains_animal\": true, \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [], \"overall_confidence\": 0.9, \"summary\": \"A deer\", \"uncertainties\": []}\n```"
+                    "parsed": "```json\n{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": true, \"is_interesting\": true, \"species\": [], \"overall_confidence\": 0.9, \"summary\": \"A deer\", \"uncertainties\": []}\n```"
                 }
             }]
         });
@@ -2292,6 +2408,7 @@ mod tests {
     fn extract_extra_fields_preserved() {
         let root = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [],
@@ -2310,6 +2427,7 @@ mod tests {
     fn validate_valid_classification() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [{"name": "squirrel", "confidence": 0.82}],
@@ -2361,6 +2479,7 @@ mod tests {
     fn validate_wrong_type_species_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": "not-an-array",
@@ -2378,6 +2497,7 @@ mod tests {
     fn validate_invalid_species_item_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [{"confidence": 0.5}],
@@ -2395,6 +2515,7 @@ mod tests {
     fn validate_negative_confidence_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [],
@@ -2412,6 +2533,7 @@ mod tests {
     fn validate_confidence_above_one_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [],
@@ -2433,6 +2555,10 @@ mod tests {
         obj.insert("contains_wildlife".to_string(), serde_json::json!(true));
         obj.insert("is_interesting".to_string(), serde_json::json!(true));
         obj.insert("species".to_string(), serde_json::json!([]));
+        obj.insert(
+            "bounding_boxes".to_string(),
+            serde_json::json!([{"x_min": 0.2, "y_min": 0.2, "x_max": 0.8, "y_max": 0.8}]),
+        );
         obj.insert("overall_confidence".to_string(), serde_json::json!(2.0));
         obj.insert("summary".to_string(), serde_json::json!("test"));
         obj.insert("uncertainties".to_string(), serde_json::json!([]));
@@ -2451,6 +2577,7 @@ mod tests {
     fn validate_species_negative_confidence_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [{"name": "test", "confidence": -0.1}],
@@ -2468,6 +2595,7 @@ mod tests {
     fn validate_species_above_one_confidence_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [{"name": "test", "confidence": 1.5}],
@@ -2485,6 +2613,7 @@ mod tests {
     fn validate_missing_summary_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [],
@@ -2501,6 +2630,7 @@ mod tests {
     fn validate_summary_wrong_type_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [],
@@ -2518,6 +2648,7 @@ mod tests {
     fn validate_uncertainties_wrong_type_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [],
@@ -2535,6 +2666,7 @@ mod tests {
     fn validate_extra_fields_preserved_in_json() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [],
@@ -2561,6 +2693,7 @@ mod tests {
     fn validate_species_null_confidence_fails() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": true,
             "is_interesting": true,
             "species": [{"name": "test", "confidence": null}],
@@ -2655,6 +2788,12 @@ mod tests {
             overall_confidence: 0.9,
             summary: "A cat".to_string(),
             uncertainties: vec![],
+            bounding_boxes: vec![BoundingBox {
+                x_min: 0.2,
+                y_min: 0.2,
+                x_max: 0.8,
+                y_max: 0.8,
+            }],
         };
         let output = ClassifierOutput {
             classification,
@@ -2692,6 +2831,12 @@ mod tests {
             overall_confidence: 0.9,
             summary: "SENTINEL-SUMMARY-LEAK".to_string(),
             uncertainties: vec!["SENTINEL-UNCERTAINTY-LEAK".to_string()],
+            bounding_boxes: vec![BoundingBox {
+                x_min: 0.2,
+                y_min: 0.2,
+                x_max: 0.8,
+                y_max: 0.8,
+            }],
         };
         let output = ClassifierOutput {
             classification,
@@ -2889,6 +3034,7 @@ mod tests {
     fn decode_structured_candidate_object() {
         let value = serde_json::json!({
             "contains_animal": true,
+            "bounding_boxes": [{"x_min":0.2,"y_min":0.2,"x_max":0.8,"y_max":0.8}],
             "contains_wildlife": false,
             "is_interesting": false,
             "species": [],
@@ -2904,7 +3050,7 @@ mod tests {
     #[test]
     fn decode_structured_candidate_string() {
         let value = serde_json::json!(
-            "{\"contains_animal\": true, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.5, \"summary\": \"test\", \"uncertainties\": []}"
+            "{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.5, \"summary\": \"test\", \"uncertainties\": []}"
         );
         let result = decode_structured_candidate(&value).unwrap();
         assert!(result.is_object());
@@ -2914,7 +3060,7 @@ mod tests {
     #[test]
     fn decode_structured_candidate_string_with_fence() {
         let value = serde_json::json!(
-            "```json\n{\"contains_animal\": true, \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.5, \"summary\": \"test\", \"uncertainties\": []}\n```"
+            "```json\n{\"contains_animal\": true, \"bounding_boxes\": [{\"x_min\":0.2,\"y_min\":0.2,\"x_max\":0.8,\"y_max\":0.8}], \"contains_wildlife\": false, \"is_interesting\": false, \"species\": [], \"overall_confidence\": 0.5, \"summary\": \"test\", \"uncertainties\": []}\n```"
         );
         let result = decode_structured_candidate(&value).unwrap();
         assert!(result.is_object());

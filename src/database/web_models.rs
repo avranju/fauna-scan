@@ -159,6 +159,8 @@ pub struct WebClassificationDetail {
     pub is_interesting: bool,
     pub summary: Option<String>,
     pub species: serde_json::Value,
+    /// Normalized animal boxes; absent for historical classifications.
+    pub bounding_boxes: Option<serde_json::Value>,
     pub confidence: Option<f64>,
     pub structured: serde_json::Value,
     pub request_started_at: String,
@@ -227,6 +229,8 @@ pub struct WebNvrUrls {
 pub struct WebImageContentLookup {
     pub local_path: Option<String>,
     pub download_status: String,
+    /// Boxes from the newest classification, if that classification has them.
+    pub bounding_boxes_json: Option<String>,
 }
 
 /// Recording target lookup result.
@@ -488,6 +492,7 @@ impl WebClassificationDetail {
         request_started_at: String,
         request_completed_at: String,
         created_at: String,
+        bounding_boxes_json: Option<String>,
     ) -> Self {
         let species = species_json
             .and_then(|v| serde_json::from_str(&v).ok())
@@ -495,6 +500,7 @@ impl WebClassificationDetail {
         let structured = classification_json
             .and_then(|v| serde_json::from_str(&v).ok())
             .unwrap_or(default_structured);
+        let bounding_boxes = bounding_boxes_json.and_then(|v| serde_json::from_str(&v).ok());
         Self {
             id,
             model,
@@ -503,6 +509,7 @@ impl WebClassificationDetail {
             is_interesting,
             summary,
             species,
+            bounding_boxes,
             confidence,
             structured,
             request_started_at,

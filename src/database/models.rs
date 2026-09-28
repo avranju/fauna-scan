@@ -265,6 +265,7 @@ pub struct ClassificationInput {
     pub is_interesting: bool,
     pub summary: Option<String>,
     pub species_json: Option<String>,
+    pub bounding_boxes_json: Option<String>,
     pub confidence: Option<f64>,
     pub classification_json: Option<String>,
     pub raw_response: Option<String>,
@@ -286,6 +287,7 @@ pub struct ClassificationRecord {
     pub is_interesting: bool,
     pub summary: Option<String>,
     pub species_json: Option<String>,
+    pub bounding_boxes_json: Option<String>,
     pub confidence: Option<f64>,
     pub classification_json: Option<String>,
     pub raw_response: Option<String>,
@@ -306,6 +308,10 @@ impl std::fmt::Debug for ClassificationInput {
             .field(
                 "species_json_len",
                 &self.species_json.as_ref().map(|s| s.len()),
+            )
+            .field(
+                "bounding_boxes_json_len",
+                &self.bounding_boxes_json.as_ref().map(|s| s.len()),
             )
             .field("confidence", &self.confidence)
             .field(
@@ -336,6 +342,10 @@ impl std::fmt::Debug for ClassificationRecord {
             .field(
                 "species_json_len",
                 &self.species_json.as_ref().map(|s| s.len()),
+            )
+            .field(
+                "bounding_boxes_json_len",
+                &self.bounding_boxes_json.as_ref().map(|s| s.len()),
             )
             .field("confidence", &self.confidence)
             .field(
@@ -595,6 +605,7 @@ mod tests {
             is_interesting: true,
             summary: Some("A deer".to_string()),
             species_json: Some(r#"[{"name":"deer","confidence":0.9}]"#.to_string()),
+            bounding_boxes_json: None,
             confidence: Some(0.9),
             classification_json: None,
             raw_response: Some("SENTINEL-CLASSIFIER-RAW-RESPONSE".to_string()),
@@ -623,6 +634,7 @@ mod tests {
             is_interesting: false,
             summary: None,
             species_json: None,
+            bounding_boxes_json: None,
             confidence: None,
             classification_json: None,
             raw_response: None,
@@ -647,6 +659,7 @@ mod tests {
             is_interesting: true,
             summary: Some("A deer".to_string()),
             species_json: Some(r#"[{"name":"deer","confidence":0.9}]"#.to_string()),
+            bounding_boxes_json: None,
             confidence: Some(0.9),
             classification_json: None,
             raw_response: Some("SENTINEL-CLASSIFIER-RAW-RESPONSE".to_string()),
@@ -678,6 +691,7 @@ mod tests {
             is_interesting: false,
             summary: None,
             species_json: None,
+            bounding_boxes_json: None,
             confidence: None,
             classification_json: None,
             raw_response: None,

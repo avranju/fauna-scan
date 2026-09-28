@@ -6,7 +6,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
-const CURRENT_SQLITE_MIGRATION: i64 = 7;
+const CURRENT_SQLITE_MIGRATION: i64 = 9;
 const TABLES: &[&str] = &[
     "cameras",
     "images",
@@ -106,6 +106,7 @@ struct Classification {
     species_json: Option<String>,
     confidence: Option<f64>,
     classification_json: Option<String>,
+    bounding_boxes_json: Option<String>,
     raw_response: Option<String>,
     request_started_at: String,
     request_completed_at: String,
@@ -356,7 +357,7 @@ async fn copy_classifications(
         }
         last_id = rows.last().expect("non-empty batch").id;
         let mut query = QueryBuilder::<Postgres>::new(
-            "INSERT INTO classifications (id, image_id, model, prompt_version, contains_wildlife, is_interesting, summary, species_json, confidence, classification_json, raw_response, request_started_at, request_completed_at, created_at) ",
+            "INSERT INTO classifications (id, image_id, model, prompt_version, contains_wildlife, is_interesting, summary, species_json, confidence, classification_json, raw_response, request_started_at, request_completed_at, created_at, bounding_boxes_json) ",
         );
         query.push_values(&rows, |mut b, row| {
             b.push_bind(row.id)
@@ -372,7 +373,8 @@ async fn copy_classifications(
                 .push_bind(&row.raw_response)
                 .push_bind(&row.request_started_at)
                 .push_bind(&row.request_completed_at)
-                .push_bind(&row.created_at);
+                .push_bind(&row.created_at)
+                .push_bind(&row.bounding_boxes_json);
         });
         query.build().execute(&mut **tx).await?;
     }

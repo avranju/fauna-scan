@@ -41,7 +41,7 @@ fn checked_in_example_configuration_loads() {
     assert!(config.nvr.download.rebase_playback_urls);
     let endpoint = &config.classifier.endpoints[0];
     assert_eq!(endpoint.model, "vision-model");
-    assert_eq!(endpoint.prompt_version, "wildlife-v1");
+    assert_eq!(endpoint.prompt_version, "wildlife-v2");
     assert_eq!(config.nvr.password.unwrap().expose(), "nvr-test-secret");
     assert_eq!(
         endpoint.api_key.as_ref().unwrap().expose(),
