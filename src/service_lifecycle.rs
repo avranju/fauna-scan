@@ -344,3 +344,44 @@ where
         }
     }
 }
+
+/// Persist worker liveness while the actual continuous pipeline is being polled.
+/// A cancelled/aborted future stops heartbeating; the reader then marks it stale.
+pub async fn with_pipeline_heartbeat<F>(
+    database: DatabaseOps,
+    key: crate::database::models::ServiceMetadataKey,
+    poll_interval: Duration,
+    work: F,
+) -> AppResult<()>
+where
+    F: Future<Output = AppResult<()>>,
+{
+    use crate::domain::Timestamp;
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tokio::pin!(work);
+    loop {
+        let result = tokio::select! {
+            result = &mut work => Some(result),
+            _ = interval.tick() => None,
+        };
+        let now = Timestamp::new(chrono::Utc::now());
+        let state = match &result {
+            Some(Ok(())) => "stopped",
+            Some(Err(_)) => "degraded",
+            None => "running",
+        };
+        let value = serde_json::json!({"state":state,"started_at":started_at,"heartbeat_at":now.to_string(),"poll_interval_seconds":poll_interval.as_secs()}).to_string();
+        // Monitoring must not disrupt image leases if its write fails.
+        if database.set_metadata(&key, &value, &now).await.is_err() {
+            tracing::warn!(
+                pipeline = key.as_str(),
+                "Could not persist pipeline heartbeat"
+            );
+        }
+        if let Some(result) = result {
+            return result;
+        }
+    }
+}

@@ -420,6 +420,16 @@ impl Scanner {
 
     /// Run scanner passes and polling sleeps with cooperative cancellation.
     pub async fn run_continuous_with_shutdown(self, shutdown: ShutdownToken) -> AppResult<()> {
+        crate::service_lifecycle::with_pipeline_heartbeat(
+            self.database.clone(),
+            ServiceMetadataKey::ScannerHeartbeat,
+            self.options.poll_interval,
+            self.run_continuous_inner(shutdown),
+        )
+        .await
+    }
+
+    async fn run_continuous_inner(self, shutdown: ShutdownToken) -> AppResult<()> {
         tracing::info!("Entering continuous scanner polling");
         loop {
             if shutdown.is_cancelled() {

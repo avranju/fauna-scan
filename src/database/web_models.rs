@@ -52,6 +52,18 @@ pub struct WebImageFilter {
     pub contains_wildlife: Option<bool>,
     pub is_interesting: Option<bool>,
     pub confidence_min: Option<f64>,
+    pub advanced: WebAdvancedFilter,
+}
+
+/// Optional explorer filters, shared by both database backends.
+#[derive(Debug, Clone, Default)]
+pub struct WebAdvancedFilter {
+    pub time_field: String,
+    pub species: Vec<String>,
+    pub model: Option<String>,
+    pub prompt_version: Option<String>,
+    pub text: Option<String>,
+    pub failure: Option<String>,
 }
 
 /// Ordering direction for web image queries.
@@ -59,6 +71,12 @@ pub struct WebImageFilter {
 pub enum WebImageOrder {
     CapturedAscending,
     CapturedDescending,
+    ConfidenceDescending,
+    ClassifiedDescending,
+    CameraAscending,
+    ConfidenceAscending,
+    ClassifiedAscending,
+    CameraDescending,
 }
 
 /// Paginated web image query with filters and cursor.
@@ -126,6 +144,8 @@ pub struct WebCameraSummary {
 /// Image summary record for the image list API.
 #[derive(Debug, Clone, Serialize)]
 pub struct WebImageSummaryRecord {
+    #[serde(skip)]
+    pub local_path: Option<String>,
     pub id: i64,
     pub captured_at: String,
     pub capture_end_at: Option<String>,
@@ -243,6 +263,7 @@ pub struct WebRecordingTarget {
 /// Activity count record.
 #[derive(Debug, Clone, Serialize)]
 pub struct WebActivityCount {
+    pub oldest_at: Option<String>,
     pub category: String,
     pub status: String,
     pub count: i64,
@@ -345,6 +366,7 @@ impl WebImageSummaryRecord {
     ) -> Self {
         let has_content = download_status == "downloaded" && local_path.is_some();
         Self {
+            local_path,
             id,
             captured_at,
             capture_end_at,
@@ -528,4 +550,21 @@ impl WebRecordingTarget {
             primary_track_id,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebActivityBucket {
+    pub start_at: String,
+    pub end_at: String,
+    pub discovered: i64,
+    pub downloaded: i64,
+    pub classified: i64,
+}
+
+/// Capture-cohort totals grouped by immutable camera ID.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebCameraCounts {
+    pub camera_id: i64,
+    pub discovered: i64,
+    pub classified: i64,
 }

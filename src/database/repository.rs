@@ -347,6 +347,14 @@ pub trait DataStore: Send + Sync {
     /// Overview counts with filters.
     async fn web_overview(&self, filter: &WebImageFilter) -> AppResult<WebOverviewRecord>;
 
+    async fn web_buckets(
+        &self,
+        filter: &WebImageFilter,
+        seconds: i64,
+    ) -> AppResult<Vec<WebActivityBucket>>;
+
+    async fn web_camera_counts(&self, filter: &WebImageFilter) -> AppResult<Vec<WebCameraCounts>>;
+
     /// Image detail by ID.
     async fn web_image_detail(&self, image_id: ImageId) -> AppResult<Option<WebImageDetailRecord>>;
 
@@ -686,6 +694,21 @@ impl DatabaseOps {
         query: &WebImageQuery,
     ) -> AppResult<(Vec<WebImageSummaryRecord>, Option<(String, i64)>)> {
         self.inner.web_query_images(query).await
+    }
+
+    pub async fn web_buckets(
+        &self,
+        filter: &WebImageFilter,
+        seconds: i64,
+    ) -> AppResult<Vec<WebActivityBucket>> {
+        self.inner.web_buckets(filter, seconds).await
+    }
+
+    pub async fn web_camera_counts(
+        &self,
+        filter: &WebImageFilter,
+    ) -> AppResult<Vec<WebCameraCounts>> {
+        self.inner.web_camera_counts(filter).await
     }
 
     pub async fn web_overview(&self, filter: &WebImageFilter) -> AppResult<WebOverviewRecord> {

@@ -955,6 +955,16 @@ impl DownloaderOrchestrator {
 
     /// Execute continuous polling while observing cooperative cancellation.
     pub async fn run_continuous_with_shutdown(&mut self, shutdown: ShutdownToken) -> AppResult<()> {
+        crate::service_lifecycle::with_pipeline_heartbeat(
+            self.database.clone(),
+            ServiceMetadataKey::DownloaderHeartbeat,
+            self.options.poll_interval,
+            self.run_continuous_inner(shutdown),
+        )
+        .await
+    }
+
+    async fn run_continuous_inner(&mut self, shutdown: ShutdownToken) -> AppResult<()> {
         let active = self.reload_active_cameras().await?;
         tracing::info!(
             active_cameras = active.len(),

@@ -84,9 +84,13 @@ Always back up your database before upgrading.
 
 ## Install and release verification
 
-Build with the current stable Rust toolchain:
+Build the frontend with Node.js 22.12+ (Node.js 24 is used in Docker), then
+build with the current stable Rust toolchain:
 
 ```bash
+npm ci --prefix web
+npm run format:check --prefix web
+npm run build --prefix web
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --no-fail-fast
@@ -178,14 +182,54 @@ fauna-scan --help
 fauna-scan --version
 ```
 
-Set `[web].enabled = true` to serve the API with `run` at the configured
-address (the example uses `http://127.0.0.1:8787`). The `web` command serves
-the same API against the durable database without starting downloader or
-classifier workers. The API provides filtered image and classification detail,
-live queue/lease monitoring, NVR still-image URLs, and on-demand NVR recording
-lookups. The default listener is loopback-only. Keep it on loopback or place
-it behind an authenticated TLS reverse proxy; the API does not provide built-in
-user authentication.
+Set `[web].enabled = true` to serve the interface and API with `run` at the
+configured address (the example uses `http://127.0.0.1:8787`). Open that address
+in a browser for Overview, Images, Scan activity, and About. The `web` command
+serves the same interface against the durable database without starting workers.
+The production HTML, CSS, and JavaScript are embedded in the Rust executable;
+rebuild the frontend **before** rebuilding Rust whenever frontend source changes.
+`just build` and `just release` do this automatically, as does the Docker build.
+A Rust-only build without frontend assets still provides the API and explains
+how to build the missing interface.
+
+Images supports shareable UTC time/camera filters, gallery/table views, species,
+confidence, model/prompt, lifecycle, text and local-file filters, and signed keyset
+pagination. Image detail preserves classification provenance and older results,
+provides zoom/pan controls and bounding-box overlays, and resolves NVR recordings
+only when **Find recording** is selected. Browser clip playback/download stay
+unavailable until a compatible media adapter is implemented; credential-free NVR
+playback URLs can be copied or opened in a native player.
+
+Live pages use SSE invalidations with polling fallback and retain their last
+successful data during connection failures. Continuous downloader/scanner workers
+persist heartbeats every five seconds. Databases without heartbeat metadata show
+unknown pipeline health; expired leases and stale heartbeats never count as active.
+Current pipeline state covers all dates/cameras, while summary cards and activity
+queues use the selected capture interval.
+
+For frontend development, run the backend in one terminal and Vite in another:
+
+```bash
+fauna-scan --config PATH web
+npm ci --prefix web
+npm run dev --prefix web
+```
+
+Vite proxies `/api` to `http://127.0.0.1:8787`; set `FAUNA_API_URL` to override that
+address. `npm test --prefix web` builds production assets and runs Chromium
+workflows, responsive checks, and Axe accessibility checks. It uses
+`/usr/bin/chromium` when available, `CHROMIUM_PATH` when supplied, or Playwright's
+installed Chromium otherwise (`cd web && npx playwright install chromium`).
+`npm run format --prefix web` applies Prettier plus the project's required blank
+lines after imports, between functions, and between interface blocks;
+`npm run format:check --prefix web` checks both rules.
+
+The default listener is loopback-only. Keep it on loopback or place it behind an
+authenticated TLS reverse proxy; the service does not provide built-in user
+authentication. Thumbnail rendering shares the configured render semaphore with
+bounding-box overlays, limits decoding to 32 MP/128 MiB, and maintains a bounded
+64 MiB / 512-entry memory cache. Local-file filtering checks actual safe filesystem
+presence; sparsely matching pages may offer another batch to scan.
 
 `run` supervises downloader and scanner pipelines. `download --once` performs
 currently due discovery/search/download work; `scan --once` drains eligible

@@ -89,3 +89,29 @@ fn draw_box(image: &mut RgbImage, box_: &BoundingBox, color: Rgb<u8>, stroke_wid
         }
     }
 }
+
+/// A bounded, orientation-correct gallery image. Shares the render semaphore.
+pub(super) fn thumbnail(jpeg: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let mut reader = ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(32_768);
+    limits.max_image_height = Some(32_768);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    reader.limits(limits);
+    let mut decoder = reader.into_decoder().map_err(|_| "JPEG decoding failed")?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_PIXELS
+        || decoder.total_bytes() > MAX_DECODED_BYTES
+    {
+        return Err("image exceeds the thumbnail size limit");
+    }
+    let orientation = decoder.orientation().map_err(|_| "invalid orientation")?;
+    let mut image = DynamicImage::from_decoder(decoder).map_err(|_| "JPEG decoding failed")?;
+    image.apply_orientation(orientation);
+    let image = image.thumbnail(480, 360);
+    let mut output = Vec::new();
+    JpegEncoder::new_with_quality(&mut output, 80)
+        .encode_image(&image)
+        .map_err(|_| "JPEG encoding failed")?;
+    Ok(output)
+}

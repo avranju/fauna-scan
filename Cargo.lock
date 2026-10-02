@@ -773,6 +773,7 @@ dependencies = [
  "clap",
  "digest_auth",
  "futures",
+ "futures-util",
  "http",
  "image",
  "md-5",

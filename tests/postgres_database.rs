@@ -718,6 +718,7 @@ async fn test_postgres_web_query_images() {
         contains_wildlife: None,
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let query = WebImageQuery {
         filter,
@@ -788,6 +789,7 @@ async fn test_postgres_classification_ranking_by_completed_at() {
         contains_wildlife: None,
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let query = WebImageQuery {
         filter,
@@ -884,6 +886,7 @@ async fn test_postgres_latest_classification_only() {
         contains_wildlife: Some(true),
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let query = WebImageQuery {
         filter,
@@ -921,6 +924,7 @@ async fn test_postgres_latest_classification_only() {
         contains_wildlife: Some(true),
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let overview = ops.web_overview(&filter2).await.expect("overview wildlife");
     assert_eq!(overview.wildlife, 1, "overview wildlife count should be 1");
@@ -938,6 +942,7 @@ async fn test_postgres_latest_classification_only() {
         contains_wildlife: Some(false),
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let overview = ops
         .web_overview(&filter3)
@@ -1007,6 +1012,7 @@ async fn test_postgres_not_classified_filter() {
         contains_wildlife: None,
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let query = WebImageQuery {
         filter: filter.clone(),
@@ -1099,6 +1105,7 @@ async fn test_postgres_web_activity_counts() {
         contains_wildlife: None,
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
 
     let record = ops.web_activity(&filter).await.expect("web activity");
@@ -1270,7 +1277,7 @@ async fn test_postgres_overview_counts() {
         "new",
     )
     .await;
-    insert_image(
+    let classified_id = insert_image(
         &pool,
         camera_id,
         "track-1",
@@ -1289,6 +1296,15 @@ async fn test_postgres_overview_counts() {
     )
     .await;
 
+    insert_classification(
+        &pool,
+        classified_id,
+        "vision",
+        "v1",
+        "2026-07-21T10:02:00.000000000Z",
+    )
+    .await;
+
     let filter = WebImageFilter {
         scope: WebScopeFilter {
             from: None,
@@ -1301,13 +1317,15 @@ async fn test_postgres_overview_counts() {
         contains_wildlife: None,
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
 
     let overview = ops.web_overview(&filter).await.expect("overview");
     assert_eq!(overview.discovered, 3);
     assert_eq!(overview.downloaded, 1);
     assert_eq!(overview.classified, 1);
-    assert_eq!(overview.permanent_failures, 2);
+    // Summary cards count images, so a double failure matches one list row.
+    assert_eq!(overview.permanent_failures, 1);
 
     drop_schema(&pool, &schema).await;
 }
@@ -1863,6 +1881,7 @@ async fn test_postgres_overview_wildlife_filter() {
         contains_wildlife: Some(true),
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
 
     let overview = ops.web_overview(&filter).await.expect("overview wildlife");
@@ -1882,6 +1901,7 @@ async fn test_postgres_overview_wildlife_filter() {
         contains_wildlife: Some(false),
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
 
     let overview2 = ops
@@ -2351,6 +2371,7 @@ async fn test_postgres_inverse_history_wildlife_filter() {
         contains_wildlife: Some(true),
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let query = WebImageQuery {
         filter,
@@ -2379,6 +2400,7 @@ async fn test_postgres_inverse_history_wildlife_filter() {
         contains_wildlife: Some(true),
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let overview = ops.web_overview(&filter2).await.expect("overview wildlife");
     assert_eq!(overview.wildlife, 0, "overview wildlife count should be 0");
@@ -2396,6 +2418,7 @@ async fn test_postgres_inverse_history_wildlife_filter() {
         contains_wildlife: Some(false),
         is_interesting: None,
         confidence_min: None,
+        advanced: Default::default(),
     };
     let overview2 = ops
         .web_overview(&filter3)
@@ -2485,6 +2508,7 @@ async fn test_postgres_inverse_history_confidence_filter() {
         contains_wildlife: None,
         is_interesting: None,
         confidence_min: Some(0.9),
+        advanced: Default::default(),
     };
     let query = WebImageQuery {
         filter,
@@ -2892,5 +2916,93 @@ async fn test_postgres_rate_limit_daily_refund() {
         .expect("refund again");
     assert!(!refunded2, "second refund should return false");
 
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FAUNA_SCAN_TEST_POSTGRES_URL"]
+async fn test_postgres_explorer_filters_sorts_and_buckets() {
+    let (pool, schema) = setup_test_schema("explorer_filters_sorts_buckets", 4).await;
+    let base = std::env::var("FAUNA_SCAN_TEST_POSTGRES_URL").unwrap();
+    let store = PostgresDataStore::connect(&Secret::new(schema_url(&base, &schema)), 4)
+        .await
+        .unwrap();
+    let ops = store.ops();
+    let camera = insert_camera(&pool, 1, "track-1").await;
+    let mut ids = Vec::new();
+    for seconds in ["00", "01", "02"] {
+        let id = insert_image(
+            &pool,
+            camera,
+            "track-1",
+            &format!("2026-07-21T10:00:{seconds}.000000000Z"),
+            "downloaded",
+            "done",
+        )
+        .await;
+        insert_classification(&pool, id, "vision", "v1", "2026-07-21T10:01:00.000000000Z").await;
+        ids.push(id);
+    }
+    let mut filter = WebImageFilter {
+        scope: WebScopeFilter {
+            from: Some("2026-07-21T10:00:00Z".parse().unwrap()),
+            to: Some("2026-07-21T10:00:03Z".parse().unwrap()),
+            camera_ids: vec![camera],
+        },
+        download_status: None,
+        processing_status: None,
+        classified: None,
+        contains_wildlife: Some(true),
+        is_interesting: None,
+        confidence_min: Some(0.9),
+        advanced: WebAdvancedFilter {
+            species: vec!["DEER".into()],
+            model: Some("vision".into()),
+            prompt_version: Some("v1".into()),
+            text: Some("deer".into()),
+            ..Default::default()
+        },
+    };
+    assert_eq!(ops.web_overview(&filter).await.unwrap().discovered, 3);
+    for order in [
+        WebImageOrder::ConfidenceDescending,
+        WebImageOrder::ClassifiedDescending,
+        WebImageOrder::CameraAscending,
+    ] {
+        let mut query = WebImageQuery {
+            filter: filter.clone(),
+            order,
+            limit: 1,
+            cursor: None,
+        };
+        let mut found = Vec::new();
+        loop {
+            let (rows, cursor) = ops.web_query_images(&query).await.unwrap();
+            found.extend(rows.into_iter().map(|i| i.id));
+            if cursor.is_none() {
+                break;
+            }
+            query.cursor = cursor;
+            assert!(found.len() < 4);
+        }
+        found.sort_unstable();
+        assert_eq!(found, ids);
+    }
+    let camera_counts = ops.web_camera_counts(&filter).await.unwrap();
+    assert_eq!(camera_counts.len(), 1);
+    assert_eq!(camera_counts[0].discovered, 3);
+    assert_eq!(camera_counts[0].classified, 3);
+    let buckets = ops.web_buckets(&filter, 300).await.unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(
+        (
+            buckets[0].discovered,
+            buckets[0].downloaded,
+            buckets[0].classified
+        ),
+        (3, 3, 3)
+    );
+    filter.advanced.time_field = "classified".into();
+    assert_eq!(ops.web_overview(&filter).await.unwrap().discovered, 0);
     drop_schema(&pool, &schema).await;
 }

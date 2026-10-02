@@ -24,11 +24,11 @@ test-postgres:
 	FAUNA_SCAN_TEST_POSTGRES_URL="${FAUNA_SCAN_TEST_POSTGRES_URL:?FAUNA_SCAN_TEST_POSTGRES_URL must be set}" cargo test --test postgres_database -- --ignored
 
 # Build debug binary
-build:
+build: web-build
 	cargo build
 
 # Build release binary
-release:
+release: web-build
 	cargo build --release
 
 # Full CI: format check → lint → test → build → install
@@ -85,7 +85,7 @@ run:
 run-debug:
 	fauna-scan --log-level debug --config "${XDG_CONFIG_HOME:-$HOME/.config}/fauna-scan/config.toml" run
 
-# Serve only the API
+# Serve the interface and API without starting workers
 web:
 	fauna-scan --config "${XDG_CONFIG_HOME:-$HOME/.config}/fauna-scan/config.toml" web
 
@@ -158,3 +158,15 @@ upgrade: service-stop install service-start
 # Show all available recipes
 help:
 	@just --list
+
+# Build the embedded React application (Node.js 24+).
+web-build:
+    cd web && npm ci && npm run format:check && npm run build
+
+# Vite development server; proxies /api to the local web service on port 8787.
+web-dev:
+    cd web && npm run dev
+
+# Browser workflow and accessibility tests (set CHROMIUM_PATH if needed).
+web-test:
+    cd web && npm test

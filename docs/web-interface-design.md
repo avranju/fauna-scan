@@ -1,8 +1,8 @@
 # Fauna Scan Web Interface Design Specification
 
-Status: proposed
+Status: implemented for milestones 1–3; browser media adapters remain capability-gated
 Audience: product, design, and implementation
-Last updated: 2026-07-21
+Last updated: 2026-10-01
 
 ## 1. Summary
 
@@ -1077,3 +1077,35 @@ These decisions require deployment-specific confirmation before Milestones 3–4
 - Whether raw model JSON should be available to a diagnostics role.
 
 None of these decisions blocks Milestone 1. Recording URL generation must remain capability-driven so later answers do not require changing the core image-detail contract.
+
+## 27. Implementation notes
+
+The browser application lives in `web/` and uses React, TypeScript, Vite, Tailwind,
+TanStack Query, Luxon, Lucide, and react-zoom-pan-pinch. Run `npm ci` and
+`npm run build` there before building Rust. `build.rs` embeds the content-hashed
+assets, and Axum serves application routes with the same response protections as
+the API. Docker and `just build`/`just release` build both parts.
+
+The existing API's integer IDs and flat download/processing list fields remain
+compatible. Repeated camera, species, and lifecycle filters are accepted alongside
+comma-separated values. Explorer queries, sorts, latest-classification predicates,
+and capture-bucket aggregation work with both SQLite and PostgreSQL. Additional
+read endpoints provide `/api/v1/images/facets` and
+`/api/v1/images/:id/neighbors`. Facet counts currently cover download and processing
+states; counts are omitted with a filesystem-presence filter to avoid implying
+that database metadata establishes file presence. Species labels use exact,
+case-insensitive trimmed matching.
+
+Pipeline heartbeats use durable `service_metadata` entries rather than a new
+`pipeline_status` table. They are emitted by each continuously running pipeline
+and distinguish unknown, idle, active, retrying, degraded, and stopped state.
+SSE emits a complete invalidation every five seconds, including after reconnect
+or process restart, and has a global connection cap of 32. This deliberately
+requires no replay buffer because every message requests a current durable-state
+refresh. The browser coalesces invalidations, falls back to polling, and pauses
+background traffic when hidden.
+
+Recording resolution remains on demand through the existing authenticated NVR
+transport. No browser media adapter is implemented, so View/Download clip actions
+are unavailable and explained. Real NVR firmware validation and the million-row
+performance target require deployment-specific acceptance testing.

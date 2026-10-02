@@ -448,6 +448,8 @@ pub enum ServiceMetadataKey {
     LastSuccessfulCameraDiscovery,
     LastSuccessfulDownloaderPoll,
     LastSuccessfulScannerPass,
+    DownloaderHeartbeat,
+    ScannerHeartbeat,
 }
 
 impl ServiceMetadataKey {
@@ -460,6 +462,8 @@ impl ServiceMetadataKey {
             Self::LastSuccessfulCameraDiscovery => "last_successful_camera_discovery",
             Self::LastSuccessfulDownloaderPoll => "last_successful_downloader_poll",
             Self::LastSuccessfulScannerPass => "last_successful_scanner_pass",
+            Self::DownloaderHeartbeat => "downloader_heartbeat",
+            Self::ScannerHeartbeat => "scanner_heartbeat",
         }
     }
 }

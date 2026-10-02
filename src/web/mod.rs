@@ -5,13 +5,14 @@
 //! so the web layer is
 //! agnostic to whether the backing store is SQLite or PostgreSQL.
 
+mod assets;
 mod bounding_boxes;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Path as AxumPath, Query, RawQuery, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -22,9 +23,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tower_http::compression::CompressionLayer;
-use tower_http::trace::TraceLayer;
 use url::Url;
 
 use crate::classifier::BoundingBox;
@@ -48,6 +49,9 @@ pub struct WebState {
     bounding_box_render_limit: Arc<Semaphore>,
     #[allow(dead_code)]
     started_at: Timestamp,
+    cursor_key: [u8; 32],
+    event_limit: Arc<Semaphore>,
+    thumbnails: Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, bytes::Bytes>>>,
 }
 
 impl WebState {
@@ -65,6 +69,9 @@ impl WebState {
                 config.web.max_concurrent_bounding_box_renders,
             )),
             started_at: Timestamp::new(Utc::now()),
+            event_limit: Arc::new(Semaphore::new(32)),
+            thumbnails: Default::default(),
+            cursor_key: Sha256::digest(uuid::Uuid::new_v4().as_bytes()).into(),
         }
     }
 }
@@ -100,6 +107,8 @@ pub async fn serve(state: WebState, shutdown: ShutdownToken) -> AppResult<()> {
 }
 
 pub fn router(state: WebState) -> Router {
+    let timeout =
+        std::time::Duration::from_secs(state.nvr.request_timeout_seconds.saturating_add(5).max(30));
     Router::new()
         // API endpoints
         .route("/api/v1/config", get(api_config))
@@ -107,15 +116,46 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/cameras", get(api_cameras))
         .route("/api/v1/overview", get(api_overview))
         .route("/api/v1/images", get(api_images))
+        .route("/api/v1/images/facets", get(api_facets))
         .route("/api/v1/images/{id}", get(api_image))
+        .route("/api/v1/images/{id}/neighbors", get(api_neighbors))
         .route("/api/v1/images/{id}/content", get(api_image_content))
         .route("/api/v1/images/{id}/thumbnail", get(api_image_thumbnail))
         .route("/api/v1/images/{id}/recording", get(api_recording))
+        .route("/api/v1/images/{id}/clip", get(unsupported_clip))
+        .route("/api/v1/images/{id}/clip/download", get(unsupported_clip))
         .route("/api/v1/activity", get(api_activity))
-        .fallback(not_found)
+        .route("/api/v1/events", get(api_events))
+        .fallback(assets::serve)
         .with_state(state)
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+                let sensitive = request.uri().path().ends_with("/recording")
+                    || request
+                        .uri()
+                        .path()
+                        .strip_prefix("/api/v1/images/")
+                        .is_some_and(|tail| !tail.contains('/'));
+                let mut response = match tokio::time::timeout(timeout, next.run(request)).await {
+                    Ok(response) => response,
+                    Err(_) => WebError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        code: "request_timeout",
+                        message: "The request timed out. Try a narrower filter or try again."
+                            .into(),
+                    }
+                    .into_response(),
+                };
+                if sensitive {
+                    response
+                        .headers_mut()
+                        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+                }
+                security_headers(response.headers_mut());
+                response
+            },
+        ))
 }
 
 fn security_headers(headers: &mut HeaderMap) {
@@ -134,10 +174,6 @@ fn security_headers(headers: &mut HeaderMap) {
         "permissions-policy",
         HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
-}
-
-async fn not_found() -> WebError {
-    WebError::not_found("The requested resource does not exist")
 }
 
 // ── Web error type ─────────────────────────────────────────────────────────
@@ -183,7 +219,9 @@ impl From<AppError> for WebError {
         Self {
             status,
             code: "request_failed",
-            message: error.message,
+            message:
+                "The requested operation could not be completed. Check the service diagnostics."
+                    .into(),
         }
     }
 }
@@ -210,11 +248,13 @@ struct ConfigResponse {
     default_clip_post_roll_seconds: u64,
     maximum_clip_duration_seconds: u64,
     capabilities: Value,
+    nvr_identity: String,
 }
 
 async fn api_config(State(state): State<WebState>) -> Json<ConfigResponse> {
     Json(ConfigResponse {
         version: env!("CARGO_PKG_VERSION"),
+        nvr_identity: format!("{}:{}", state.nvr.host, state.nvr.port),
         generated_at: Timestamp::new(Utc::now()).to_string(),
         default_clip_pre_roll_seconds: state.web.clip_pre_roll_seconds,
         default_clip_post_roll_seconds: state.web.clip_post_roll_seconds,
@@ -241,10 +281,94 @@ struct HealthResponse {
     active_downloads: i64,
     active_classifications: i64,
     generated_at: String,
+    pipelines: Value,
 }
 
 async fn api_health(State(state): State<WebState>) -> Result<Json<HealthResponse>, WebError> {
     let snapshot = state.ops.web_health().await.map_err(db_error)?;
+    let filter = build_image_filter(&ImageParams::default())?;
+    let activity = state.ops.web_activity(&filter).await.map_err(db_error)?;
+    let mut pipelines = serde_json::Map::new();
+    for (name, key, category, success) in [
+        (
+            "downloader",
+            crate::database::models::ServiceMetadataKey::DownloaderHeartbeat,
+            "download",
+            &snapshot.last_downloader_poll,
+        ),
+        (
+            "classifier",
+            crate::database::models::ServiceMetadataKey::ScannerHeartbeat,
+            "processing",
+            &snapshot.last_scanner_pass,
+        ),
+    ] {
+        let raw = state.ops.get_metadata(&key).await.map_err(db_error)?;
+        let heartbeat: Option<Value> = raw.and_then(|v| serde_json::from_str(&v).ok());
+        let age = heartbeat
+            .as_ref()
+            .and_then(|v| v["heartbeat_at"].as_str())
+            .and_then(|v| v.parse::<Timestamp>().ok())
+            .map(|v| (Utc::now() - *v.as_datetime()).num_seconds());
+        let fresh = age.is_some_and(|age| (0..=15).contains(&age));
+        let active = activity
+            .active
+            .iter()
+            .filter(|a| {
+                let lease = if category == "download" {
+                    &a.download_lease_until
+                } else {
+                    &a.processing_lease_until
+                };
+                let status = if category == "download" {
+                    &a.download_status
+                } else {
+                    &a.processing_status
+                };
+                fresh
+                    && ["downloading", "processing"].contains(&status.as_str())
+                    && lease
+                        .as_ref()
+                        .and_then(|v| v.parse::<Timestamp>().ok())
+                        .is_some_and(|v| *v.as_datetime() > Utc::now())
+            })
+            .count();
+        let count = |statuses: &[&str]| {
+            activity
+                .counts
+                .iter()
+                .filter(|c| c.category == category && statuses.contains(&c.status.as_str()))
+                .map(|c| c.count)
+                .sum::<i64>()
+        };
+        let retry = count(&["retry_wait"]);
+        let failures = count(&["failed", "unavailable", "missing"]);
+        let poll = heartbeat
+            .as_ref()
+            .and_then(|v| v["poll_interval_seconds"].as_u64())
+            .unwrap_or(5);
+        let status = if heartbeat.is_none() {
+            "unknown"
+        } else if heartbeat.as_ref().is_some_and(|v| v["state"] == "stopped")
+            || age.is_some_and(|age| age > 15.max(poll.saturating_mul(2) as i64))
+        {
+            "stopped"
+        } else if !fresh
+            || failures > 0
+            || heartbeat.as_ref().is_some_and(|v| v["state"] == "degraded")
+        {
+            "degraded"
+        } else if active > 0 {
+            "active"
+        } else if retry > 0 {
+            "retrying"
+        } else {
+            "idle"
+        };
+        pipelines.insert(name.into(), json!({"state":status,"active":active,"queue_depth":count(&["pending","new","retry_wait"]),"oldest_queued_at":activity.counts.iter().filter(|c|c.category==category && ["pending","new","retry_wait"].contains(&c.status.as_str())).filter_map(|c|c.oldest_at.as_ref()).min(),"heartbeat_at":heartbeat.as_ref().map(|v|v["heartbeat_at"].clone()),"last_success_at":success,"heartbeat_fresh":fresh,"stale_after_seconds":15.max(poll.saturating_mul(2)),"last_error":if failures>0 {Some("Permanent failures are present in the queue.")}else{None}}));
+    }
+    let active_downloads = pipelines["downloader"]["active"].as_i64().unwrap_or(0);
+    let active_classifications = pipelines["classifier"]["active"].as_i64().unwrap_or(0);
     Ok(Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -252,8 +376,9 @@ async fn api_health(State(state): State<WebState>) -> Result<Json<HealthResponse
         last_camera_discovery: snapshot.last_camera_discovery.clone(),
         last_downloader_poll: snapshot.last_downloader_poll.clone(),
         last_scanner_pass: snapshot.last_scanner_pass.clone(),
-        active_downloads: snapshot.active_downloads,
-        active_classifications: snapshot.active_classifications,
+        active_downloads,
+        active_classifications,
+        pipelines: Value::Object(pipelines),
         generated_at: snapshot.generated_at.clone(),
     }))
 }
@@ -290,7 +415,9 @@ async fn api_cameras(State(state): State<WebState>) -> Result<Json<Value>, WebEr
             last_completed_window_end: r.last_completed_window_end,
             last_poll_at: r.last_poll_at,
             next_search_at: r.next_search_at,
-            last_error: r.last_error,
+            last_error: r.last_error.map(|_| {
+                "The last NVR search failed. Check connectivity and service diagnostics.".into()
+            }),
         })
         .collect();
     Ok(Json(
@@ -300,7 +427,8 @@ async fn api_cameras(State(state): State<WebState>) -> Result<Json<Value>, WebEr
 
 // ── Query parameter parsing ────────────────────────────────────────────────
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[serde(deny_unknown_fields)]
 struct ImageParams {
     from: Option<String>,
     to: Option<String>,
@@ -314,6 +442,13 @@ struct ImageParams {
     sort: Option<String>,
     limit: Option<u32>,
     cursor: Option<String>,
+    species: Option<String>,
+    model: Option<String>,
+    prompt_version: Option<String>,
+    time_field: Option<String>,
+    q: Option<String>,
+    failure: Option<String>,
+    local_file: Option<String>,
 }
 
 // ── API: images ────────────────────────────────────────────────────────────
@@ -353,8 +488,9 @@ struct ImageSummary {
 
 async fn api_images(
     State(state): State<WebState>,
-    Query(params): Query<ImageParams>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, WebError> {
+    let params = parse_image_params(raw)?;
     let (data, next_cursor) = query_images(&state, &params).await?;
     Ok(Json(json!({
         "data": data,
@@ -363,30 +499,140 @@ async fn api_images(
     })))
 }
 
+async fn local_file_present(state: &WebState, path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let Ok(root) = tokio::fs::canonicalize(&state.output_directory).await else {
+        return false;
+    };
+    let Ok(path) = tokio::fs::canonicalize(path).await else {
+        return false;
+    };
+    path.starts_with(root) && tokio::fs::metadata(path).await.is_ok_and(|m| m.is_file())
+}
+
 async fn query_images(
     state: &WebState,
     params: &ImageParams,
 ) -> Result<(Vec<ImageSummary>, Option<String>), WebError> {
+    let mut current = params.clone();
+    let limit = params.limit.unwrap_or(60);
+    let mut results = Vec::new();
+    let mut next = None;
+    // A missing-file filter requires filesystem checks. Bound each response's
+    // scan to eight database pages; the continuation still covers every row.
+    for _ in 0..8 {
+        current.limit = Some(limit - results.len() as u32);
+        let (page, cursor) = query_images_page(state, &current).await?;
+        results.extend(page);
+        next = cursor;
+        if results.len() >= limit as usize || next.is_none() || params.local_file.is_none() {
+            break;
+        }
+        current.cursor = next.clone();
+    }
+    Ok((results, next))
+}
+
+async fn api_facets(
+    State(state): State<WebState>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, WebError> {
+    let params = parse_image_params(raw)?;
+    validate_time_range(&params)?;
+    if params.local_file.is_some() {
+        return Ok(Json(json!({"download_status":{},"processing_status":{}})));
+    }
+    let mut result = serde_json::Map::new();
+    for (facet, statuses) in [
+        (
+            "download_status",
+            vec![
+                "pending",
+                "downloading",
+                "downloaded",
+                "retry_wait",
+                "unavailable",
+                "failed",
+            ],
+        ),
+        (
+            "processing_status",
+            vec![
+                "new",
+                "processing",
+                "done",
+                "retry_wait",
+                "failed",
+                "missing",
+            ],
+        ),
+    ] {
+        let mut counts = serde_json::Map::new();
+        for status in statuses {
+            let mut candidate = params.clone();
+            if facet == "download_status" {
+                candidate.download_status = Some(status.into());
+            } else {
+                candidate.processing_status = Some(status.into());
+            }
+            let filter = build_image_filter(&candidate)?;
+            let count = state
+                .ops
+                .web_overview(&filter)
+                .await
+                .map_err(db_error)?
+                .discovered;
+            counts.insert(status.into(), json!(count));
+        }
+        result.insert(facet.into(), Value::Object(counts));
+    }
+    Ok(Json(Value::Object(result)))
+}
+
+async fn query_images_page(
+    state: &WebState,
+    params: &ImageParams,
+) -> Result<(Vec<ImageSummary>, Option<String>), WebError> {
     validate_time_range(params)?;
-    let ascending = match params.sort.as_deref().unwrap_or("captured_desc") {
-        "captured_desc" => false,
-        "captured_asc" => true,
+    let order = match params.sort.as_deref().unwrap_or("captured_desc") {
+        "captured_desc" => WebImageOrder::CapturedDescending,
+        "captured_asc" => WebImageOrder::CapturedAscending,
+        "confidence_desc" => WebImageOrder::ConfidenceDescending,
+        "classified_desc" => WebImageOrder::ClassifiedDescending,
+        "camera_asc" => WebImageOrder::CameraAscending,
         _ => return Err(WebError::bad_request("unsupported image sort")),
     };
-    let limit = params.limit.unwrap_or(60).clamp(1, 200);
+    let limit = params.limit.unwrap_or(60);
+    if !(1..=200).contains(&limit) {
+        return Err(WebError::bad_request("limit must be between 1 and 200"));
+    }
     let filter = build_image_filter(params)?;
     let query = WebImageQuery {
         filter,
-        order: if ascending {
-            WebImageOrder::CapturedAscending
-        } else {
-            WebImageOrder::CapturedDescending
-        },
+        order,
         limit,
-        cursor: params.cursor.as_deref().map(decode_cursor).transpose()?,
+        cursor: params
+            .cursor
+            .as_deref()
+            .map(|v| decode_cursor(v, params, &state.cursor_key))
+            .transpose()?,
     };
 
     let (summaries, next_cursor) = state.ops.web_query_images(&query).await.map_err(db_error)?;
+    let mut matching = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        if let Some(presence) = &params.local_file {
+            let present = summary.download_status == "downloaded"
+                && local_file_present(state, summary.local_path.as_deref()).await;
+            if present != (presence == "present") {
+                continue;
+            }
+        }
+        matching.push(summary);
+    }
+    let summaries = matching;
 
     let data: Vec<ImageSummary> = summaries
         .into_iter()
@@ -417,7 +663,7 @@ async fn query_images(
         })
         .collect();
 
-    let next_cursor = next_cursor.map(|(ts, id)| encode_cursor(&ts, id));
+    let next_cursor = next_cursor.map(|(ts, id)| encode_cursor(&ts, id, params, &state.cursor_key));
     Ok((data, next_cursor))
 }
 
@@ -523,6 +769,29 @@ fn build_image_filter(params: &ImageParams) -> Result<WebImageFilter, WebError> 
         None => None,
     };
 
+    if params
+        .local_file
+        .as_deref()
+        .is_some_and(|v| !["present", "missing"].contains(&v))
+    {
+        return Err(WebError::bad_request(
+            "local_file must be present or missing",
+        ));
+    }
+    let time_field = params
+        .time_field
+        .clone()
+        .unwrap_or_else(|| "captured".into());
+    if !["captured", "discovered", "downloaded", "classified"].contains(&time_field.as_str()) {
+        return Err(WebError::bad_request("unsupported time_field"));
+    }
+    if params
+        .failure
+        .as_deref()
+        .is_some_and(|v| !["retryable", "permanent"].contains(&v))
+    {
+        return Err(WebError::bad_request("unsupported failure filter"));
+    }
     Ok(WebImageFilter {
         scope,
         download_status,
@@ -531,6 +800,18 @@ fn build_image_filter(params: &ImageParams) -> Result<WebImageFilter, WebError> 
         contains_wildlife,
         is_interesting,
         confidence_min,
+        advanced: WebAdvancedFilter {
+            time_field,
+            species: params
+                .species
+                .as_ref()
+                .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
+            model: params.model.clone(),
+            prompt_version: params.prompt_version.clone(),
+            text: params.q.clone(),
+            failure: params.failure.clone(),
+        },
     })
 }
 
@@ -538,12 +819,38 @@ fn build_image_filter(params: &ImageParams) -> Result<WebImageFilter, WebError> 
 
 async fn api_overview(
     State(state): State<WebState>,
-    Query(params): Query<ImageParams>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, WebError> {
+    let params = parse_image_params(raw)?;
     validate_time_range(&params)?;
     let filter = build_image_filter(&params)?;
     let record = state.ops.web_overview(&filter).await.map_err(db_error)?;
+    let camera_counts = state
+        .ops
+        .web_camera_counts(&filter)
+        .await
+        .map_err(db_error)?;
+    let range = match (&filter.scope.from, &filter.scope.to) {
+        (Some(from), Some(to)) => (*to.as_datetime() - *from.as_datetime()).num_seconds(),
+        _ => i64::MAX,
+    };
+    let seconds = if range <= 21600 {
+        300
+    } else if range <= 172800 {
+        3600
+    } else if range <= 7776000 {
+        86400
+    } else {
+        604800
+    };
+    let buckets = state
+        .ops
+        .web_buckets(&filter, seconds)
+        .await
+        .map_err(db_error)?;
     Ok(Json(json!({
+        "buckets": buckets,
+        "camera_counts": camera_counts,
         "counts": {
             "discovered": record.discovered,
             "downloaded": record.downloaded,
@@ -573,6 +880,20 @@ async fn api_image(
         })?;
     let detail = detail.ok_or_else(|| WebError::not_found("Image not found"))?;
 
+    let lookup = state
+        .ops
+        .web_image_content_lookup(ImageId::new(id))
+        .await
+        .map_err(db_error)?;
+    let mut file = json!({"present":false});
+    if let Some(lookup) = lookup
+        && lookup.download_status == "downloaded"
+        && local_file_present(&state, lookup.local_path.as_deref()).await
+        && let Some(path) = lookup.local_path
+        && let Ok(metadata) = tokio::fs::metadata(path).await
+    {
+        file = json!({"present":true,"name":format!("image-{id}.jpg"),"size_bytes":metadata.len()});
+    }
     // Validate NVR URLs from the detail record
     let validated_image_url = detail
         .nvr
@@ -610,6 +931,7 @@ async fn api_image(
     Ok(Json(json!({
         "id": detail.id,
         "image_key": detail.image_key,
+        "file": file,
         "captured_at": detail.captured_at,
         "capture_end_at": detail.capture_end_at,
         "discovered_at": detail.discovered_at,
@@ -625,7 +947,7 @@ async fn api_image(
             "status": detail.download.status,
             "attempts": detail.download.attempts,
             "downloaded_at": detail.download.downloaded_at,
-            "last_error": detail.download.last_error,
+            "last_error": detail.download.last_error.map(|_|"The image download failed. Check the NVR connection and service diagnostics."),
             "next_attempt_at": detail.download.next_attempt_at,
             "lease_until": detail.download.lease_until
         },
@@ -634,7 +956,7 @@ async fn api_image(
             "attempts": detail.processing.attempts,
             "started_at": detail.processing.started_at,
             "completed_at": detail.processing.completed_at,
-            "last_error": detail.processing.last_error,
+            "last_error": detail.processing.last_error.map(|_|"Classification failed. Check the model endpoint and service diagnostics."),
             "next_attempt_at": detail.processing.next_attempt_at,
             "lease_until": detail.processing.lease_until
         },
@@ -644,6 +966,107 @@ async fn api_image(
         },
         "classifications": classifications
     })))
+}
+
+async fn api_neighbors(
+    State(state): State<WebState>,
+    AxumPath(id): AxumPath<i64>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, WebError> {
+    let mut params = parse_image_params(raw)?;
+    validate_time_range(&params)?;
+    let detail = state
+        .ops
+        .web_image_detail(ImageId::new(id))
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| WebError::not_found("Image not found"))?;
+    if params.camera.is_none() && params.from.is_none() && params.to.is_none() {
+        params.camera = Some(detail.camera.id.to_string());
+    }
+    let filter = build_image_filter(&params)?;
+    let latest = detail.classifications.first();
+    let (forward, backward, value) = match params.sort.as_deref().unwrap_or("captured_desc") {
+        "captured_desc" => (
+            WebImageOrder::CapturedDescending,
+            WebImageOrder::CapturedAscending,
+            detail.captured_at.clone(),
+        ),
+        "captured_asc" => (
+            WebImageOrder::CapturedAscending,
+            WebImageOrder::CapturedDescending,
+            detail.captured_at.clone(),
+        ),
+        "confidence_desc" => (
+            WebImageOrder::ConfidenceDescending,
+            WebImageOrder::ConfidenceAscending,
+            latest
+                .and_then(|c| c.confidence)
+                .unwrap_or(-1.0)
+                .to_string(),
+        ),
+        "classified_desc" => (
+            WebImageOrder::ClassifiedDescending,
+            WebImageOrder::ClassifiedAscending,
+            latest
+                .map(|c| c.request_completed_at.clone())
+                .unwrap_or_default(),
+        ),
+        "camera_asc" => (
+            WebImageOrder::CameraAscending,
+            WebImageOrder::CameraDescending,
+            serde_json::to_string(&(detail.camera.channel, &detail.captured_at))
+                .expect("tuple serializes"),
+        ),
+        _ => return Err(WebError::bad_request("unsupported image sort")),
+    };
+    async fn find_neighbor(
+        state: &WebState,
+        mut query: WebImageQuery,
+        presence: Option<&str>,
+    ) -> Result<Option<i64>, WebError> {
+        query.limit = if presence.is_some() { 200 } else { 1 };
+        loop {
+            let (rows, cursor) = state.ops.web_query_images(&query).await.map_err(db_error)?;
+            for row in rows {
+                if let Some(presence) = presence {
+                    let exists = row.download_status == "downloaded"
+                        && local_file_present(state, row.local_path.as_deref()).await;
+                    if exists != (presence == "present") {
+                        continue;
+                    }
+                }
+                return Ok(Some(row.id));
+            }
+            if cursor.is_none() {
+                return Ok(None);
+            }
+            query.cursor = cursor;
+        }
+    }
+    let next = find_neighbor(
+        &state,
+        WebImageQuery {
+            filter: filter.clone(),
+            order: forward,
+            limit: 1,
+            cursor: Some((value.clone(), id)),
+        },
+        params.local_file.as_deref(),
+    )
+    .await?;
+    let previous = find_neighbor(
+        &state,
+        WebImageQuery {
+            filter,
+            order: backward,
+            limit: 1,
+            cursor: Some((value, id)),
+        },
+        params.local_file.as_deref(),
+    )
+    .await?;
+    Ok(Json(json!({"previous":previous,"next":next})))
 }
 
 // ── API: image content ─────────────────────────────────────────────────────
@@ -659,20 +1082,63 @@ async fn api_image_content(
     AxumPath(id): AxumPath<i64>,
     Query(params): Query<ImageContentParams>,
 ) -> Result<Response, WebError> {
-    serve_image_content(state, id, params.draw_bounding_box == Some(true)).await
+    serve_image_content(state, id, params.draw_bounding_box == Some(true), false).await
 }
 
 async fn api_image_thumbnail(
     State(state): State<WebState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Response, WebError> {
-    serve_image_content(state, id, false).await
+    serve_image_content(state, id, false, true).await
+}
+
+/// Open from a directory descriptor, refusing symlinks in every component.
+/// Anchoring traversal prevents a replaced-path race between containment checks
+/// and the actual read. O_NONBLOCK avoids blocking on a substituted FIFO.
+async fn open_local_image(root: PathBuf, path: PathBuf) -> Result<tokio::fs::File, WebError> {
+    let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        use nix::fcntl::{OFlag, open, openat};
+        use nix::sys::stat::Mode;
+        let flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW;
+        let mut directory = open(&root, flags | OFlag::O_DIRECTORY, Mode::empty())?;
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
+        let components = relative.components().collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            };
+            let final_component = index + 1 == components.len();
+            directory = openat(
+                &directory,
+                Path::new(name),
+                flags
+                    | if final_component {
+                        OFlag::O_NONBLOCK
+                    } else {
+                        OFlag::O_DIRECTORY
+                    },
+                Mode::empty(),
+            )?;
+        }
+        let file = std::fs::File::from(directory);
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        }
+        Ok(file)
+    })
+    .await
+    .map_err(|_| WebError::not_found("Local image file could not be opened"))?
+    .map_err(|_| WebError::not_found("Local image file is missing or unsafe"))?;
+    Ok(tokio::fs::File::from_std(file))
 }
 
 async fn serve_image_content(
     state: WebState,
     id: i64,
     draw_bounding_box: bool,
+    thumbnail: bool,
 ) -> Result<Response, WebError> {
     let lookup = state
         .ops
@@ -703,6 +1169,25 @@ async fn serve_image_content(
         });
     }
 
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| WebError::not_found("Local image file is missing"))?;
+    if !metadata.is_file() || metadata.len() > state.nvr.download.maximum_image_size_bytes {
+        return Err(WebError::bad_request(
+            "The local image is not a regular file within the configured size limit",
+        ));
+    }
+    let cache_key = format!("{id}:{}:{:?}", metadata.len(), metadata.modified().ok());
+    if thumbnail && let Some(bytes) = state.thumbnails.lock().await.get(&cache_key).cloned() {
+        return Ok((
+            [
+                (CONTENT_TYPE, "image/jpeg"),
+                (CACHE_CONTROL, "private, max-age=300"),
+            ],
+            bytes,
+        )
+            .into_response());
+    }
     let boxes = if draw_bounding_box {
         lookup
             .bounding_boxes_json
@@ -723,7 +1208,7 @@ async fn serve_image_content(
     // Acquire before reading the JPEG so waiting requests do not retain image
     // bytes. Move the permit into the blocking task so cancellation of the
     // HTTP request cannot release it while a render is still running.
-    let render = if let Some(boxes) = boxes {
+    let render = if boxes.is_some() || thumbnail {
         let permit = state
             .bounding_box_render_limit
             .clone()
@@ -734,14 +1219,23 @@ async fn serve_image_content(
                 code: "image_rendering_unavailable",
                 message: "Image rendering is unavailable".into(),
             })?;
-        Some((boxes, permit))
+        Some((boxes.unwrap_or_default(), permit))
     } else {
         None
     };
 
-    let mut bytes = tokio::fs::read(&path)
+    use tokio::io::AsyncReadExt;
+    let file = open_local_image(root, path).await?;
+    let mut bytes = Vec::new();
+    file.take(state.nvr.download.maximum_image_size_bytes + 1)
+        .read_to_end(&mut bytes)
         .await
         .map_err(|_| WebError::not_found("Local image file could not be read"))?;
+    if bytes.len() as u64 > state.nvr.download.maximum_image_size_bytes {
+        return Err(WebError::bad_request(
+            "Image exceeds the configured size limit",
+        ));
+    }
 
     // Full JPEG validation: check signature and trailer
     if bytes.len() < 4 || !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
@@ -757,7 +1251,11 @@ async fn serve_image_content(
         let stroke_width = state.web.bounding_box_width_pixels;
         bytes = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            bounding_boxes::render_jpeg_with_boxes(&bytes, &boxes, color, stroke_width)
+            if thumbnail {
+                bounding_boxes::thumbnail(&bytes)
+            } else {
+                bounding_boxes::render_jpeg_with_boxes(&bytes, &boxes, color, stroke_width)
+            }
         })
         .await
         .map_err(|_| WebError {
@@ -772,6 +1270,17 @@ async fn serve_image_content(
         })?;
     }
 
+    let bytes = bytes::Bytes::from(bytes);
+    if thumbnail {
+        let mut cache = state.thumbnails.lock().await;
+        // Hard memory/entry caps; an evicted thumbnail is safely regenerated.
+        if cache.len() >= 512
+            || cache.values().map(|v| v.len()).sum::<usize>() + bytes.len() > 64 * 1024 * 1024
+        {
+            cache.clear();
+        }
+        cache.insert(cache_key, bytes.clone());
+    }
     let mut response = Response::new(Body::from(bytes));
     response
         .headers_mut()
@@ -852,7 +1361,7 @@ async fn api_recording(
         .find(&track, start, end, capture_start_at)
         .await
         .map_err(|e| {
-            tracing::warn!(image_id = %id, "recording search failed: {e}");
+            tracing::warn!(image_id = %id, category = ?e.category, "Recording search failed");
             WebError {
                 status: StatusCode::BAD_GATEWAY,
                 code: "recording_search_failed",
@@ -885,12 +1394,17 @@ async fn api_recording(
     })))
 }
 
+async fn unsupported_clip() -> WebError {
+    WebError {status:StatusCode::UNPROCESSABLE_ENTITY,code:"recording_not_supported",message:"This deployment has no browser-compatible bounded clip adapter. Use the NVR playback URI in an external player.".into()}
+}
+
 // ── API: activity ──────────────────────────────────────────────────────────
 
 async fn api_activity(
     State(state): State<WebState>,
-    Query(params): Query<ImageParams>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, WebError> {
+    let params = parse_image_params(raw)?;
     validate_time_range(&params)?;
     let filter = build_image_filter(&params)?;
     let record = state.ops.web_activity(&filter).await.map_err(db_error)?;
@@ -934,6 +1448,39 @@ async fn api_activity(
     })))
 }
 
+// Every event is a full invalidation, including the first after reconnect/restart.
+// No replay buffer is needed because no entity state is carried in the stream.
+async fn api_events(State(state): State<WebState>) -> Result<Response, WebError> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let permit = state
+        .event_limit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| WebError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "event_limit",
+            message: "Too many live-update connections. Polling remains available.".into(),
+        })?;
+    let interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let stream =
+        futures_util::stream::unfold((interval, permit), |(mut interval, permit)| async move {
+            interval.tick().await;
+            let now = Utc::now().to_rfc3339();
+            let event = Event::default().event("invalidate").id(&now).data(
+                json!({"resources":["health","activity","images","overview","cameras"],"at":now})
+                    .to_string(),
+            );
+            Some((Ok::<_, std::convert::Infallible>(event), (interval, permit)))
+        });
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::default().interval(std::time::Duration::from_secs(15)))
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    Ok(response)
+}
+
 // ── Validation helpers ─────────────────────────────────────────────────────
 
 fn validate_time_range(params: &ImageParams) -> Result<(), WebError> {
@@ -961,23 +1508,129 @@ fn parse_timestamp(value: &str, field: &'static str) -> Result<Timestamp, WebErr
         .map_err(|_| WebError::bad_request(format!("{field} must be an RFC 3339 timestamp")))
 }
 
-fn encode_cursor(timestamp: &str, id: i64) -> String {
-    URL_SAFE_NO_PAD.encode(format!("{timestamp}\n{id}"))
+fn parse_image_params(raw: Option<String>) -> Result<ImageParams, WebError> {
+    let mut values = std::collections::BTreeMap::<String, String>::new();
+    for (key, value) in url::form_urlencoded::parse(raw.as_deref().unwrap_or("").as_bytes()) {
+        if let Some(existing) = values.get_mut(key.as_ref()) {
+            if !["camera", "species", "download_status", "processing_status"]
+                .contains(&key.as_ref())
+            {
+                return Err(WebError::bad_request("duplicate query parameter"));
+            }
+            existing.push(',');
+            existing.push_str(&value);
+        } else {
+            values.insert(key.into_owned(), value.into_owned());
+        }
+    }
+    let mut object = serde_json::Map::new();
+    for (key, value) in values {
+        let parsed = match key.as_str() {
+            "contains_wildlife" | "interesting" | "classified" => json!(
+                value
+                    .parse::<bool>()
+                    .map_err(|_| WebError::bad_request("invalid boolean filter"))?
+            ),
+            "limit" => json!(
+                value
+                    .parse::<u32>()
+                    .map_err(|_| WebError::bad_request("invalid limit"))?
+            ),
+            "confidence_min" => {
+                let confidence = value
+                    .parse::<f64>()
+                    .map_err(|_| WebError::bad_request("invalid confidence"))?;
+                if !confidence.is_finite() {
+                    return Err(WebError::bad_request("invalid confidence"));
+                }
+                json!(confidence)
+            }
+            _ => json!(value),
+        };
+        object.insert(key, parsed);
+    }
+    serde_json::from_value(Value::Object(object))
+        .map_err(|_| WebError::bad_request("unknown or invalid query parameter"))
 }
 
-fn decode_cursor(value: &str) -> Result<(String, i64), WebError> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| WebError::bad_request("cursor is invalid"))?;
-    let value = String::from_utf8(bytes).map_err(|_| WebError::bad_request("cursor is invalid"))?;
-    let (timestamp, id) = value
-        .rsplit_once('\n')
-        .ok_or_else(|| WebError::bad_request("cursor is invalid"))?;
-    parse_timestamp(timestamp, "cursor timestamp")?;
-    let id = id
-        .parse::<i64>()
-        .map_err(|_| WebError::bad_request("cursor is invalid"))?;
-    Ok((timestamp.to_string(), id))
+fn cursor_scope(params: &ImageParams) -> String {
+    let mut scope = params.clone();
+    scope.cursor = None;
+    scope.limit = None;
+    // Canonicalize unordered multi-value filters.
+    for raw in [
+        &mut scope.camera,
+        &mut scope.download_status,
+        &mut scope.processing_status,
+        &mut scope.species,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let mut values: Vec<_> = raw.split(',').map(str::trim).collect();
+        values.sort_unstable();
+        values.dedup();
+        *raw = values.join(",");
+    }
+    serde_json::to_string(&scope).expect("filter serializes")
+}
+
+// HMAC-SHA256 with a per-process random key. Restarted servers reject old cursors.
+fn cursor_mac(payload: &[u8], key: &[u8; 32]) -> Vec<u8> {
+    let mut inner = [0x36; 64];
+    let mut outer = [0x5c; 64];
+    for i in 0..32 {
+        inner[i] ^= key[i];
+        outer[i] ^= key[i];
+    }
+    let mut hash = Sha256::new();
+    hash.update(inner);
+    hash.update(payload);
+    let digest = hash.finalize();
+    let mut hash = Sha256::new();
+    hash.update(outer);
+    hash.update(digest);
+    hash.finalize().to_vec()
+}
+fn encode_cursor(value: &str, id: i64, params: &ImageParams, key: &[u8; 32]) -> String {
+    let payload =
+        serde_json::to_vec(&(value, id, cursor_scope(params))).expect("cursor serializes");
+    format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(&payload),
+        URL_SAFE_NO_PAD.encode(cursor_mac(&payload, key))
+    )
+}
+fn decode_cursor(
+    value: &str,
+    params: &ImageParams,
+    key: &[u8; 32],
+) -> Result<(String, i64), WebError> {
+    let invalid = || WebError {
+        status: StatusCode::BAD_REQUEST,
+        code: "invalid_cursor",
+        message: "This image cursor expired or belongs to different filters. Reload the list."
+            .into(),
+    };
+    let (payload, signature) = value.split_once('.').ok_or_else(invalid)?;
+    let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| invalid())?;
+    let signature = URL_SAFE_NO_PAD.decode(signature).map_err(|_| invalid())?;
+    let expected = cursor_mac(&payload, key);
+    if signature.len() != expected.len()
+        || signature
+            .iter()
+            .zip(&expected)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            != 0
+    {
+        return Err(invalid());
+    }
+    let (sort_value, id, scope): (String, i64, String) =
+        serde_json::from_slice(&payload).map_err(|_| invalid())?;
+    if scope != cursor_scope(params) {
+        return Err(invalid());
+    }
+    Ok((sort_value, id))
 }
 
 fn validated_still_url(raw: &str, config: &NvrConfig) -> Option<String> {
@@ -1151,15 +1804,23 @@ mod tests {
             recording_search: Arc::new(RecordingSearchClient::new(transport, 50)),
             bounding_box_render_limit: Arc::new(Semaphore::new(2)),
             started_at: "2026-07-21T10:00:00Z".parse().unwrap(),
+            event_limit: Arc::new(Semaphore::new(32)),
+            thumbnails: Default::default(),
+            cursor_key: [7; 32],
         };
         (root, state)
     }
 
     #[test]
     fn cursor_round_trip() {
-        let encoded = encode_cursor("2026-07-21T00:00:00Z", 42);
+        let encoded = encode_cursor(
+            "2026-07-21T00:00:00Z",
+            42,
+            &ImageParams::default(),
+            &[7; 32],
+        );
         assert_eq!(
-            decode_cursor(&encoded).unwrap(),
+            decode_cursor(&encoded, &ImageParams::default(), &[7; 32]).unwrap(),
             ("2026-07-21T00:00:00Z".to_string(), 42)
         );
     }
@@ -1221,13 +1882,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ui_routes_are_not_served() {
+    async fn ui_routes_serve_embedded_application() {
         let (_root, state) = test_state().await;
         let response = router(state)
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.status(),
+            if assets::available() {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        );
     }
 
     #[tokio::test]
@@ -1243,5 +1911,322 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    async fn get_json(state: &WebState, uri: &str) -> (StatusCode, Value) {
+        let response = router(state.clone())
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn add_images(root: &tempfile::TempDir) {
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            root.path().join("web.sqlite3").display()
+        ))
+        .await
+        .unwrap();
+        for id in 2..=4 {
+            sqlx::query("INSERT INTO images (id,image_key,camera_id,track_id,capture_start_at,playback_uri,canonical_playback_uri,download_status,processing_status,discovered_at,created_at,updated_at) VALUES (?, ?, 1, '303', '2026-07-21T10:00:00.000000000Z', 'http://nvr/still', 'http://nvr/still', 'pending', 'new', '2026-07-21T11:00:00.000000000Z', '2026-07-21T11:00:00.000000000Z', '2026-07-21T11:00:00.000000000Z')")
+                .bind(id).bind(format!("image-{id}")).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn explorer_filters_boundaries_and_aggregates_agree() {
+        let (root, state) = test_state().await;
+        add_images(&root).await;
+        for (query, expected) in [
+            ("from=2026-07-21T10:00:00Z&to=2026-07-21T10:00:01Z", 4),
+            ("from=2026-07-21T09:00:00Z&to=2026-07-21T10:00:00Z", 0),
+            ("camera=1&camera=99", 4),
+            (
+                "species=SQUIRREL&confidence_min=0.8&model=vision&prompt_version=wildlife-v1",
+                1,
+            ),
+            ("species=dog", 0),
+            ("q=garden", 4),
+            ("q=squirrel", 1),
+            ("time_field=discovered&from=2026-07-21T11:00:00Z", 3),
+            ("time_field=classified&from=2026-07-21T10:00:00Z", 1),
+        ] {
+            let (status, images) = get_json(&state, &format!("/api/v1/images?{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {images}");
+            assert_eq!(
+                images["data"].as_array().unwrap().len(),
+                expected,
+                "{query}"
+            );
+            let (status, overview) = get_json(&state, &format!("/api/v1/overview?{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {overview}");
+            assert_eq!(overview["counts"]["discovered"], expected, "{query}");
+            let camera_total: i64 = overview["camera_counts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["discovered"].as_i64().unwrap())
+                .sum();
+            assert_eq!(camera_total, expected as i64, "{query}");
+        }
+        assert_eq!(
+            get_json(&state, "/api/v1/images?typo=true").await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn all_sorts_have_stable_signed_pagination_and_neighbors() {
+        let (root, state) = test_state().await;
+        add_images(&root).await;
+        for sort in [
+            "captured_desc",
+            "captured_asc",
+            "confidence_desc",
+            "classified_desc",
+            "camera_asc",
+        ] {
+            let mut cursor = None::<String>;
+            let mut ids = Vec::new();
+            loop {
+                let suffix = cursor
+                    .as_ref()
+                    .map(|c| format!("&cursor={c}"))
+                    .unwrap_or_default();
+                let (status, page) = get_json(
+                    &state,
+                    &format!("/api/v1/images?sort={sort}&limit=1{suffix}"),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{sort}: {page}");
+                ids.push(page["data"][0]["id"].as_i64().unwrap());
+                if let Some(next) = page["page"]["next_cursor"].as_str() {
+                    cursor = Some(next.into());
+                } else {
+                    break;
+                }
+                assert!(ids.len() < 5);
+            }
+            let mut unique = ids.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(unique, vec![1, 2, 3, 4]);
+            let (_, neighbor) = get_json(
+                &state,
+                &format!("/api/v1/images/{}/neighbors?sort={sort}", ids[1]),
+            )
+            .await;
+            assert_eq!(neighbor["previous"], ids[0], "{sort}: {neighbor}");
+            assert_eq!(neighbor["next"], ids[2], "{sort}: {neighbor}");
+            let cursor = cursor.unwrap();
+            assert_eq!(
+                get_json(
+                    &state,
+                    &format!("/api/v1/images?sort={sort}&species=fox&cursor={cursor}")
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(
+                get_json(
+                    &state,
+                    &format!("/api/v1/images?sort={sort}&cursor={cursor}x")
+                )
+                .await
+                .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn thumbnail_is_resized_and_security_headers_cover_all_routes() {
+        let (root, state) = test_state().await;
+        let image = image::RgbImage::new(1600, 1200);
+        image.save(root.path().join("images/one.jpg")).unwrap();
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/images/1/thumbnail")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let bytes = to_bytes(response.into_body(), 2_000_000).await.unwrap();
+        let thumbnail = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((thumbnail.width(), thumbnail.height()), (480, 360));
+        assert_eq!(state.thumbnails.lock().await.len(), 1);
+        for path in ["/api/v1/config", "/api/v1/does-not-exist", "/images/1"] {
+            let response = router(state.clone())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert!(response.headers().contains_key("content-security-policy"));
+        }
+    }
+
+    #[tokio::test]
+    async fn health_distinguishes_missing_fresh_and_stopped_heartbeats() {
+        let (_root, state) = test_state().await;
+        assert_eq!(
+            get_json(&state, "/api/v1/health").await.1["pipelines"]["downloader"]["state"],
+            "unknown"
+        );
+        let now = Timestamp::new(Utc::now());
+        state.ops.set_metadata(&crate::database::models::ServiceMetadataKey::DownloaderHeartbeat,&json!({"state":"running","heartbeat_at":now.to_string(),"poll_interval_seconds":60}).to_string(),&now).await.unwrap();
+        assert_eq!(
+            get_json(&state, "/api/v1/health").await.1["pipelines"]["downloader"]["state"],
+            "idle"
+        );
+        state
+            .ops
+            .set_metadata(
+                &crate::database::models::ServiceMetadataKey::DownloaderHeartbeat,
+                &json!({"state":"stopped","heartbeat_at":now.to_string()}).to_string(),
+                &now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            get_json(&state, "/api/v1/health").await.1["pipelines"]["downloader"]["state"],
+            "stopped"
+        );
+    }
+    #[tokio::test]
+    async fn filesystem_filters_facets_and_descriptor_privacy() {
+        let (root, state) = test_state().await;
+        add_images(&root).await;
+        assert_eq!(
+            get_json(&state, "/api/v1/images?local_file=present")
+                .await
+                .1["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (status, facets) =
+            get_json(&state, "/api/v1/images/facets?download_status=downloaded").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(facets["download_status"]["pending"], 3);
+        assert_eq!(facets["processing_status"]["done"], 1);
+        assert_eq!(
+            get_json(&state, "/api/v1/images?confidence_min=NaN")
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        tokio::fs::remove_file(root.path().join("images/one.jpg"))
+            .await
+            .unwrap();
+        let (_, page) = get_json(
+            &state,
+            "/api/v1/images?download_status=downloaded&local_file=missing",
+        )
+        .await;
+        assert_eq!(page["data"].as_array().unwrap().len(), 1);
+        let (_, detail) = get_json(&state, "/api/v1/images/1").await;
+        assert_eq!(detail["file"]["present"], false);
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/images/1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
+        assert_eq!(
+            get_json(&state, "/api/v1/images/1/clip").await.0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn image_open_rejects_replaced_symlink_components() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.jpg"), b"private").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("replaced")).unwrap();
+        assert!(
+            open_local_image(root.path().into(), root.path().join("replaced/secret.jpg"))
+                .await
+                .is_err()
+        );
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.jpg"),
+            root.path().join("file.jpg"),
+        )
+        .unwrap();
+        assert!(
+            open_local_image(root.path().into(), root.path().join("file.jpg"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_assets_and_stream_cover_the_production_contract() {
+        let (_root, state) = test_state().await;
+        if assets::available() {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/images/1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let html = String::from_utf8(
+                to_bytes(response.into_body(), 1_000_000)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            let script = html
+                .split("src=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+            assert!(script.starts_with("/assets/"));
+            let response = router(state.clone())
+                .oneshot(Request::builder().uri(script).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[CONTENT_TYPE],
+                "text/javascript; charset=utf-8"
+            );
+        }
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+        let mut stream = response.into_body().into_data_stream();
+        use futures_util::StreamExt;
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&chunk).contains("event: invalidate"));
+        drop(stream);
+        assert_eq!(state.event_limit.available_permits(), 32);
     }
 }

@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1
 
+FROM node:24-bookworm-slim AS frontend
+WORKDIR /app/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web ./
+RUN npm run format:check && npm run build
+
 FROM rust:1.97-slim-bookworm AS builder
 
 WORKDIR /app
@@ -13,7 +20,8 @@ RUN apt-get update \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY --from=frontend /app/web/dist ./web/dist/
 COPY migrations ./migrations/
 COPY migrations-postgres ./migrations-postgres/
 COPY src ./src/

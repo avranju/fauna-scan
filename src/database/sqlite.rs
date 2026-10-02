@@ -297,114 +297,63 @@ impl SqliteDataStore {
             cursor,
         } = query;
 
-        // Build WHERE conditions
-        let WebImageFilter {
-            scope,
-            download_status,
-            processing_status,
-            classified,
-            contains_wildlife,
-            is_interesting,
-            confidence_min,
-        } = filter;
-
-        let mut conditions: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn std::any::Any + Send + Sync>> = Vec::new();
-
-        if let Some(from) = &scope.from {
-            conditions.push("capture_start_at >= ?".to_string());
-            params.push(Box::new(format_timestamp(from)));
-        }
-        if let Some(to) = &scope.to {
-            conditions.push("capture_start_at < ?".to_string());
-            params.push(Box::new(format_timestamp(to)));
-        }
-        if !scope.camera_ids.is_empty() {
-            let placeholders: Vec<String> = (0..scope.camera_ids.len())
-                .map(|_| "?".to_string())
-                .collect();
-            conditions.push(format!("camera_id IN ({})", placeholders.join(",")));
-            for cid in &scope.camera_ids {
-                params.push(Box::new(*cid));
-            }
-        }
-        if let Some(WebDownloadStatusFilter::OneOf(statuses)) = download_status {
-            let placeholders: Vec<String> = (0..statuses.len()).map(|_| "?".to_string()).collect();
-            conditions.push(format!("download_status IN ({})", placeholders.join(",")));
-            for s in statuses {
-                params.push(Box::new(s.clone()));
-            }
-        }
-        if let Some(WebProcessingStatusFilter::OneOf(statuses)) = processing_status {
-            let placeholders: Vec<String> = (0..statuses.len()).map(|_| "?".to_string()).collect();
-            conditions.push(format!("processing_status IN ({})", placeholders.join(",")));
-            for s in statuses {
-                params.push(Box::new(s.clone()));
-            }
-        }
-        if let Some(WebClassifiedFilter::Classified) = classified {
-            conditions.push("classifications.id IS NOT NULL".to_string());
-        } else if let Some(WebClassifiedFilter::NotClassified) = classified {
-            conditions.push("classifications.id IS NULL".to_string());
-        }
-        if let Some(wildlife) = contains_wildlife {
-            if *wildlife {
-                conditions.push("classifications.contains_wildlife = 1".to_string());
+        let (mut conditions, mut params) =
+            super::web_query::predicates(filter, "classifications", false);
+        let (sort_expression, direction) = super::web_query::ordering(order);
+        if let Some((value, id)) = cursor {
+            let comparison = if direction == "ASC" { ">" } else { "<" };
+            conditions.push(format!(
+                "({sort_expression}, images.id) {comparison} (?, ?)"
+            ));
+            if matches!(
+                order,
+                WebImageOrder::ConfidenceDescending | WebImageOrder::ConfidenceAscending
+            ) {
+                params.push(Box::new(value.parse::<f64>().map_err(|_| {
+                    AppError::new(
+                        ErrorCategory::Configuration,
+                        "invalid_cursor",
+                        "invalid confidence cursor",
+                    )
+                })?));
             } else {
-                conditions.push(
-                    "classifications.id IS NOT NULL AND classifications.contains_wildlife = 0"
-                        .to_string(),
-                );
+                params.push(Box::new(value.clone()));
             }
+            params.push(Box::new(*id));
         }
-        if let Some(interesting) = is_interesting {
-            if *interesting {
-                conditions.push("classifications.is_interesting = 1".to_string());
+        let mut order_clause =
+            format!("ORDER BY {sort_expression} {direction}, images.id {direction}");
+        if matches!(
+            order,
+            WebImageOrder::CameraAscending | WebImageOrder::CameraDescending
+        ) {
+            let reverse = matches!(order, WebImageOrder::CameraDescending);
+            order_clause = if reverse {
+                "ORDER BY cameras.channel_number DESC, images.capture_start_at ASC, images.id ASC"
             } else {
-                conditions.push(
-                    "classifications.id IS NOT NULL AND classifications.is_interesting = 0"
-                        .to_string(),
-                );
+                "ORDER BY cameras.channel_number ASC, images.capture_start_at DESC, images.id DESC"
+            }
+            .into();
+            if let Some((value, id)) = cursor {
+                conditions.pop();
+                params.pop();
+                params.pop();
+                let (channel, timestamp): (i64, String) =
+                    serde_json::from_str(value).map_err(|_| {
+                        AppError::new(
+                            ErrorCategory::Configuration,
+                            "invalid_cursor",
+                            "invalid camera cursor",
+                        )
+                    })?;
+                conditions.push(if reverse {"(cameras.channel_number < ? OR (cameras.channel_number = ? AND (images.capture_start_at, images.id) > (?, ?)))"}else{"(cameras.channel_number > ? OR (cameras.channel_number = ? AND (images.capture_start_at, images.id) < (?, ?)))"}.into());
+                params.push(Box::new(channel));
+                params.push(Box::new(channel));
+                params.push(Box::new(timestamp));
+                params.push(Box::new(*id));
             }
         }
-        if let Some(conf_min) = confidence_min {
-            conditions.push(
-                "classifications.id IS NOT NULL AND classifications.confidence >= ?".to_string(),
-            );
-            params.push(Box::new(*conf_min));
-        }
-
-        // Add keyset cursor condition
-        if let Some((cursor_ts, cursor_id)) = cursor {
-            let cursor_clause = match order {
-                WebImageOrder::CapturedAscending => {
-                    "(images.capture_start_at > ? OR (images.capture_start_at = ? AND images.id > ?))"
-                }
-                WebImageOrder::CapturedDescending => {
-                    "(images.capture_start_at < ? OR (images.capture_start_at = ? AND images.id < ?))"
-                }
-            };
-            conditions.push(cursor_clause.to_string());
-            params.push(Box::new(cursor_ts.clone()));
-            params.push(Box::new(cursor_ts.clone()));
-            params.push(Box::new(*cursor_id));
-        }
-
-        let where_clause = if conditions.is_empty() {
-            "".to_string()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-
-        let order_clause = match order {
-            WebImageOrder::CapturedAscending => {
-                "ORDER BY images.capture_start_at ASC, images.id ASC"
-            }
-            WebImageOrder::CapturedDescending => {
-                "ORDER BY images.capture_start_at DESC, images.id DESC"
-            }
-        };
-
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
         let query_str = format!(
             r#"SELECT images.id, images.image_key, images.capture_start_at, images.capture_end_at,
                       images.local_path, images.download_status, images.processing_status,
@@ -412,7 +361,8 @@ impl SqliteDataStore {
                       classifications.id, classifications.contains_wildlife, classifications.is_interesting,
                       classifications.summary, classifications.species_json, classifications.confidence,
                       classifications.model, classifications.prompt_version, classifications.request_started_at,
-                      classifications.request_completed_at, classifications.created_at
+                      classifications.request_completed_at, classifications.created_at,
+                      {sort_expression} AS sort_value
                FROM images
                LEFT JOIN cameras ON cameras.id = images.camera_id
                LEFT JOIN classifications ON classifications.image_id = images.id
@@ -453,9 +403,22 @@ impl SqliteDataStore {
         let summaries = build_image_summaries(&rows[..row_count]).await?;
         let next_cursor = if has_more {
             let last = &rows[row_count - 1];
-            let ts: String = last
-                .try_get(2)
-                .map_err(|e| map_sqlx_error("web_query_cursor", e))?;
+            let ts: String = match order {
+                WebImageOrder::ConfidenceDescending | WebImageOrder::ConfidenceAscending => {
+                    last.try_get::<f64, _>("sort_value").map(|v| v.to_string())
+                }
+                WebImageOrder::CameraAscending | WebImageOrder::CameraDescending => {
+                    let channel: i64 = last
+                        .try_get("sort_value")
+                        .map_err(|e| map_sqlx_error("web_query_cursor", e))?;
+                    let captured: String = last
+                        .try_get(2)
+                        .map_err(|e| map_sqlx_error("web_query_cursor", e))?;
+                    Ok(serde_json::to_string(&(channel, captured)).expect("tuple serializes"))
+                }
+                _ => last.try_get("sort_value"),
+            }
+            .map_err(|e| map_sqlx_error("web_query_cursor", e))?;
             let id: i64 = last
                 .try_get(0)
                 .map_err(|e| map_sqlx_error("web_query_cursor", e))?;
@@ -467,112 +430,24 @@ impl SqliteDataStore {
     }
 
     async fn web_overview(&self, filter: &WebImageFilter) -> AppResult<WebOverviewRecord> {
-        let WebImageFilter {
-            scope,
-            download_status,
-            processing_status,
-            classified,
-            contains_wildlife,
-            is_interesting,
-            confidence_min,
-        } = filter;
-
-        // Build image-level conditions (download/processing status, scope, classified flag).
-        // Classification filters reference the latest classification via a CTE so that
-        // only the most recent classification per image is considered.
-        let mut conditions: Vec<String> = Vec::new();
-        let mut params: Vec<Box<dyn std::any::Any + Send + Sync>> = Vec::new();
-
-        if let Some(from) = &scope.from {
-            conditions.push("capture_start_at >= ?".to_string());
-            params.push(Box::new(format_timestamp(from)));
-        }
-        if let Some(to) = &scope.to {
-            conditions.push("capture_start_at < ?".to_string());
-            params.push(Box::new(format_timestamp(to)));
-        }
-        if !scope.camera_ids.is_empty() {
-            let placeholders: Vec<String> = (0..scope.camera_ids.len())
-                .map(|_| "?".to_string())
-                .collect();
-            conditions.push(format!("camera_id IN ({})", placeholders.join(",")));
-            for cid in &scope.camera_ids {
-                params.push(Box::new(*cid));
-            }
-        }
-        if let Some(WebDownloadStatusFilter::OneOf(statuses)) = download_status {
-            let placeholders: Vec<String> = (0..statuses.len()).map(|_| "?".to_string()).collect();
-            conditions.push(format!("download_status IN ({})", placeholders.join(",")));
-            for s in statuses {
-                params.push(Box::new(s.clone()));
-            }
-        }
-        if let Some(WebProcessingStatusFilter::OneOf(statuses)) = processing_status {
-            let placeholders: Vec<String> = (0..statuses.len()).map(|_| "?".to_string()).collect();
-            conditions.push(format!("processing_status IN ({})", placeholders.join(",")));
-            for s in statuses {
-                params.push(Box::new(s.clone()));
-            }
-        }
-        // Classification filters reference the latest classification alias `lc`.
-        if let Some(WebClassifiedFilter::Classified) = classified {
-            conditions.push("lc.id IS NOT NULL".to_string());
-        } else if let Some(WebClassifiedFilter::NotClassified) = classified {
-            conditions.push("lc.id IS NULL".to_string());
-        }
-        if let Some(wildlife) = contains_wildlife {
-            if *wildlife {
-                conditions.push("lc.contains_wildlife = 1".to_string());
-            } else {
-                conditions.push("lc.contains_wildlife = 0".to_string());
-            }
-        }
-        if let Some(interesting) = is_interesting {
-            if *interesting {
-                conditions.push("lc.is_interesting = 1".to_string());
-            } else {
-                conditions.push("lc.is_interesting = 0".to_string());
-            }
-        }
-        if let Some(conf_min) = confidence_min {
-            conditions.push("lc.confidence >= ?".to_string());
-            params.push(Box::new(*conf_min));
-        }
-
-        let where_clause = if conditions.is_empty() {
-            "WHERE 1=1".to_string()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-
-        // Use a CTE to rank classifications by request_completed_at DESC, id DESC
-        // so that only the latest classification per image is joined.  The CTE
-        // retains the classification id so the join is exact (rn=1 on that row).
+        let (conditions, params) = super::web_query::predicates(filter, "classifications", false);
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
         let overview_sql = format!(
-            r#"WITH latest_class AS (
-                   SELECT id, image_id,
-                          ROW_NUMBER() OVER (PARTITION BY image_id ORDER BY request_completed_at DESC, id DESC) AS rn
-                   FROM classifications
-               ),
-               lc AS (
-                   SELECT c.id, c.image_id, c.contains_wildlife, c.is_interesting,
-                          c.summary, c.species_json, c.confidence
-                   FROM classifications c
-                   JOIN latest_class lc2 ON lc2.id = c.id AND lc2.rn = 1
-               )
-               SELECT
+            r#"               SELECT
                    COUNT(*),
                    COALESCE(SUM(CASE WHEN images.download_status = 'downloaded' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN images.processing_status = 'done' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN lc.contains_wildlife = 1 THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN lc.is_interesting = 1 THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN images.download_status = 'retry_wait' THEN 1 ELSE 0 END), 0) +
-                   COALESCE(SUM(CASE WHEN images.processing_status = 'retry_wait' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN images.download_status IN ('unavailable', 'failed') THEN 1 ELSE 0 END), 0) +
-                   COALESCE(SUM(CASE WHEN images.processing_status IN ('failed', 'missing') THEN 1 ELSE 0 END), 0)
+                   COALESCE(SUM(CASE WHEN classifications.id IS NOT NULL THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN classifications.contains_wildlife = 1 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN classifications.is_interesting = 1 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN images.download_status = 'retry_wait' OR images.processing_status = 'retry_wait' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN images.download_status IN ('unavailable', 'failed') OR images.processing_status IN ('failed', 'missing') THEN 1 ELSE 0 END), 0)
                FROM images
-               LEFT JOIN lc ON lc.image_id = images.id
-               {where_clause}"#,
+               LEFT JOIN cameras ON cameras.id = images.camera_id
+               LEFT JOIN classifications ON classifications.id = (
+                   SELECT c.id FROM classifications c WHERE c.image_id = images.id
+                   ORDER BY c.request_completed_at DESC, c.id DESC LIMIT 1
+               )
+ {where_clause}"#
         );
         let mut overview_query = sqlx::query(&overview_sql);
         for p in &params {
@@ -612,6 +487,103 @@ impl SqliteDataStore {
                 .try_get(6)
                 .map_err(|e| map_sqlx_error("web_overview", e))?,
         })
+    }
+
+    async fn web_buckets(
+        &self,
+        filter: &WebImageFilter,
+        seconds: i64,
+    ) -> AppResult<Vec<WebActivityBucket>> {
+        let (conditions, params) = super::web_query::predicates(filter, "classifications", false);
+        let where_clause = conditions.join(" AND ");
+        let sql = format!(
+            r#"SELECT (CAST(strftime('%s', images.capture_start_at) AS INTEGER) / {seconds}) * {seconds} AS bucket,
+            COUNT(*) AS discovered,
+            COALESCE(SUM(CASE WHEN images.download_status = 'downloaded' THEN 1 ELSE 0 END), 0) AS downloaded,
+            COALESCE(SUM(CASE WHEN classifications.id IS NOT NULL THEN 1 ELSE 0 END), 0) AS classified
+            FROM images LEFT JOIN cameras ON cameras.id = images.camera_id
+            LEFT JOIN classifications ON classifications.id = (SELECT c.id FROM classifications c WHERE c.image_id = images.id ORDER BY c.request_completed_at DESC, c.id DESC LIMIT 1)
+            WHERE {where_clause} GROUP BY bucket ORDER BY bucket"#
+        );
+
+        let mut query = sqlx::query(&sql);
+        for p in &params {
+            if let Some(s) = p.downcast_ref::<String>() {
+                query = query.bind(s);
+            } else if let Some(i) = p.downcast_ref::<i64>() {
+                query = query.bind(i);
+            } else if let Some(f) = p.downcast_ref::<f64>() {
+                query = query.bind(f);
+            }
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error("web_buckets", e))?;
+        rows.into_iter()
+            .map(|row| {
+                let start: i64 = row
+                    .try_get("bucket")
+                    .map_err(|e| map_sqlx_error("web_buckets", e))?;
+                Ok(WebActivityBucket {
+                    start_at: chrono::DateTime::from_timestamp(start, 0)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_default(),
+                    end_at: chrono::DateTime::from_timestamp(start + seconds, 0)
+                        .map(|d| d.to_rfc3339())
+                        .unwrap_or_default(),
+                    discovered: row
+                        .try_get("discovered")
+                        .map_err(|e| map_sqlx_error("web_buckets", e))?,
+                    downloaded: row
+                        .try_get("downloaded")
+                        .map_err(|e| map_sqlx_error("web_buckets", e))?,
+                    classified: row
+                        .try_get("classified")
+                        .map_err(|e| map_sqlx_error("web_buckets", e))?,
+                })
+            })
+            .collect()
+    }
+
+    async fn web_camera_counts(&self, filter: &WebImageFilter) -> AppResult<Vec<WebCameraCounts>> {
+        let (conditions, params) = super::web_query::predicates(filter, "classifications", false);
+        let sql = format!(
+            "SELECT images.camera_id, COUNT(*) AS discovered, COUNT(classifications.id) AS classified
+            FROM images LEFT JOIN cameras ON cameras.id = images.camera_id
+            LEFT JOIN classifications ON classifications.id = (SELECT c.id FROM classifications c WHERE c.image_id = images.id ORDER BY c.request_completed_at DESC, c.id DESC LIMIT 1)
+            WHERE {} GROUP BY images.camera_id", conditions.join(" AND ")
+        );
+
+        let mut query = sqlx::query(&sql);
+        for p in &params {
+            if let Some(s) = p.downcast_ref::<String>() {
+                query = query.bind(s);
+            } else if let Some(i) = p.downcast_ref::<i64>() {
+                query = query.bind(i);
+            } else if let Some(f) = p.downcast_ref::<f64>() {
+                query = query.bind(f);
+            }
+        }
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error("web_camera_counts", e))?
+            .into_iter()
+            .map(|row| {
+                Ok(WebCameraCounts {
+                    camera_id: row
+                        .try_get("camera_id")
+                        .map_err(|e| map_sqlx_error("web_camera_counts", e))?,
+                    discovered: row
+                        .try_get("discovered")
+                        .map_err(|e| map_sqlx_error("web_camera_counts", e))?,
+                    classified: row
+                        .try_get("classified")
+                        .map_err(|e| map_sqlx_error("web_camera_counts", e))?,
+                })
+            })
+            .collect()
     }
 
     async fn web_image_detail(&self, image_id: ImageId) -> AppResult<Option<WebImageDetailRecord>> {
@@ -871,6 +843,7 @@ impl SqliteDataStore {
             contains_wildlife: _,
             is_interesting: _,
             confidence_min: _,
+            advanced: _,
         } = filter;
 
         let mut conditions: Vec<String> = Vec::new();
@@ -902,11 +875,11 @@ impl SqliteDataStore {
         // Separate GROUP BY queries: one per category to avoid paired-row duplication.
         // Download counts
         let dl_sql = format!(
-            r#"SELECT download_status, COUNT(*)
+            r#"SELECT download_status, COUNT(*), MIN(discovered_at)
                FROM images {where_clause}
                GROUP BY download_status"#,
         );
-        let mut dl_query = sqlx::query_as::<_, (String, i64)>(&dl_sql);
+        let mut dl_query = sqlx::query_as::<_, (String, i64, Option<String>)>(&dl_sql);
         for p in &params {
             if let Some(s) = p.downcast_ref::<String>() {
                 dl_query = dl_query.bind(s);
@@ -916,18 +889,18 @@ impl SqliteDataStore {
                 dl_query = dl_query.bind(f);
             }
         }
-        let dl_rows: Vec<(String, i64)> = dl_query
+        let dl_rows: Vec<(String, i64, Option<String>)> = dl_query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| map_sqlx_error("web_activity_dl", e))?;
 
         // Processing counts
         let ps_sql = format!(
-            r#"SELECT processing_status, COUNT(*)
+            r#"SELECT processing_status, COUNT(*), MIN(downloaded_at)
                FROM images {where_clause}
                GROUP BY processing_status"#,
         );
-        let mut ps_query = sqlx::query_as::<_, (String, i64)>(&ps_sql);
+        let mut ps_query = sqlx::query_as::<_, (String, i64, Option<String>)>(&ps_sql);
         for p in &params {
             if let Some(s) = p.downcast_ref::<String>() {
                 ps_query = ps_query.bind(s);
@@ -937,21 +910,23 @@ impl SqliteDataStore {
                 ps_query = ps_query.bind(f);
             }
         }
-        let ps_rows: Vec<(String, i64)> = ps_query
+        let ps_rows: Vec<(String, i64, Option<String>)> = ps_query
             .fetch_all(&self.pool)
             .await
             .map_err(|e| map_sqlx_error("web_activity_ps", e))?;
 
         let mut counts = Vec::new();
-        for (status, count) in &dl_rows {
+        for (status, count, oldest_at) in &dl_rows {
             counts.push(WebActivityCount {
+                oldest_at: oldest_at.clone(),
                 category: "download".to_string(),
                 status: status.clone(),
                 count: *count,
             });
         }
-        for (status, count) in &ps_rows {
+        for (status, count, oldest_at) in &ps_rows {
             counts.push(WebActivityCount {
+                oldest_at: oldest_at.clone(),
                 category: "processing".to_string(),
                 status: status.clone(),
                 count: *count,
@@ -2207,7 +2182,7 @@ impl DataStore for SqliteDataStore {
         let mut counts = StatusCounts::default();
 
         let download_rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT download_status, COUNT(*) FROM images GROUP BY download_status")
+            sqlx::query_as("SELECT download_status, COUNT(*), MIN(discovered_at) FROM images GROUP BY download_status")
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error("status_counts_download", e))?;
@@ -2224,7 +2199,7 @@ impl DataStore for SqliteDataStore {
         }
 
         let processing_rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT processing_status, COUNT(*) FROM images GROUP BY processing_status",
+            "SELECT processing_status, COUNT(*), MIN(downloaded_at) FROM images GROUP BY processing_status",
         )
         .fetch_all(&self.pool)
         .await
@@ -3226,6 +3201,18 @@ impl DataStore for SqliteDataStore {
 
     async fn web_overview(&self, filter: &WebImageFilter) -> AppResult<WebOverviewRecord> {
         self.web_overview(filter).await
+    }
+
+    async fn web_buckets(
+        &self,
+        filter: &WebImageFilter,
+        seconds: i64,
+    ) -> AppResult<Vec<WebActivityBucket>> {
+        self.web_buckets(filter, seconds).await
+    }
+
+    async fn web_camera_counts(&self, filter: &WebImageFilter) -> AppResult<Vec<WebCameraCounts>> {
+        self.web_camera_counts(filter).await
     }
 
     async fn web_image_detail(&self, image_id: ImageId) -> AppResult<Option<WebImageDetailRecord>> {
