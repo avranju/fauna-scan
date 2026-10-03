@@ -76,7 +76,8 @@ async function fixture(page: Page) {
         body: ': fixture\n\n',
       });
     let body: unknown;
-    if (path === 'config')
+    if (path === 'auth/session') body = { username: 'Test User' };
+    else if (path === 'config')
       body = {
         version: '0.1.0',
         default_clip_pre_roll_seconds: 10,
@@ -228,6 +229,110 @@ async function fixture(page: Page) {
 }
 
 test.beforeEach(async ({ page }) => fixture(page));
+
+test('login gates deep links, reports invalid credentials, persists, and signs out', async ({
+  page,
+}) => {
+  let authenticated = false;
+  const innerRequests: string[] = [];
+  page.on('request', (request) => {
+    const path = new URL(request.url()).pathname;
+    if (path.startsWith('/api/v1/') && !path.startsWith('/api/v1/auth/'))
+      innerRequests.push(path);
+  });
+  await page.route('**/api/v1/auth/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    expect(route.request().headers()['x-fauna-scan-request']).toBe('1');
+    if (path.endsWith('/logout')) {
+      authenticated = false;
+      return route.fulfill({ status: 204 });
+    }
+    if (path.endsWith('/login')) {
+      const credentials = route.request().postDataJSON();
+      authenticated =
+        credentials.username === 'Test User' &&
+        credentials.password === 'correct password';
+    }
+    return route.fulfill({
+      status: authenticated ? 200 : 401,
+      contentType: 'application/json',
+      body: JSON.stringify(
+        authenticated
+          ? { username: 'Test User' }
+          : { error: { message: 'Invalid user name or password.' } },
+      ),
+    });
+  });
+  await page.goto('/images/1');
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(
+    page.getByRole('heading', { name: 'Sign in to Fauna Scan' }),
+  ).toBeVisible();
+  expect(innerRequests).toEqual([]);
+  const accessibility = await new AxeBuilder({ page }).analyze();
+  expect(accessibility.violations).toEqual([]);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.getByLabel('User name').fill('Test User');
+  await page.getByLabel('Password', { exact: true }).fill('wrong password');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByRole('alert')).toHaveText(
+    'Invalid user name or password.',
+  );
+  await page.getByLabel('Password', { exact: true }).fill('correct password');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(
+    page.getByRole('heading', {
+      name: 'Your wildlife, at a glance.',
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.goto('/images?range=all');
+  await expect(
+    page.getByRole('heading', { name: 'Images', exact: true }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(
+    page.getByRole('heading', { name: 'Images', exact: true }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(page.getByLabel('Password', { exact: true })).toHaveValue('');
+  await page.goto('/activity');
+  await expect(
+    page.getByRole('heading', { name: 'Sign in to Fauna Scan' }),
+  ).toBeVisible();
+});
+
+test('an expired or revoked API session returns the interface to login', async ({
+  page,
+}) => {
+  await page.goto('/images?range=all');
+  await expect(
+    page.getByRole('heading', { name: 'Images', exact: true }),
+  ).toBeVisible();
+  await page.route('**/api/v1/auth/session', (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: 'application/json',
+      body: '{"error":{"message":"Please sign in."}}',
+    }),
+  );
+  await page.route('**/api/v1/images/1', (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: 'application/json',
+      body: '{"error":{"message":"Please sign in."}}',
+    }),
+  );
+  await page.locator('.image-card').first().click();
+  await expect(
+    page.getByRole('heading', { name: 'Sign in to Fauna Scan' }),
+  ).toBeVisible();
+});
 
 test('filters are shareable, validate ranges, and survive browser navigation', async ({
   page,

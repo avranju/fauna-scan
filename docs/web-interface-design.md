@@ -897,7 +897,9 @@ Full content can use `ETag` based on image ID plus file metadata and may use pri
 
 The default server binds to `127.0.0.1`. Recommended remote access is through a trusted reverse proxy with TLS and authentication, or through an SSH/VPN tunnel.
 
-If Fauna Scan provides built-in authentication, the minimum is one operator account with an Argon2id password hash, secure HTTP-only SameSite cookies, session expiry, login throttling, and CSRF protection for any future state-changing route. Reverse-proxy authentication must only trust identity headers from explicitly configured proxy addresses.
+Fauna Scan requires built-in authentication on all inner pages and API/media routes. `/login`, its static assets, and `POST /api/v1/auth/login` are public. Credentials live in the `users` table on both backends and are provisioned out of band or through `users list`, `users add USERNAME PASSWORD`, and `users remove USERNAME`. Passwords are salted Argon2id PHC strings. Every authenticated user has access to all pages.
+
+Durable opaque sessions live in `web_sessions`, with only token digests stored. HTTP-only SameSite cookies are renewed on authenticated requests. `web.session_expiry_seconds = 0` is the default and means no server expiry; positive values give new sessions a fixed lifetime. Browser cookie retention limits still apply. `web.secure_cookie = true` must be enabled for HTTPS deployments. User deletion, password-hash changes, and sign-out revoke access. Login throttling, bounded password hashing, and a custom same-origin header on unsafe methods provide abuse and CSRF protection. Reverse-proxy identity headers are not used for built-in authentication.
 
 ### 20.2 Authorization roles
 

@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use crate::domain::{CameraId, ClassificationId, ImageId, Timestamp};
 use crate::error::AppResult;
 
+use super::auth_models::{SessionCredential, UserCredential};
 use super::models::*;
 use super::web_models::*;
 
@@ -86,6 +87,24 @@ pub type GcOperation =
 /// Implementations may use SQLite, PostgreSQL, or any other backend.
 #[async_trait]
 pub trait DataStore: Send + Sync {
+    // Authentication operations. Session insertion checks credentials atomically.
+    async fn list_users(&self) -> AppResult<Vec<String>>;
+    async fn add_user(&self, username: &str, password_hash: &str) -> AppResult<bool>;
+    async fn remove_user(&self, username: &str) -> AppResult<bool>;
+    async fn find_user(&self, username: &str) -> AppResult<Option<UserCredential>>;
+    async fn create_session(
+        &self,
+        token_hash: &str,
+        user: &UserCredential,
+        expires_at: Option<i64>,
+    ) -> AppResult<bool>;
+    async fn find_session(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> AppResult<Option<SessionCredential>>;
+    async fn remove_session(&self, token_hash: &str) -> AppResult<()>;
+
     // ── Camera operations ───────────────────────────────────────────────
 
     /// Return enabled cameras ordered deterministically by channel number then
@@ -385,6 +404,45 @@ pub struct DatabaseOps {
 }
 
 impl DatabaseOps {
+    pub async fn list_users(&self) -> AppResult<Vec<String>> {
+        self.inner.list_users().await
+    }
+
+    pub async fn add_user(&self, username: &str, password_hash: &str) -> AppResult<bool> {
+        self.inner.add_user(username, password_hash).await
+    }
+
+    pub async fn remove_user(&self, username: &str) -> AppResult<bool> {
+        self.inner.remove_user(username).await
+    }
+
+    pub async fn find_user(&self, username: &str) -> AppResult<Option<UserCredential>> {
+        self.inner.find_user(username).await
+    }
+
+    pub async fn create_session(
+        &self,
+        token_hash: &str,
+        user: &UserCredential,
+        expires_at: Option<i64>,
+    ) -> AppResult<bool> {
+        self.inner
+            .create_session(token_hash, user, expires_at)
+            .await
+    }
+
+    pub async fn find_session(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> AppResult<Option<SessionCredential>> {
+        self.inner.find_session(token_hash, now).await
+    }
+
+    pub async fn remove_session(&self, token_hash: &str) -> AppResult<()> {
+        self.inner.remove_session(token_hash).await
+    }
+
     /// Create a new DatabaseOps wrapping the given DataStore.
     pub fn new(store: Arc<dyn DataStore>) -> Self {
         Self { inner: store }

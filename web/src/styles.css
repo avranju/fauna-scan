@@ -1334,3 +1334,46 @@ footer a {
     background: #344735;
   }
 }
+/* Authentication */
+.login-page {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.login-panel {
+  width: 100%;
+  max-width: 440px;
+  padding: 36px;
+}
+.login-panel h1 {
+  font-size: 1.75rem;
+  margin: 16px 0 8px;
+}
+.login-panel .eyebrow {
+  margin-top: 24px;
+}
+.login-panel form {
+  display: grid;
+  gap: 12px;
+  margin-top: 28px;
+}
+.login-panel label {
+  font-weight: 600;
+}
+.login-panel input {
+  width: 100%;
+  min-height: 44px;
+}
+.login-panel .button {
+  margin-top: 12px;
+  min-height: 44px;
+}
+.login-error {
+  color: #9d2828;
+  margin: 0;
+}
+.sign-out {
+  white-space: nowrap;
+  min-height: 44px;
+}

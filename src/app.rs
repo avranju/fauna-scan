@@ -34,6 +34,7 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
             .await
             .map_err(|error| with_command_context("web", error)),
         Command::CheckConfig => handle_check_config(config_path),
+        Command::Users { command } => handle_users(command, config_path).await,
         Command::Discover => handle_discover(config_path).await,
         Command::Download(args) => handle_download(args, config_path).await,
         Command::Scan(args) => handle_scan(args, config_path).await,
@@ -41,6 +42,59 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
             .await
             .map_err(|error| with_command_context("status", error)),
     }
+}
+
+/// Manage credentials without contacting the NVR or classifier.
+async fn handle_users(
+    command: crate::cli::UsersCommand,
+    config_path: Option<&Path>,
+) -> AppResult<()> {
+    use crate::cli::UsersCommand;
+
+    let config = Config::load(config_path)?;
+    create_runtime_directories(&config)?;
+    let database = Database::connect(&config.database).await?;
+    let ops = database.ops();
+    match command {
+        UsersCommand::List => {
+            for username in ops.list_users().await? {
+                println!("{username}");
+            }
+        }
+        UsersCommand::Add { username, password } => {
+            crate::authentication::validate_credentials(&username, &password)?;
+            let hash = tokio::task::spawn_blocking(move || {
+                crate::authentication::hash_password(&password)
+            })
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCategory::Configuration,
+                    "users_add",
+                    "password hashing failed",
+                )
+            })??;
+            if !ops.add_user(&username, &hash).await? {
+                return Err(AppError::new(
+                    ErrorCategory::Configuration,
+                    "users_add",
+                    "user already exists",
+                ));
+            }
+            println!("Added user: {username}");
+        }
+        UsersCommand::Remove { username } => {
+            if !ops.remove_user(&username).await? {
+                return Err(AppError::new(
+                    ErrorCategory::Configuration,
+                    "users_remove",
+                    "user does not exist",
+                ));
+            }
+            println!("Removed user: {username}");
+        }
+    }
+    Ok(())
 }
 
 /// Serve the API against durable state without running worker pipelines.

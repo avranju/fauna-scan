@@ -169,23 +169,44 @@ export interface Clip {
   expires_in_seconds: number;
 }
 
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public status: number,
+  ) {
+    super(message);
+  }
+}
+
 export async function api<T>(
   path: string,
   signal?: AbortSignal,
   method = 'GET',
+  body?: unknown,
 ): Promise<T> {
   const response = await fetch(`/api/v1/${path}`, {
     method,
     signal,
-    headers: { Accept: 'application/json' },
+    credentials: 'same-origin',
+    headers: {
+      Accept: 'application/json',
+      'X-Fauna-Scan-Request': '1',
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
     const error = await response.json().catch(() => null);
-    throw new Error(
+    if (response.status === 401 && !path.startsWith('auth/')) {
+      window.dispatchEvent(new Event('fauna-scan:unauthenticated'));
+    }
+    throw new ApiError(
       error?.error?.message ||
         `Request failed (${response.status}). Please try again.`,
+      response.status,
     );
   }
+  if (response.status === 204) return undefined as T;
   return response.json();
 }
 

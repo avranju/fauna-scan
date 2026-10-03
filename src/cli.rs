@@ -46,6 +46,43 @@ pub enum Command {
 
     /// Print database status counts grouped by download and processing state.
     Status,
+
+    /// Manage web login credentials in the configured database.
+    Users {
+        #[command(subcommand)]
+        command: UsersCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum UsersCommand {
+    /// List user names (never passwords or hashes).
+    List,
+    /// Add a user with a salted password hash. Existing users are not replaced.
+    Add {
+        username: String,
+        #[arg(allow_hyphen_values = true)]
+        password: String,
+    },
+    /// Remove a user and revoke all their sessions.
+    Remove { username: String },
+}
+
+impl std::fmt::Debug for UsersCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::List => f.write_str("List"),
+            Self::Add { username, .. } => f
+                .debug_struct("Add")
+                .field("username", username)
+                .field("password", &"[REDACTED]")
+                .finish(),
+            Self::Remove { username } => f
+                .debug_struct("Remove")
+                .field("username", username)
+                .finish(),
+        }
+    }
 }
 
 /// Arguments for the `download` subcommand.

@@ -6,7 +6,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
-const CURRENT_SQLITE_MIGRATION: i64 = 9;
+const CURRENT_SQLITE_MIGRATION: i64 = 10;
 const TABLES: &[&str] = &[
     "cameras",
     "images",
@@ -15,6 +15,8 @@ const TABLES: &[&str] = &[
     "service_metadata",
     "classifier_rate_limit_events",
     "classifier_rate_limit_daily_usage",
+    "users",
+    "web_sessions",
 ];
 
 #[derive(Parser, Debug)]
@@ -196,6 +198,7 @@ async fn main() -> Result<()> {
     copy_service_metadata(&sqlite, &mut tx).await?;
     copy_rate_limit_events(&sqlite, &mut tx, args.batch_size).await?;
     copy_daily_usage(&sqlite, &mut tx).await?;
+    copy_authentication(&sqlite, &mut tx, args.batch_size).await?;
 
     verify_foreign_keys(&mut tx).await?;
     reset_sequences(&mut tx).await?;
@@ -389,6 +392,9 @@ async fn copy_search_cursors(
         .fetch_all(sqlite)
         .await
         .context("reading search_cursors")?;
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut query = QueryBuilder::<Postgres>::new(
         "INSERT INTO search_cursors (camera_id, next_search_at, last_completed_window_start, last_completed_window_end, last_poll_at, last_error, updated_at) ",
     );
@@ -401,9 +407,7 @@ async fn copy_search_cursors(
             .push_bind(&row.last_error)
             .push_bind(&row.updated_at);
     });
-    if !rows.is_empty() {
-        query.build().execute(&mut **tx).await?;
-    }
+    query.build().execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -415,6 +419,9 @@ async fn copy_service_metadata(
         .fetch_all(sqlite)
         .await
         .context("reading service_metadata")?;
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut query =
         QueryBuilder::<Postgres>::new("INSERT INTO service_metadata (key, value, updated_at) ");
     query.push_values(&rows, |mut b, row| {
@@ -422,9 +429,7 @@ async fn copy_service_metadata(
             .push_bind(&row.value)
             .push_bind(&row.updated_at);
     });
-    if !rows.is_empty() {
-        query.build().execute(&mut **tx).await?;
-    }
+    query.build().execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -468,6 +473,9 @@ async fn copy_daily_usage(sqlite: &SqlitePool, tx: &mut Transaction<'_, Postgres
             .fetch_all(sqlite)
             .await
             .context("reading classifier_rate_limit_daily_usage")?;
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut query = QueryBuilder::<Postgres>::new(
         "INSERT INTO classifier_rate_limit_daily_usage (quota_group, day, requests, tokens) ",
     );
@@ -477,8 +485,58 @@ async fn copy_daily_usage(sqlite: &SqlitePool, tx: &mut Transaction<'_, Postgres
             .push_bind(row.requests)
             .push_bind(row.tokens);
     });
-    if !rows.is_empty() {
+    query.build().execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Preserve credentials and durable sessions when changing database backends.
+async fn copy_authentication(
+    sqlite: &SqlitePool,
+    tx: &mut Transaction<'_, Postgres>,
+    batch_size: usize,
+) -> Result<()> {
+    let mut after: Option<String> = None;
+    loop {
+        let rows = sqlx::query_as::<_, fauna_scan::database::auth_models::UserCredential>(
+            "SELECT username, password_hash FROM users WHERE (? IS NULL OR username > ?) ORDER BY username LIMIT ?",
+        ).bind(&after).bind(&after).bind(batch_size as i64).fetch_all(sqlite).await?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut query =
+            QueryBuilder::<Postgres>::new("INSERT INTO users (username, password_hash) ");
+        query.push_values(&rows, |mut row, user| {
+            row.push_bind(&user.username).push_bind(&user.password_hash);
+        });
         query.build().execute(&mut **tx).await?;
+        after = rows.last().map(|user| user.username.clone());
+    }
+    #[derive(FromRow)]
+    struct Session {
+        token_hash: String,
+        username: String,
+        credential_fingerprint: String,
+        expires_at: Option<i64>,
+    }
+    let mut after: Option<String> = None;
+    loop {
+        let rows = sqlx::query_as::<_, Session>(
+            "SELECT token_hash, username, credential_fingerprint, expires_at FROM web_sessions WHERE (? IS NULL OR token_hash > ?) ORDER BY token_hash LIMIT ?",
+        ).bind(&after).bind(&after).bind(batch_size as i64).fetch_all(sqlite).await?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut query = QueryBuilder::<Postgres>::new(
+            "INSERT INTO web_sessions (token_hash, username, credential_fingerprint, expires_at) ",
+        );
+        query.push_values(&rows, |mut row, session| {
+            row.push_bind(&session.token_hash)
+                .push_bind(&session.username)
+                .push_bind(&session.credential_fingerprint)
+                .push_bind(session.expires_at);
+        });
+        query.build().execute(&mut **tx).await?;
+        after = rows.last().map(|session| session.token_hash.clone());
     }
     Ok(())
 }
@@ -507,7 +565,7 @@ async fn reset_sequences(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Counts([i64; 7]);
+struct Counts([i64; 9]);
 
 async fn sqlite_counts(sqlite: &SqlitePool) -> Result<Counts> {
     Ok(Counts([
@@ -530,6 +588,12 @@ async fn sqlite_counts(sqlite: &SqlitePool) -> Result<Counts> {
             .fetch_one(sqlite)
             .await?,
         sqlx::query_scalar("SELECT COUNT(*) FROM classifier_rate_limit_daily_usage")
+            .fetch_one(sqlite)
+            .await?,
+        sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(sqlite)
+            .await?,
+        sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
             .fetch_one(sqlite)
             .await?,
     ]))
@@ -556,6 +620,12 @@ async fn pg_counts(pg: &PgPool) -> Result<Counts> {
             .fetch_one(pg)
             .await?,
         sqlx::query_scalar("SELECT COUNT(*) FROM classifier_rate_limit_daily_usage")
+            .fetch_one(pg)
+            .await?,
+        sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(pg)
+            .await?,
+        sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
             .fetch_one(pg)
             .await?,
     ]))

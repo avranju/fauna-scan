@@ -75,6 +75,8 @@ output_directory = "{output}"
 [web]
 enabled = true
 listen_address = "127.0.0.1:9876"
+session_expiry_seconds = 7200
+secure_cookie = true
 clip_pre_roll_seconds = 5
 clip_post_roll_seconds = 15
 maximum_clip_duration_seconds = 60
@@ -94,6 +96,34 @@ start_at = "2026-01-01T00:00:00Z"
     assert_eq!(config.web.clip_pre_roll_seconds, 5);
     assert_eq!(config.web.clip_post_roll_seconds, 15);
     assert_eq!(config.web.maximum_clip_duration_seconds, 60);
+    assert_eq!(config.web.session_expiry_seconds, 7200);
+    assert!(config.web.secure_cookie);
+}
+
+#[test]
+fn web_sessions_default_to_no_expiry_and_reject_overflowing_lifetimes() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = format!(
+        r#"[database]
+path = {database:?}
+[general]
+output_directory = {output:?}
+[nvr]
+host = "nvr"
+port = 80
+username = "user"
+password = "password"
+start_at = "2026-01-01T00:00:00Z"
+"#,
+        database = dir.path().join("users.sqlite3"),
+        output = dir.path().join("images"),
+    );
+    let config = Config::load(Some(&write_config(&dir, &base))).unwrap();
+    assert_eq!(config.web.session_expiry_seconds, 0);
+    assert!(!config.web.secure_cookie);
+    let content = format!("{base}\n[web]\nsession_expiry_seconds = {}\n", i64::MAX);
+    let error = Config::load(Some(&write_config(&dir, &content))).unwrap_err();
+    assert!(error.message.contains("session_expiry_seconds"));
 }
 
 #[test]

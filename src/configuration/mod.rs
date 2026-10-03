@@ -223,6 +223,10 @@ pub struct Config {
 /// Resolved API server settings.
 #[derive(Debug, Clone)]
 pub struct WebConfig {
+    /// Session lifetime in seconds. Zero means no server-side expiry.
+    pub session_expiry_seconds: u64,
+    /// Require HTTPS for the session cookie (enable behind an HTTPS proxy).
+    pub secure_cookie: bool,
     /// Whether `run` should serve the API.
     pub enabled: bool,
     /// Address on which the Axum server listens.
@@ -252,6 +256,8 @@ pub struct WebConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
+            session_expiry_seconds: 0,
+            secure_cookie: false,
             enabled: false,
             listen_address: "127.0.0.1:8787".parse().expect("static socket address"),
             clip_pre_roll_seconds: 10,
@@ -474,6 +480,8 @@ struct RawConfig {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct RawWebConfig {
+    session_expiry_seconds: Option<u64>,
+    secure_cookie: Option<bool>,
     enabled: Option<bool>,
     listen_address: Option<String>,
     clip_pre_roll_seconds: Option<u64>,
@@ -788,6 +796,8 @@ impl Config {
         let classifier = resolve_classifier(&raw.classifier, &get_env)?;
 
         let web = WebConfig {
+            session_expiry_seconds: raw.web.session_expiry_seconds.unwrap_or(0),
+            secure_cookie: raw.web.secure_cookie.unwrap_or(false),
             enabled: raw.web.enabled.unwrap_or(false),
             listen_address: raw
                 .web
@@ -1187,6 +1197,13 @@ fn parse_bounding_box_color(value: &str) -> AppResult<[u8; 3]> {
 }
 
 fn validate_config(config: &Config) -> AppResult<()> {
+    if config.web.session_expiry_seconds > i64::MAX as u64 / 2 {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "web.session_expiry_seconds exceeds the supported range",
+        ));
+    }
     if config.web.listen_address.port() == 0 {
         return Err(AppError::new(
             ErrorCategory::Configuration,

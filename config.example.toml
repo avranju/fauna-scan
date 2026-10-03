@@ -18,6 +18,11 @@ log_level = "info"
 non_wildlife_image_retention_days = 4
 
 [web]
+# Zero keeps sessions valid indefinitely on the server. A positive value is
+# a fixed lifetime in seconds for newly created sessions.
+session_expiry_seconds = 0
+# Set true when the browser accesses Fauna Scan over HTTPS, including via proxy.
+secure_cookie = false
 enabled = true
 listen_address = "127.0.0.1:8787"
 clip_pre_roll_seconds = 10

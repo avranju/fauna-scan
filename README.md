@@ -36,7 +36,7 @@ Only configure providers and storage locations you trust, and ensure that your
 use of camera footage complies with applicable consent, privacy, and retention
 requirements.
 
-The web API has no built-in authentication. Keep its listener on loopback,
+The web interface and API require a database-backed login. Keep the listener on loopback,
 as in the default configuration, or put it behind an authenticated TLS reverse
 proxy. Protect the configuration and secret files, database, and image output
 directory from unauthorized access.
@@ -176,6 +176,9 @@ fauna-scan --config PATH discover
 fauna-scan --config PATH download --once
 fauna-scan --config PATH scan --once
 fauna-scan --config PATH status
+fauna-scan --config PATH users list
+fauna-scan --config PATH users add "USER NAME" "PASSWORD"
+fauna-scan --config PATH users remove "USER NAME"
 fauna-scan --config PATH check-config
 fauna-scan --log-level debug --config PATH run
 fauna-scan --help
@@ -184,13 +187,57 @@ fauna-scan --version
 
 Set `[web].enabled = true` to serve the interface and API with `run` at the
 configured address (the example uses `http://127.0.0.1:8787`). Open that address
-in a browser for Overview, Images, Scan activity, and About. The `web` command
+in a browser to sign in, then access Overview, Images, Scan activity, and About. The `web` command
 serves the same interface against the durable database without starting workers.
 The production HTML, CSS, and JavaScript are embedded in the Rust executable;
 rebuild the frontend **before** rebuilding Rust whenever frontend source changes.
 `just build` and `just release` do this automatically, as does the Docker build.
 A Rust-only build without frontend assets still provides the API and explains
 how to build the missing interface.
+
+Web authentication is mandatory for all pages, APIs (including health), images,
+clips, and live events. The login page and its static assets are public. Create
+the first user with `fauna-scan --config PATH users add "USER NAME" "PASSWORD"`
+before signing in. There are no default users, registration, or automatic
+credential provisioning. `users list` prints only user names; `users add`
+rejects duplicates; `users remove` deletes the user and all their sessions.
+All authenticated users can access all pages. User names are case sensitive;
+spaces are preserved. Passwords are never trimmed or silently truncated.
+
+Both SQLite and PostgreSQL have a `users(username, password_hash)` table.
+Passwords use Argon2id v19 with 19 MiB of memory, two iterations, one lane,
+and an independently generated random salt. The stored PHC string contains the
+algorithm, parameters, salt, and hash, following the
+[OWASP password-storage guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html).
+For manual database provisioning, insert a compatible Argon2id PHC string into
+`password_hash`; inserting plaintext will never authenticate. The CLI generates
+these hashes for you. To change a password with the CLI, remove the user and add
+them again. Updating `password_hash` directly also invalidates existing sessions.
+The positional password argument can appear in shell history and process listings.
+
+Sessions use a random 256-bit token in a host-only `HttpOnly`, `SameSite=Lax`
+cookie; only its SHA-256 digest is stored in `web_sessions`. Sessions survive
+server restarts. `[web].session_expiry_seconds = 0` (default) means no server-side
+expiry. A positive value sets a fixed lifetime for newly issued sessions, in
+seconds; renewing the cookie does not extend that lifetime. Signing out revokes
+the current session. An indefinitely valid session gets a persistent cookie
+renewed on each authenticated request, with a 400-day lifetime. Browsers impose
+their own retention limits ([Chrome caps cookies at 400 days](https://developer.chrome.com/blog/cookie-max-age-expires/)),
+so a cookie can still disappear after prolonged inactivity or clearing browser
+data. A literal forever cookie is not supported by browsers.
+
+For remote access, serve through HTTPS and set `[web].secure_cookie = true`
+to prevent the browser from sending the session token over HTTP. The default
+`false` supports local HTTP access; proxy headers do not override it. Login
+attempts are throttled, password verification concurrency and request size are
+bounded, and errors do not reveal whether a user exists. Authenticated responses
+are marked `private, no-store`. Unsafe API requests require the
+`X-Fauna-Scan-Request: 1` header for CSRF protection; no cross-origin allowance
+is provided. The web interface sends it automatically. API clients must log in
+using `POST /api/v1/auth/login` with JSON `{"username":"...","password":"..."}`
+and that header, then retain the returned cookie. `GET /api/v1/auth/session`
+reports the signed-in user; `POST /api/v1/auth/logout` revokes their session.
+The `sqlite-to-pg` utility preserves users and sessions when migrating backend.
 
 Images supports shareable UTC time/camera filters, gallery/table views, species,
 confidence, model/prompt, lifecycle, text and local-file filters, and signed keyset

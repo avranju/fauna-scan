@@ -468,7 +468,7 @@ with open(args[-1], 'wb') as output:
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         state.web.ffmpeg_path = executable;
         state.clips = ClipStore::new(&state.web);
-        let app = router(state.clone());
+        let app = super::super::tests::test_router(state.clone());
         let uri = "/api/v1/images/1/clip?pre_roll_seconds=10&post_roll_seconds=20";
         let response = app
             .clone()
@@ -627,7 +627,7 @@ sys.exit(result.returncode)
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         state.web.ffmpeg_path = executable;
         state.clips = ClipStore::new(&state.web);
-        let app = router(state.clone());
+        let app = super::super::tests::test_router(state.clone());
         for scenario in ["header_only", "audio_only", "video"] {
             std::fs::write(&mode, scenario).unwrap();
             let response = app

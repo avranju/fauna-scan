@@ -16,6 +16,7 @@ use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
+use super::auth_models::{SessionCredential, UserCredential};
 use super::models::*;
 use super::repository::{
     DataStore, DatabaseOps, GcOperation, GcOutcome, RateLimitGrant, RateLimitReservation,
@@ -1124,6 +1125,85 @@ async fn build_image_summaries_pg(
 
 #[async_trait]
 impl DataStore for PostgresDataStore {
+    async fn list_users(&self) -> AppResult<Vec<String>> {
+        let result = sqlx::query_scalar("SELECT username FROM users ORDER BY username")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error("list_users", error))?;
+        Ok(result)
+    }
+
+    async fn add_user(&self, username: &str, password_hash: &str) -> AppResult<bool> {
+        let result = sqlx::query("INSERT INTO users (username, password_hash) VALUES ($1, $2) ON CONFLICT (username) DO NOTHING")
+            .bind(username)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error("add_user", error))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn remove_user(&self, username: &str) -> AppResult<bool> {
+        let result = sqlx::query("DELETE FROM users WHERE username = $1")
+            .bind(username)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error("remove_user", error))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn find_user(&self, username: &str) -> AppResult<Option<UserCredential>> {
+        let result = sqlx::query_as::<_, UserCredential>(
+            "SELECT username, password_hash FROM users WHERE username = $1",
+        )
+        .bind(username)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| map_sqlx_error("find_user", error))?;
+        Ok(result)
+    }
+
+    async fn create_session(
+        &self,
+        token_hash: &str,
+        user: &UserCredential,
+        expires_at: Option<i64>,
+    ) -> AppResult<bool> {
+        let result = sqlx::query("INSERT INTO web_sessions (token_hash, username, credential_fingerprint, expires_at) SELECT $1, username, $2, $3 FROM users WHERE username = $4 AND password_hash = $5")
+            .bind(token_hash)
+            .bind(crate::authentication::fingerprint(&user.password_hash))
+            .bind(expires_at)
+            .bind(&user.username)
+            .bind(&user.password_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error("create_session", error))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn find_session(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> AppResult<Option<SessionCredential>> {
+        let result = sqlx::query_as::<_, SessionCredential>("SELECT u.username, u.password_hash, s.credential_fingerprint, s.expires_at FROM web_sessions s JOIN users u ON u.username = s.username WHERE s.token_hash = $1 AND (s.expires_at IS NULL OR s.expires_at > $2)")
+            .bind(token_hash)
+            .bind(now)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error("find_session", error))?;
+        Ok(result)
+    }
+
+    async fn remove_session(&self, token_hash: &str) -> AppResult<()> {
+        sqlx::query("DELETE FROM web_sessions WHERE token_hash = $1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error("remove_session", error))?;
+        Ok(())
+    }
+
     async fn list_active_cameras(&self) -> AppResult<Vec<CameraRecord>> {
         let rows = sqlx::query("SELECT id, channel_number, primary_track_id, picture_track_id, name, raw_discovery_identifier, enabled, first_seen_at, last_seen_at, created_at, updated_at FROM cameras WHERE enabled = 1 ORDER BY channel_number ASC, id ASC")
             .fetch_all(&self.pool).await.map_err(|e| map_sqlx_error("list_active_cameras", e))?;

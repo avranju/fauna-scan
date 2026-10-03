@@ -3,6 +3,7 @@
 //! Exposes all public modules for the binary entry point and integration tests.
 
 pub mod app;
+pub mod authentication;
 pub mod classifier;
 pub mod cli;
 pub mod configuration;

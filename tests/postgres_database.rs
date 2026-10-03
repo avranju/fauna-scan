@@ -108,6 +108,219 @@ async fn drop_schema(pool: &PgPool, schema: &str) {
         .await;
 }
 
+#[tokio::test]
+#[ignore = "requires FAUNA_SCAN_TEST_POSTGRES_URL"]
+async fn test_postgres_web_authentication_and_session_revocation() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use fauna_scan::authentication::{fingerprint, hash_password, new_session_token};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    let (pool, schema) = setup_test_schema("web_authentication", 4).await;
+    let base_url = std::env::var("FAUNA_SCAN_TEST_POSTGRES_URL").unwrap();
+    let store = PostgresDataStore::connect(&Secret::new(schema_url(&base_url, &schema)), 4)
+        .await
+        .unwrap();
+    let ops = store.ops();
+    let username = "Test User ' स";
+    let hash = hash_password("test password").unwrap();
+    assert!(ops.add_user(username, &hash).await.unwrap());
+    assert!(!ops.add_user(username, "replacement").await.unwrap());
+    assert_eq!(ops.list_users().await.unwrap(), vec![username]);
+    assert_eq!(
+        ops.find_user(username)
+            .await
+            .unwrap()
+            .unwrap()
+            .password_hash,
+        hash
+    );
+    let user = ops.find_user(username).await.unwrap().unwrap();
+    let expired = new_session_token();
+    let now = Utc::now().timestamp();
+    assert!(
+        ops.create_session(&fingerprint(&expired), &user, Some(now))
+            .await
+            .unwrap()
+    );
+    assert!(
+        ops.find_session(&fingerprint(&expired), now)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"[database]
+backend = "postgres"
+url = "postgres://localhost/test"
+[general]
+output_directory = {:?}
+[nvr]
+host = "nvr"
+port = 80
+username = "nvr-user"
+password = "nvr-password"
+start_at = "2026-01-01T00:00:00Z"
+"#,
+            root.path().join("images")
+        ),
+    )
+    .unwrap();
+    let config = fauna_scan::configuration::Config::load(Some(&path)).unwrap();
+    let transport = Arc::new(fauna_scan::nvr::NvrTransport::from_config(&config.nvr).unwrap());
+    let state = fauna_scan::web::WebState::from_config(ops.clone(), &config, transport);
+    let app = fauna_scan::web::router(state);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header("x-fauna-scan-request", "1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"username": username, "password": "test password"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let token = cookie.split_once('=').unwrap().1;
+    let stored = ops
+        .find_session(&fingerprint(token), now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.username, username);
+    assert_eq!(stored.expires_at, None);
+    assert_eq!(stored.credential_fingerprint, fingerprint(&hash));
+    let check = || {
+        Request::builder()
+            .uri("/api/v1/auth/session")
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(
+        app.clone().oneshot(check()).await.unwrap().status(),
+        StatusCode::OK
+    );
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE username = $2")
+        .bind(hash_password("changed").unwrap())
+        .bind(username)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(check()).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // Password changes during verification must prevent session insertion.
+    assert!(
+        !ops.create_session(&fingerprint(&new_session_token()), &user, None)
+            .await
+            .unwrap()
+    );
+    assert!(ops.remove_user(username).await.unwrap());
+    assert!(!ops.remove_user(username).await.unwrap());
+    assert!(
+        ops.find_session(&fingerprint(token), now)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(ops.list_users().await.unwrap().is_empty());
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FAUNA_SCAN_TEST_POSTGRES_URL"]
+async fn test_sqlite_to_pg_preserves_users_and_sessions() {
+    use fauna_scan::authentication::{fingerprint, hash_password, new_session_token};
+
+    let (pool, schema) = setup_test_schema("authentication_migration", 1).await;
+    let base_url = std::env::var("FAUNA_SCAN_TEST_POSTGRES_URL").unwrap();
+    let url = schema_url(&base_url, &schema);
+    let root = tempfile::tempdir().unwrap();
+    let database_path = root.path().join("source.sqlite3");
+    let sqlite = fauna_scan::database::sqlite::SqliteDataStore::connect(&database_path, 1)
+        .await
+        .unwrap();
+    let ops = sqlite.ops();
+    let hash = hash_password("migration password").unwrap();
+    let mut sessions = Vec::new();
+    for index in 0..3 {
+        let username = format!("Migration User {index}");
+        ops.add_user(&username, &hash).await.unwrap();
+        let user = ops.find_user(&username).await.unwrap().unwrap();
+        let token = new_session_token();
+        let expires_at = if index == 0 {
+            None
+        } else {
+            Some(Utc::now().timestamp() + 3600)
+        };
+        ops.create_session(&fingerprint(&token), &user, expires_at)
+            .await
+            .unwrap();
+        sessions.push((username, token, expires_at));
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sqlite-to-pg"))
+        .args([
+            "--sqlite-path",
+            database_path.to_str().unwrap(),
+            "--pg-url",
+            &url,
+            "--batch-size",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let postgres = PostgresDataStore::connect(&Secret::new(url), 1)
+        .await
+        .unwrap();
+    let ops = postgres.ops();
+    assert_eq!(ops.list_users().await.unwrap().len(), 3);
+    for (username, token, expires_at) in sessions {
+        assert_eq!(
+            ops.find_user(&username)
+                .await
+                .unwrap()
+                .unwrap()
+                .password_hash,
+            hash
+        );
+        let session = ops
+            .find_session(&fingerprint(&token), Utc::now().timestamp())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.username, username);
+        assert_eq!(session.expires_at, expires_at);
+        assert_eq!(session.credential_fingerprint, fingerprint(&hash));
+    }
+    drop_schema(&pool, &schema).await;
+}
+
 /// Poll `pg_locks` until at least `expected_waiters` backends are confirmed
 /// waiting on the specific advisory lock held by `lock_pool`.
 ///

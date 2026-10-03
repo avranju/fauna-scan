@@ -7,6 +7,7 @@
 //!
 //! Concrete implementations live in [`sqlite`] and [`postgres`].
 
+pub mod auth_models;
 pub mod models;
 pub mod repository;
 pub mod sqlite;

@@ -103,7 +103,13 @@ function About() {
   );
 }
 
-export function App() {
+export function App({
+  username,
+  onSignOut,
+}: {
+  username: string;
+  onSignOut: () => void;
+}) {
   const [params] = useSearchParams();
   const location = useLocation();
   const client = useQueryClient();
@@ -251,6 +257,13 @@ export function App() {
                 <Info size={19} />
               </NavLink>
             </div>
+            <button
+              className="text-button sign-out"
+              onClick={onSignOut}
+              title={`Signed in as ${username}`}
+            >
+              Sign out
+            </button>
           </div>
         </header>
         <main id="main" className="main">

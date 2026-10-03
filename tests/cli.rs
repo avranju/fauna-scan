@@ -109,6 +109,141 @@ start_at = "2026-01-01T00:00:00Z"
 }
 
 #[test]
+fn users_commands_manage_hashed_credentials_without_contacting_external_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let database_path = dir.path().join("users.sqlite3");
+    let config_path = dir.path().join("config.toml");
+    let config = minimal_valid_config().replace(
+        "[general]",
+        &format!(
+            "[database]\nbackend = \"sqlite\"\npath = {:?}\n\n[general]",
+            database_path
+        ),
+    );
+    std::fs::write(&config_path, config).unwrap();
+    let username = "Test User ' quoted";
+    let password = "a secret password";
+    cmd()
+        .args(["--config", config_path.to_str().unwrap(), "users", "list"])
+        .assert()
+        .success()
+        .stdout("");
+    cmd()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "users",
+            "add",
+            username,
+            password,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(username).and(predicate::str::contains(password).not()));
+    cmd()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "users",
+            "add",
+            username,
+            "replacement password",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("user already exists"));
+    cmd()
+        .args(["--config", config_path.to_str().unwrap(), "users", "list"])
+        .assert()
+        .success()
+        .stdout(format!("{username}\n"));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let store = fauna_scan::database::sqlite::SqliteDataStore::connect(&database_path, 1)
+            .await
+            .unwrap();
+        let credential = store.ops().find_user(username).await.unwrap().unwrap();
+        assert_ne!(credential.password_hash, password);
+        assert!(fauna_scan::authentication::verify_password(
+            password,
+            &credential.password_hash
+        ));
+        assert!(!fauna_scan::authentication::verify_password(
+            "replacement password",
+            &credential.password_hash
+        ));
+    });
+    cmd()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "users",
+            "remove",
+            username,
+        ])
+        .assert()
+        .success();
+    cmd()
+        .args(["--config", config_path.to_str().unwrap(), "users", "list"])
+        .assert()
+        .success()
+        .stdout("");
+    cmd()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "users",
+            "remove",
+            username,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("user does not exist"));
+}
+
+#[test]
+fn users_add_rejects_empty_credentials_and_redacts_debug_output() {
+    use clap::Parser;
+    let cli = fauna_scan::cli::Cli::try_parse_from([
+        "fauna-scan",
+        "users",
+        "add",
+        "Test User",
+        "sensitive password",
+    ])
+    .unwrap();
+    assert!(!format!("{cli:?}").contains("sensitive password"));
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let config = minimal_valid_config().replace(
+        "[general]",
+        &format!(
+            "[database]\nbackend = \"sqlite\"\npath = {:?}\n\n[general]",
+            dir.path().join("users.sqlite3")
+        ),
+    );
+    std::fs::write(&config_path, config).unwrap();
+    for (username, password) in [("", "password"), ("user", ""), ("\nuser", "password")] {
+        cmd()
+            .args([
+                "--config",
+                config_path.to_str().unwrap(),
+                "users",
+                "add",
+                username,
+                password,
+            ])
+            .assert()
+            .failure();
+    }
+    cmd()
+        .args(["--config", config_path.to_str().unwrap(), "users", "list"])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
 fn check_config_with_valid_file_exits_success() {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.toml");

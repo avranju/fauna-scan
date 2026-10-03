@@ -6,6 +6,7 @@
 //! agnostic to whether the backing store is SQLite or PostgreSQL.
 
 mod assets;
+mod auth;
 mod bounding_boxes;
 mod clips;
 
@@ -54,6 +55,7 @@ pub struct WebState {
     cursor_key: [u8; 32],
     event_limit: Arc<Semaphore>,
     thumbnails: Arc<tokio::sync::Mutex<std::collections::BTreeMap<String, bytes::Bytes>>>,
+    login_guard: auth::LoginGuard,
 }
 
 impl WebState {
@@ -74,6 +76,7 @@ impl WebState {
             started_at: Timestamp::new(Utc::now()),
             event_limit: Arc::new(Semaphore::new(32)),
             thumbnails: Default::default(),
+            login_guard: Default::default(),
             cursor_key: Sha256::digest(uuid::Uuid::new_v4().as_bytes()).into(),
         }
     }
@@ -121,6 +124,12 @@ pub fn router(state: WebState) -> Router {
             .max(120),
     );
     Router::new()
+        .route(
+            "/api/v1/auth/login",
+            post(auth::login).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
+        .route("/api/v1/auth/session", get(auth::session))
+        .route("/api/v1/auth/logout", post(auth::logout))
         // API endpoints
         .route("/api/v1/config", get(api_config))
         .route("/api/v1/health", get(api_health))
@@ -138,13 +147,19 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/activity", get(api_activity))
         .route("/api/v1/events", get(api_events))
         .fallback(assets::serve)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_login,
+        ))
         .with_state(state)
         .layer(CompressionLayer::new())
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| async move {
                 let preparing_clip = request.method() == axum::http::Method::POST
                     && request.uri().path().ends_with("/clip");
-                let sensitive = request.uri().path().contains("/clips/")
+                let sensitive = request.uri().path().starts_with("/api/v1/auth/")
+                    || request.uri().path() == "/login"
+                    || request.uri().path().contains("/clips/")
                     || preparing_clip
                     || request.uri().path().ends_with("/recording")
                     || request
@@ -1783,12 +1798,38 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    pub(super) const TEST_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// Exercise existing API/media tests through the real authentication layer.
+    pub(super) fn test_router(state: WebState) -> Router {
+        super::router(state).layer(axum::middleware::from_fn(
+            |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+                request.headers_mut().insert(
+                    "cookie",
+                    HeaderValue::from_static(
+                        "fauna_scan_session=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    ),
+                );
+                request
+                    .headers_mut()
+                    .insert("x-fauna-scan-request", HeaderValue::from_static("1"));
+                next.run(request).await
+            },
+        ))
+    }
+
     pub(super) async fn test_state() -> (tempfile::TempDir, WebState) {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("images");
         std::fs::create_dir(&output).unwrap();
         let db_path = root.path().join("web.sqlite3");
         let sqlite_store = crate::database::sqlite::SqliteDataStore::connect(&db_path, 1)
+            .await
+            .unwrap();
+        let ops = sqlite_store.ops();
+        ops.add_user("fixture", "fixture-credential").await.unwrap();
+        let user = ops.find_user("fixture").await.unwrap().unwrap();
+        ops.create_session(&crate::authentication::fingerprint(TEST_TOKEN), &user, None)
             .await
             .unwrap();
         let now = "2026-07-21T10:00:00.000000000Z";
@@ -1891,6 +1932,7 @@ mod tests {
             event_limit: Arc::new(Semaphore::new(32)),
             thumbnails: Default::default(),
             cursor_key: [7; 32],
+            login_guard: Default::default(),
         };
         (root, state)
     }
@@ -1937,7 +1979,7 @@ mod tests {
     #[tokio::test]
     async fn image_api_filters_and_returns_classification() {
         let (_root, state) = test_state().await;
-        let response = router(state)
+        let response = test_router(state)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/images?from=2026-07-21T09%3A00%3A00.000Z&to=2026-07-21T11%3A00%3A00.000Z&camera=1")
@@ -1956,7 +1998,7 @@ mod tests {
     #[tokio::test]
     async fn detail_api_omits_paths_and_raw_responses() {
         let (_root, state) = test_state().await;
-        let response = router(state)
+        let response = test_router(state)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/images/1")
@@ -1975,7 +2017,7 @@ mod tests {
     #[tokio::test]
     async fn image_content_is_served_as_jpeg() {
         let (_root, state) = test_state().await;
-        let response = router(state)
+        let response = test_router(state)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/images/1/content")
@@ -1993,7 +2035,7 @@ mod tests {
     #[tokio::test]
     async fn ui_routes_serve_embedded_application() {
         let (_root, state) = test_state().await;
-        let response = router(state)
+        let response = test_router(state)
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -2010,7 +2052,7 @@ mod tests {
     #[tokio::test]
     async fn image_api_rejects_reversed_time_range() {
         let (_root, state) = test_state().await;
-        let response = router(state)
+        let response = test_router(state)
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/images?from=2026-07-22T00%3A00%3A00Z&to=2026-07-21T00%3A00%3A00Z")
@@ -2022,7 +2064,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
     async fn get_json(state: &WebState, uri: &str) -> (StatusCode, Value) {
-        let response = router(state.clone())
+        let response = test_router(state.clone())
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -2157,7 +2199,7 @@ mod tests {
         let (root, state) = test_state().await;
         let image = image::RgbImage::new(1600, 1200);
         image.save(root.path().join("images/one.jpg")).unwrap();
-        let response = router(state.clone())
+        let response = test_router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/images/1/thumbnail")
@@ -2173,7 +2215,7 @@ mod tests {
         assert_eq!((thumbnail.width(), thumbnail.height()), (480, 360));
         assert_eq!(state.thumbnails.lock().await.len(), 1);
         for path in ["/api/v1/config", "/api/v1/does-not-exist", "/images/1"] {
-            let response = router(state.clone())
+            let response = test_router(state.clone())
                 .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
@@ -2243,7 +2285,7 @@ mod tests {
         assert_eq!(page["data"].as_array().unwrap().len(), 1);
         let (_, detail) = get_json(&state, "/api/v1/images/1").await;
         assert_eq!(detail["file"]["present"], false);
-        let response = router(state.clone())
+        let response = test_router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/images/1")
@@ -2253,7 +2295,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
-        let response = router(state.clone())
+        let response = test_router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/images/1/clip")
@@ -2292,7 +2334,7 @@ mod tests {
     async fn embedded_assets_and_stream_cover_the_production_contract() {
         let (_root, state) = test_state().await;
         if assets::available() {
-            let response = router(state.clone())
+            let response = test_router(state.clone())
                 .oneshot(
                     Request::builder()
                         .uri("/images/1")
@@ -2317,7 +2359,7 @@ mod tests {
                 .next()
                 .unwrap();
             assert!(script.starts_with("/assets/"));
-            let response = router(state.clone())
+            let response = test_router(state.clone())
                 .oneshot(Request::builder().uri(script).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
@@ -2327,7 +2369,7 @@ mod tests {
                 "text/javascript; charset=utf-8"
             );
         }
-        let response = router(state.clone())
+        let response = test_router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/events")

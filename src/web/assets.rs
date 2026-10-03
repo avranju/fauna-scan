@@ -7,7 +7,7 @@ use axum::{
 include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
 pub(super) async fn serve(uri: Uri) -> Response {
     let path = uri.path();
-    let shell = matches!(path, "/" | "/images" | "/activity" | "/about")
+    let shell = matches!(path, "/" | "/login" | "/images" | "/activity" | "/about")
         || path
             .strip_prefix("/images/")
             .is_some_and(|id| id.parse::<u64>().is_ok());
