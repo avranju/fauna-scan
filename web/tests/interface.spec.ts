@@ -316,6 +316,9 @@ test('detail shows provenance, older results, zoom, and on-demand NVR recording'
     page.getByRole('heading', { name: 'Current lifecycle' }),
   ).toBeVisible();
   await page.getByRole('tab', { name: 'NVR & files' }).click();
+  await expect(
+    page.getByRole('link', { name: 'Open Local Image', exact: true }),
+  ).toHaveAttribute('href', '/fixture.jpg?draw-bounding-box=true');
   await expect(page.locator('code').first()).toHaveText(
     'http://nvr.local/picture/1',
   );

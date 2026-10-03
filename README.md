@@ -308,6 +308,10 @@ docker compose logs -f fauna-scan
 With the example Compose configuration, the API is available only on the
 Docker host at `http://127.0.0.1:8787`.
 
+The read-only container needs writable temporary storage for video clips.
+The Compose example mounts a 1 GiB tmpfs at `/tmp`; include this mount in
+custom deployments too. Prepared clips disappear when the container restarts.
+
 Set `[database].path` (SQLite) or `[database].url_env` (PostgreSQL) and
 `general.output_directory` to the container paths already used by
 `config.docker.example.toml`. Compose persists those paths in the

@@ -8,6 +8,9 @@ services:
     init: true
     stop_grace_period: 30s
     read_only: true
+    # Bounded clip preparation needs writable temporary storage.
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=1g,mode=1777
     security_opt:
       - no-new-privileges:true
     cap_drop:

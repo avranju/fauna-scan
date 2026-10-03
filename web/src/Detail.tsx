@@ -693,11 +693,11 @@ export function Detail() {
               {detail.content_url ? (
                 <a
                   className="button"
-                  href={detail.content_url}
+                  href={`${detail.content_url}?draw-bounding-box=true`}
                   target="_blank"
                   rel="noopener noreferrer"
                 >
-                  Open local JPEG
+                  Open Local Image
                 </a>
               ) : (
                 <p className="muted">A local file is not available.</p>
