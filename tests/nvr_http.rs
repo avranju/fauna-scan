@@ -137,7 +137,7 @@ async fn reqwest_with_no_redirects_gets_headers() {
 
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .use_rustls_tls()
+        .tls_backend_rustls()
         .build()
         .unwrap();
 

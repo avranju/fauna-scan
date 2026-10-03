@@ -235,7 +235,10 @@ async fn verify_sqlite_schema(sqlite: &SqlitePool) -> Result<()> {
 async fn ensure_destination_is_empty(pg: &PgPool) -> Result<()> {
     for table in TABLES {
         let query = format!("SELECT COUNT(*) FROM {table}");
-        let count: i64 = sqlx::query_scalar(&query).fetch_one(pg).await?;
+        // Table identifiers come from the fixed TABLES list.
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .fetch_one(pg)
+            .await?;
         if count != 0 {
             bail!("destination table {table} is not empty ({count} rows)");
         }
@@ -559,7 +562,10 @@ async fn reset_sequences(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         let query = format!(
             "SELECT setval(pg_get_serial_sequence('{table}', 'id'), COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM {table}"
         );
-        sqlx::query(&query).execute(&mut **tx).await?;
+        // Table identifiers come from the fixed sequence-repair list.
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(&mut **tx)
+            .await?;
     }
     Ok(())
 }

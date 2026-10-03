@@ -600,12 +600,34 @@ async fn run_process_signal_test(signal_kind: Signal, signal_name: &str) {
     command.stderr(Stdio::piped()).stdout(Stdio::piped());
     let child = command.spawn().unwrap();
     wait_for_application_metadata(&db_path).await;
+    // Startup metadata precedes discovery and signal registration. Wait until
+    // Linux reports both handlers installed before testing graceful shutdown.
+    #[cfg(target_os = "linux")]
+    wait_for_shutdown_handlers(child.id()).await;
     let (status, stderr) = stop_process(child, signal_kind).await;
     assert!(status.success(), "service stderr: {stderr}");
     assert!(stderr.contains("Starting downloader and scanner pipelines"));
     assert!(stderr.contains("Shutdown signal received"));
     assert!(stderr.contains(signal_name));
     assert!(stderr.contains("Graceful shutdown completed"));
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_shutdown_handlers(pid: u32) {
+    let required = (1u64 << (Signal::SIGINT as u32 - 1)) | (1u64 << (Signal::SIGTERM as u32 - 1));
+    for _ in 0..200 {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let caught = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigCgt:"))
+            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+            .unwrap();
+        if caught & required == required {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("service did not install shutdown signal handlers");
 }
 
 #[tokio::test]

@@ -219,22 +219,12 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
             }
             Ok(Event::Start(e)) => {
                 let local_name = e.name().local_name();
-                let local: String = reader
-                    .decoder()
-                    .decode(local_name.as_ref())
-                    .map_err(|e| {
-                        AppError::new(
-                            ErrorCategory::XmlParsing,
-                            "parse_camera_discovery_xml",
-                            format!("character encoding error: {e}"),
-                        )
-                    })?
-                    .into_owned();
+                let local: String = local_name.as_ref().to_owned();
 
                 let depth = element_stack.len();
 
                 // Validate attributes for every Start element.
-                validate_attributes(&reader, &e)?;
+                validate_attributes(&e)?;
 
                 // At depth 0 (document root level), only StreamingChannelList is
                 // permitted.  Unknown elements before or after the root are rejected
@@ -276,7 +266,7 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
                         ));
                     }
                     // Capture raw discovery identifier from the channel element's `id` attribute.
-                    let raw_id = extract_channel_id_attr(&reader, &e)?;
+                    let raw_id = extract_channel_id_attr(&e)?;
                     current_channel = RawChannel {
                         track_id: None,
                         name: None,
@@ -332,22 +322,12 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
             }
             Ok(Event::Empty(e)) => {
                 let local_name = e.name().local_name();
-                let local: String = reader
-                    .decoder()
-                    .decode(local_name.as_ref())
-                    .map_err(|e| {
-                        AppError::new(
-                            ErrorCategory::XmlParsing,
-                            "parse_camera_discovery_xml",
-                            format!("character encoding error: {e}"),
-                        )
-                    })?
-                    .into_owned();
+                let local: String = local_name.as_ref().to_owned();
 
                 let depth = element_stack.len();
 
                 // Validate attributes for every Empty element.
-                validate_attributes(&reader, &e)?;
+                validate_attributes(&e)?;
 
                 // At depth 0 (document root level), only StreamingChannelList is
                 // permitted.  Unknown empty elements before or after the root are
@@ -390,7 +370,7 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
                                 "StreamingChannel must be a direct child of StreamingChannelList",
                             ));
                         }
-                        let raw_id = extract_channel_id_attr(&reader, &e)?;
+                        let raw_id = extract_channel_id_attr(&e)?;
                         channels.push(RawChannel {
                             track_id: None,
                             name: None,
@@ -453,9 +433,9 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
                     }
                 }
             }
-            Ok(Event::Text(e)) => {
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
                 // Propagate entity-decoding errors.
-                let text = e.unescape().map_err(|e| {
+                let text = super::xml::text(&event).map_err(|e| {
                     AppError::new(
                         ErrorCategory::XmlParsing,
                         "parse_camera_discovery_xml",
@@ -548,17 +528,8 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
             }
             Ok(Event::CData(e)) => {
                 // CDATA content is literal character data — do NOT unescape
-                // XML entities.  Decode bytes to string and enforce the same
-                // depth-0 restriction as regular text.
-                let cdata_bytes = e.as_ref();
-                let text = reader.decoder().decode(cdata_bytes).map_err(|e| {
-                    AppError::new(
-                        ErrorCategory::XmlParsing,
-                        "parse_camera_discovery_xml",
-                        format!("character encoding error in CDATA: {e}"),
-                    )
-                })?;
-                let text = text.into_owned();
+                // XML entities. Enforce the same depth-0 restriction as regular text.
+                let text = e.as_ref();
 
                 if element_stack.is_empty() && !text.trim().is_empty() {
                     return Err(AppError::new(
@@ -576,7 +547,7 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
                     &mut current_channel,
                     active_fields.last(),
                     current_depth,
-                    &text,
+                    text,
                 );
             }
             Err(e) => {
@@ -659,10 +630,7 @@ pub fn parse_camera_discovery_xml(xml: &[u8]) -> AppResult<Vec<CameraDiscovery>>
 /// * Character encoding errors in attribute keys/values.
 ///
 /// Returns an `XmlParsing` error on any violation.
-fn validate_attributes<'a>(
-    reader: &Reader<&'a [u8]>,
-    event: &'a quick_xml::events::BytesStart<'a>,
-) -> AppResult<()> {
+fn validate_attributes<'a>(event: &'a quick_xml::events::BytesStart<'a>) -> AppResult<()> {
     let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for attr_result in event.attributes() {
@@ -675,17 +643,7 @@ fn validate_attributes<'a>(
         })?;
 
         // Decode attribute key as owned String.
-        let key = reader
-            .decoder()
-            .decode(attr.key.as_ref())
-            .map_err(|e| {
-                AppError::new(
-                    ErrorCategory::XmlParsing,
-                    "parse_camera_discovery_xml",
-                    format!("character encoding error in attribute key: {e}"),
-                )
-            })?
-            .into_owned();
+        let key = attr.key.as_ref().to_owned();
 
         // Check for duplicate attribute names.
         if !seen_keys.insert(key.clone()) {
@@ -696,16 +654,9 @@ fn validate_attributes<'a>(
             ));
         }
 
-        // Decode attribute value — first decode bytes to string, then
-        // unescape XML entities to detect invalid entity references.
-        let decoded = reader.decoder().decode(&attr.value).map_err(|e| {
-            AppError::new(
-                ErrorCategory::XmlParsing,
-                "parse_camera_discovery_xml",
-                format!("character encoding error in attribute value: {e}"),
-            )
-        })?;
-        quick_xml::escape::unescape(&decoded).map_err(|e| {
+        // Attribute values are UTF-8; validate their entity references.
+        let decoded = &attr.value;
+        quick_xml::escape::unescape(decoded).map_err(|e| {
             AppError::new(
                 ErrorCategory::XmlParsing,
                 "parse_camera_discovery_xml",
@@ -722,7 +673,6 @@ fn validate_attributes<'a>(
 /// Returns the decoded attribute value or `None` if the attribute is absent.
 /// Propagates encoding and entity errors as `XmlParsing`.
 fn extract_channel_id_attr<'a>(
-    reader: &Reader<&'a [u8]>,
     event: &'a quick_xml::events::BytesStart<'a>,
 ) -> AppResult<Option<String>> {
     for attr_result in event.attributes() {
@@ -734,27 +684,11 @@ fn extract_channel_id_attr<'a>(
             )
         })?;
 
-        let key = reader
-            .decoder()
-            .decode(attr.key.as_ref())
-            .map_err(|e| {
-                AppError::new(
-                    ErrorCategory::XmlParsing,
-                    "parse_camera_discovery_xml",
-                    format!("character encoding error in attribute key: {e}"),
-                )
-            })?
-            .into_owned();
+        let key = attr.key.as_ref().to_owned();
 
         if key == "id" {
-            let decoded = reader.decoder().decode(&attr.value).map_err(|e| {
-                AppError::new(
-                    ErrorCategory::XmlParsing,
-                    "parse_camera_discovery_xml",
-                    format!("character encoding error in attribute value: {e}"),
-                )
-            })?;
-            let value = quick_xml::escape::unescape(&decoded)
+            let decoded = &attr.value;
+            let value = quick_xml::escape::unescape(decoded)
                 .map_err(|e| {
                     AppError::new(
                         ErrorCategory::XmlParsing,

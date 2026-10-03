@@ -15,6 +15,7 @@ pub mod camera_discovery;
 pub mod image_download;
 pub mod image_search;
 pub mod recording_search;
+mod xml;
 
 pub use authentication::{NvrRequest, NvrTransport};
 pub use camera_discovery::{CameraDiscoveryClient, parse_camera_discovery_xml};

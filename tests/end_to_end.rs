@@ -332,7 +332,7 @@ async fn build_runtime(config: &Config) -> AppResult<RuntimeHarness> {
     })
 }
 
-async fn scalar_i64(pool: &sqlx::SqlitePool, sql: &str) -> AppResult<i64> {
+async fn scalar_i64(pool: &sqlx::SqlitePool, sql: &'static str) -> AppResult<i64> {
     sqlx::query_scalar(sql).fetch_one(pool).await.map_err(|e| {
         fauna_scan::error::AppError::new(ErrorCategory::Database, "test_query", e.to_string())
     })

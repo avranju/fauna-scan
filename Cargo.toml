@@ -35,47 +35,47 @@ sqlite = []
 postgres = ["sqlx/postgres"]
 
 [dependencies]
-anyhow = "1"
-argon2 = { version = "0.5", features = ["std"] }
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-sqlx = { version = "0.8", default-features = false, features = ["chrono", "runtime-tokio", "sqlite", "migrate", "macros"] }
-async-trait = "0.1"
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-toml = "0.8"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-url = "2"
-nix = { version = "0.30", default-features = false, features = ["fs", "signal", "process"] }
-bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli"] }
-digest_auth = "0.3"
-md-5 = "0.10"
-sha2 = "0.10"
-uuid = { version = "1", features = ["v4"] }
-quick-xml = "0.37"
-rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
-base64 = "0.22"
-serde_json = "1"
+anyhow = "1.0.104"
+argon2 = "0.6.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["chrono", "runtime-tokio", "sqlite", "migrate", "macros"] }
+async-trait = "0.1.92"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["full"] }
+toml = "1.1.6"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+nix = { version = "0.31.3", default-features = false, features = ["fs", "signal", "process"] }
+bytes = "1.12.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "gzip", "brotli"] }
+digest_auth = "0.3.1"
+md-5 = "0.11.0"
+sha2 = "0.11.0"
+uuid = { version = "1.27.0", features = ["v4"] }
+quick-xml = "0.42.0"
+rustls = { version = "0.23.45", default-features = false, features = ["aws-lc-rs"] }
+base64 = "0.23.1"
+serde_json = "1.0.151"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
-axum = "0.8"
-futures-util = "0.3"
-tempfile = "3"
-tower-http = { version = "0.6", features = ["compression-gzip", "trace"] }
+axum = "0.8.9"
+futures-util = "0.3.34"
+tempfile = "3.27.0"
+tower-http = { version = "0.7.1", features = ["compression-gzip", "trace"] }
 
 [dev-dependencies]
-assert_cmd = "2"
-futures = "0.3"
-http = "1"
-predicates = "3"
-rcgen = "0.14"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros", "chrono"] }
-tokio = { version = "1", features = ["full", "test-util"] }
-tokio-rustls = "0.26"
-wiremock = "0.6"
-tower = { version = "0.5", features = ["util"] }
+assert_cmd = "2.2.2"
+futures = "0.3.34"
+http = "1.5.0"
+predicates = "3.1.4"
+rcgen = "0.14.10"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "postgres", "migrate", "macros", "chrono"] }
+tokio = { version = "1.53.2", features = ["full", "test-util"] }
+tokio-rustls = "0.26.6"
+wiremock = "0.6.5"
+tower = { version = "0.5.3", features = ["util"] }
 
 [lints.rust]
 unsafe_code = "forbid"

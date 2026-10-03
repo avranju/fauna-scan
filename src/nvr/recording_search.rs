@@ -179,11 +179,7 @@ fn parse_response(xml: &[u8], expected_search_id: Uuid) -> AppResult<ParsedPage>
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Eof) => break,
             Ok(Event::Start(event)) => {
-                let name = reader
-                    .decoder()
-                    .decode(event.name().local_name().as_ref())
-                    .map_err(|_| xml_error("invalid element name encoding"))?
-                    .into_owned();
+                let name = event.name().local_name().as_ref().to_owned();
                 if name == "searchMatchItem" {
                     inside_item = true;
                     track_id = None;
@@ -194,26 +190,17 @@ fn parse_response(xml: &[u8], expected_search_id: Uuid) -> AppResult<ParsedPage>
                 stack.push(name);
                 text.clear();
             }
-            Ok(Event::Text(event)) => {
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
                 text.push_str(
-                    &event
-                        .unescape()
-                        .map_err(|_| xml_error("invalid XML entity"))?,
+                    &super::xml::text(&event).map_err(|_| xml_error("invalid XML entity"))?,
                 );
             }
             Ok(Event::CData(event)) => {
-                let value = reader
-                    .decoder()
-                    .decode(event.as_ref())
-                    .map_err(|_| xml_error("invalid CDATA encoding"))?;
-                text.push_str(&value);
+                let value = event.as_ref();
+                text.push_str(value);
             }
             Ok(Event::End(event)) => {
-                let name = reader
-                    .decoder()
-                    .decode(event.name().local_name().as_ref())
-                    .map_err(|_| xml_error("invalid element name encoding"))?
-                    .into_owned();
+                let name = event.name().local_name().as_ref().to_owned();
                 let value = text.trim().to_string();
                 if inside_item {
                     match name.as_str() {

@@ -78,10 +78,14 @@ async fn setup_test_schema(test_name: &str, max_connections: u32) -> (PgPool, St
         .connect(&base_url)
         .await
         .expect("connect to test PostgreSQL for schema creation");
-    sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", schema))
-        .execute(&base_pool)
-        .await
-        .expect("create test schema");
+    // Schema identifiers are generated locally from test names and UUIDs.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA IF NOT EXISTS {}",
+        schema
+    )))
+    .execute(&base_pool)
+    .await
+    .expect("create test schema");
     drop(base_pool);
 
     // Now open a schema-scoped pool.
@@ -103,9 +107,12 @@ async fn setup_test_schema(test_name: &str, max_connections: u32) -> (PgPool, St
 
 /// Drop the test schema.
 async fn drop_schema(pool: &PgPool, schema: &str) {
-    let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(pool)
-        .await;
+    // The schema identifier comes from schema_name(), never external input.
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(pool)
+    .await;
 }
 
 #[tokio::test]

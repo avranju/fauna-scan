@@ -1766,6 +1766,18 @@ fn sanitize_toml_reason(message: &str) -> String {
         if let Some(whitelisted) = match_whitelisted_type(expected_tail) {
             return format!("expected {whitelisted}");
         }
+        // Newer TOML parsers append syntax expectations after a comma too.
+        // Classify them with the same fixed vocabulary; never echo the tail.
+        let syntax_expected = format!("expected {expected_tail}");
+        if let Some((_, safe)) = EXPECTED_TOKEN_WHITELIST
+            .iter()
+            .find(|(fragment, _)| syntax_expected.starts_with(fragment))
+        {
+            return safe.to_string();
+        }
+        if message.starts_with("invalid basic string") {
+            return "unterminated string".to_string();
+        }
         // Then check syntax-level expected tokens.
         // The full message before the comma may contain the "expected" keyword.
         let before_comma = &message[..comma_expected];

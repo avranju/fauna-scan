@@ -1,7 +1,7 @@
 //! Password hashing and opaque session tokens shared by the CLI and web server.
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
-use argon2::password_hash::{PasswordHash, SaltString};
+use argon2::password_hash::generate_salt;
+use argon2::password_hash::phc::PasswordHash;
 use argon2::{Argon2, PasswordHasher, PasswordVerifier};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -36,9 +36,8 @@ pub fn validate_credentials(username: &str, password: &str) -> AppResult<()> {
 /// Argon2id v19, 19 MiB, two iterations, one lane, with a fresh random salt.
 /// The PHC string includes the algorithm, parameters, salt, and hash.
 pub fn hash_password(password: &str) -> AppResult<String> {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|_| {
             AppError::new(
@@ -63,7 +62,9 @@ pub fn verify_password(password: &str, encoded: &str) -> bool {
 /// A 256-bit bearer token. Only its SHA-256 digest is persisted in the database.
 pub fn new_session_token() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    // Each salt supplies 16 independent bytes from the operating system's RNG.
+    bytes[..16].copy_from_slice(&generate_salt());
+    bytes[16..].copy_from_slice(&generate_salt());
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -74,6 +75,23 @@ pub fn fingerprint(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifies_existing_argon2_05_password_hashes() {
+        // A fixed Argon2 0.5 test vector verifies compatibility with stored PHC strings.
+        let hash = "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc";
+        assert!(verify_password("password", hash));
+        assert!(!verify_password("incorrect", hash));
+    }
+
+    #[test]
+    fn session_tokens_contain_256_random_bits() {
+        let first = new_session_token();
+        let second = new_session_token();
+        assert_ne!(first, second);
+        assert_eq!(URL_SAFE_NO_PAD.decode(first).unwrap().len(), 32);
+        assert_eq!(URL_SAFE_NO_PAD.decode(second).unwrap().len(), 32);
+    }
 
     #[test]
     fn passwords_are_salted_and_verified_without_plaintext_storage() {

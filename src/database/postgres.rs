@@ -409,7 +409,8 @@ impl PostgresDataStore {
         let query_str = super::web_query::numbered(&query_str);
         let limit_i64 = (*limit as i64) + 1;
         let rows: Vec<_> = {
-            let mut q = sqlx::query(&query_str);
+            // SQL uses fixed fragments and generated placeholders; values are bound below.
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(query_str));
             for param in &params {
                 if let Some(s) = param.downcast_ref::<String>() {
                     q = q.bind(s);
@@ -481,7 +482,8 @@ impl PostgresDataStore {
  {where_clause}"#
         );
         let overview_sql = super::web_query::numbered(&overview_sql);
-        let mut overview_query = sqlx::query(&overview_sql);
+        // SQL uses fixed fragments and generated placeholders; values are bound below.
+        let mut overview_query = sqlx::query(sqlx::AssertSqlSafe(overview_sql));
         for p in &params {
             if let Some(s) = p.downcast_ref::<String>() {
                 overview_query = overview_query.bind(s);
@@ -538,7 +540,8 @@ impl PostgresDataStore {
             WHERE {where_clause} GROUP BY bucket ORDER BY bucket"#
         );
         let sql = super::web_query::numbered(&sql);
-        let mut query = sqlx::query(&sql);
+        // SQL uses fixed fragments and generated placeholders; values are bound below.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in &params {
             if let Some(s) = p.downcast_ref::<String>() {
                 query = query.bind(s);
@@ -587,7 +590,8 @@ impl PostgresDataStore {
             WHERE {} GROUP BY images.camera_id", conditions.join(" AND ")
         );
         let sql = super::web_query::numbered(&sql);
-        let mut query = sqlx::query(&sql);
+        // SQL uses fixed fragments and generated placeholders; values are bound below.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
         for p in &params {
             if let Some(s) = p.downcast_ref::<String>() {
                 query = query.bind(s);
@@ -875,7 +879,9 @@ impl PostgresDataStore {
                FROM images {} GROUP BY download_status"#,
             where_clause
         );
-        let mut dl_query = sqlx::query_as::<_, (String, i64, Option<String>)>(&dl_sql);
+        // SQL uses fixed fragments and generated placeholders; values are bound below.
+        let mut dl_query =
+            sqlx::query_as::<_, (String, i64, Option<String>)>(sqlx::AssertSqlSafe(dl_sql));
         for p in &params {
             if let Some(s) = p.downcast_ref::<String>() {
                 dl_query = dl_query.bind(s);
@@ -896,7 +902,9 @@ impl PostgresDataStore {
                FROM images {} GROUP BY processing_status"#,
             where_clause
         );
-        let mut ps_query = sqlx::query_as::<_, (String, i64, Option<String>)>(&ps_sql);
+        // SQL uses fixed fragments and generated placeholders; values are bound below.
+        let mut ps_query =
+            sqlx::query_as::<_, (String, i64, Option<String>)>(sqlx::AssertSqlSafe(ps_sql));
         for p in &params {
             if let Some(s) = p.downcast_ref::<String>() {
                 ps_query = ps_query.bind(s);
@@ -940,7 +948,8 @@ impl PostgresDataStore {
                  ORDER BY images.updated_at DESC LIMIT 100"#,
             where_clause
         );
-        let mut active_query = sqlx::query(&active_sql);
+        // SQL uses fixed fragments and generated placeholders; values are bound below.
+        let mut active_query = sqlx::query(sqlx::AssertSqlSafe(active_sql));
         for p in &params {
             if let Some(s) = p.downcast_ref::<String>() {
                 active_query = active_query.bind(s);
@@ -1263,7 +1272,8 @@ impl DataStore for PostgresDataStore {
                 "UPDATE cameras SET enabled = 0, updated_at = $1 WHERE enabled = 1 AND picture_track_id NOT IN ({})",
                 placeholders.join(",")
             );
-            let mut q = sqlx::query(&query).bind(&now);
+            // SQL uses fixed fragments and generated placeholders; values are bound below.
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(query)).bind(&now);
             for pid in &picture_ids {
                 q = q.bind(pid);
             }

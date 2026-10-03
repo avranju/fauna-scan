@@ -430,17 +430,7 @@ pub fn parse_image_search_xml(xml: &[u8], expected_search_id: Uuid) -> AppResult
             }
             Ok(Event::Start(e)) => {
                 let local_name = e.name().local_name();
-                let local: String = reader
-                    .decoder()
-                    .decode(local_name.as_ref())
-                    .map_err(|e| {
-                        AppError::new(
-                            ErrorCategory::XmlParsing,
-                            "parse_image_search_xml",
-                            format!("character encoding error: {e}"),
-                        )
-                    })?
-                    .into_owned();
+                let local: String = local_name.as_ref().to_owned();
 
                 let depth = element_stack.len();
                 if depth == 0 {
@@ -488,17 +478,7 @@ pub fn parse_image_search_xml(xml: &[u8], expected_search_id: Uuid) -> AppResult
             }
             Ok(Event::Empty(e)) => {
                 let local_name = e.name().local_name();
-                let local: String = reader
-                    .decoder()
-                    .decode(local_name.as_ref())
-                    .map_err(|e| {
-                        AppError::new(
-                            ErrorCategory::XmlParsing,
-                            "parse_image_search_xml",
-                            format!("character encoding error: {e}"),
-                        )
-                    })?
-                    .into_owned();
+                let local: String = local_name.as_ref().to_owned();
 
                 let depth = element_stack.len();
                 if depth == 0 {
@@ -630,17 +610,7 @@ pub fn parse_image_search_xml(xml: &[u8], expected_search_id: Uuid) -> AppResult
                 }
             }
             Ok(Event::End(e)) => {
-                let end_local = reader
-                    .decoder()
-                    .decode(e.name().local_name().as_ref())
-                    .map_err(|err| {
-                        AppError::new(
-                            ErrorCategory::XmlParsing,
-                            "parse_image_search_xml",
-                            format!("character encoding error: {err}"),
-                        )
-                    })?
-                    .into_owned();
+                let end_local = e.name().local_name().as_ref().to_owned();
                 let expected_local = element_stack.last().ok_or_else(|| {
                     AppError::new(
                         ErrorCategory::XmlParsing,
@@ -733,8 +703,8 @@ pub fn parse_image_search_xml(xml: &[u8], expected_search_id: Uuid) -> AppResult
                     }
                 }
             }
-            Ok(Event::Text(e)) => {
-                let text = e.unescape().map_err(|e| {
+            Ok(event @ (Event::Text(_) | Event::GeneralRef(_))) => {
+                let text = super::xml::text(&event).map_err(|e| {
                     AppError::new(
                         ErrorCategory::XmlParsing,
                         "parse_image_search_xml",
@@ -751,13 +721,7 @@ pub fn parse_image_search_xml(xml: &[u8], expected_search_id: Uuid) -> AppResult
                 current_capture.push_str(&text);
             }
             Ok(Event::CData(e)) => {
-                let cdata = reader.decoder().decode(e.as_ref()).map_err(|e| {
-                    AppError::new(
-                        ErrorCategory::XmlParsing,
-                        "parse_image_search_xml",
-                        format!("encoding error in CDATA: {e}"),
-                    )
-                })?;
+                let cdata = e.as_ref();
                 if element_stack.is_empty() && !cdata.trim().is_empty() {
                     return Err(AppError::new(
                         ErrorCategory::XmlParsing,
@@ -765,7 +729,7 @@ pub fn parse_image_search_xml(xml: &[u8], expected_search_id: Uuid) -> AppResult
                         "unexpected non-whitespace CDATA outside response root",
                     ));
                 }
-                current_capture.push_str(&cdata);
+                current_capture.push_str(cdata);
             }
             Ok(Event::Comment(_)) => {}
             Ok(Event::Decl(_)) => {
@@ -961,7 +925,11 @@ fn malformed_item_fingerprint(
         field(&mut hasher, Some(descriptor.as_bytes()));
     }
 
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 /// Validate a single searchMatchItem's required fields.
@@ -1246,7 +1214,12 @@ pub fn compute_image_key(
     hasher.update(b"\n");
     hasher.update(canonical_playback_uri.as_bytes());
     let digest = hasher.finalize();
-    ImageKey::new(format!("{:x}", digest))
+    ImageKey::new(
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
 }
 
 // ── Pagination helpers ────────────────────────────────────────────────────
@@ -1371,7 +1344,10 @@ fn build_page_signature(items: &[ParsedMatchItem], status_string: &str) -> Strin
         }
     }
     let digest = hasher.finalize();
-    format!("{:x}", digest)
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 // ── DiscoveredImage conversion ────────────────────────────────────────────

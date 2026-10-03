@@ -81,8 +81,8 @@ impl SharedHttpClient {
             .connect_timeout(config.connect_timeout)
             .timeout(config.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
-            .danger_accept_invalid_certs(config.allow_invalid_tls_certificates)
-            .use_rustls_tls();
+            .tls_danger_accept_invalid_certs(config.allow_invalid_tls_certificates)
+            .tls_backend_rustls();
 
         let client = builder.build().map_err(|e| {
             AppError::with_source(
