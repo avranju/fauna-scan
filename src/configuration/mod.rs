@@ -233,6 +233,14 @@ pub struct WebConfig {
     pub clip_post_roll_seconds: u64,
     /// Maximum total recording-search interval accepted from an API client.
     pub maximum_clip_duration_seconds: u64,
+    /// RTSP port used for recording playback (independent of the ISAPI HTTP port).
+    pub rtsp_port: u16,
+    /// Enable browser clips when FFmpeg is installed.
+    pub clips_enabled: bool,
+    /// FFmpeg executable, resolved against PATH when not absolute.
+    pub ffmpeg_path: PathBuf,
+    /// Maximum simultaneous video encodes.
+    pub max_concurrent_clip_encodes: usize,
     /// RGB color used for image bounding boxes.
     pub bounding_box_color: [u8; 3],
     /// Bounding box stroke width in image pixels.
@@ -249,6 +257,10 @@ impl Default for WebConfig {
             clip_pre_roll_seconds: 10,
             clip_post_roll_seconds: 20,
             maximum_clip_duration_seconds: 120,
+            rtsp_port: 554,
+            clips_enabled: true,
+            ffmpeg_path: PathBuf::from("ffmpeg"),
+            max_concurrent_clip_encodes: 1,
             bounding_box_color: [255, 255, 0],
             bounding_box_width_pixels: 3,
             max_concurrent_bounding_box_renders: 2,
@@ -467,6 +479,10 @@ struct RawWebConfig {
     clip_pre_roll_seconds: Option<u64>,
     clip_post_roll_seconds: Option<u64>,
     maximum_clip_duration_seconds: Option<u64>,
+    rtsp_port: Option<u16>,
+    clips_enabled: Option<bool>,
+    ffmpeg_path: Option<PathBuf>,
+    max_concurrent_clip_encodes: Option<usize>,
     bounding_box_color: Option<String>,
     bounding_box_width_pixels: Option<u32>,
     max_concurrent_bounding_box_renders: Option<usize>,
@@ -789,6 +805,13 @@ impl Config {
             clip_pre_roll_seconds: raw.web.clip_pre_roll_seconds.unwrap_or(10),
             clip_post_roll_seconds: raw.web.clip_post_roll_seconds.unwrap_or(20),
             maximum_clip_duration_seconds: raw.web.maximum_clip_duration_seconds.unwrap_or(120),
+            rtsp_port: raw.web.rtsp_port.unwrap_or(554),
+            clips_enabled: raw.web.clips_enabled.unwrap_or(true),
+            ffmpeg_path: raw
+                .web
+                .ffmpeg_path
+                .unwrap_or_else(|| PathBuf::from("ffmpeg")),
+            max_concurrent_clip_encodes: raw.web.max_concurrent_clip_encodes.unwrap_or(1),
             bounding_box_color: raw
                 .web
                 .bounding_box_color
@@ -1169,6 +1192,16 @@ fn validate_config(config: &Config) -> AppResult<()> {
             ErrorCategory::Configuration,
             "validate_config",
             "web.listen_address port must be greater than zero",
+        ));
+    }
+    if config.web.rtsp_port == 0
+        || config.web.ffmpeg_path.as_os_str().is_empty()
+        || !(1..=4).contains(&config.web.max_concurrent_clip_encodes)
+    {
+        return Err(AppError::new(
+            ErrorCategory::Configuration,
+            "validate_config",
+            "web.rtsp_port must be nonzero, ffmpeg_path must be nonempty, and max_concurrent_clip_encodes must be between 1 and 4",
         ));
     }
     if config.web.maximum_clip_duration_seconds == 0 {

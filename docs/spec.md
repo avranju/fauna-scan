@@ -1711,7 +1711,7 @@ The implementation shall be considered complete when all the following are demon
 
 The following are explicitly outside the initial implementation:
 
-* Downloading or analysing full video clips.
+* Analysing full video clips. Bounded recording playback/download for image review is supported by the web interface.
 * Real-time RTSP stream analysis.
 * A graphical user interface.
 * A web dashboard.

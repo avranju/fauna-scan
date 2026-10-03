@@ -603,7 +603,7 @@ td a:hover {
   font-size: 10px;
 }
 .histogram {
-  height: 135px;
+  overflow-x: auto;
   display: flex;
   gap: 3px;
   border-bottom: 1px solid var(--border);
@@ -611,14 +611,46 @@ td a:hover {
 }
 .histogram a {
   flex: 1;
-  min-width: 2px;
+  min-width: 46px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
 }
 .histogram a:hover {
   background: #eef4e9;
 }
 .histogram svg {
   width: 100%;
-  height: 100%;
+  height: 135px;
+  flex-shrink: 0;
+}
+.histogram-label {
+  display: flex;
+  flex-direction: column;
+  text-align: center;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--muted);
+  padding: 7px 0;
+}
+.viewer-stage {
+  position: relative;
+  overflow: hidden;
+  isolation: isolate;
+  flex: 1;
+}
+.recording video {
+  width: 100%;
+  max-height: 65vh;
+  margin: 15px 0;
+  background: #000;
+}
+.uncertainties {
+  list-style: disc;
+  padding-left: 22px;
+}
+.uncertainties li + li {
+  margin-top: 8px;
 }
 summary {
   cursor: pointer;
@@ -790,6 +822,9 @@ input[type='checkbox'] {
   min-height: 440px;
 }
 .viewer-controls {
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
   display: flex;
   flex-wrap: wrap;
   justify-content: center;

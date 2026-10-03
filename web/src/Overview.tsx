@@ -363,12 +363,26 @@ export function Overview({
                       fill="#214f3e"
                     />
                   </svg>
+                  <time
+                    className="histogram-label"
+                    dateTime={b.start_at}
+                    title={DateTime.fromISO(b.start_at)
+                      .setZone(zone)
+                      .toFormat('dd LLL yyyy HH:mm ZZZZ')}
+                  >
+                    <span>
+                      {DateTime.fromISO(b.start_at)
+                        .setZone(zone)
+                        .toFormat('dd LLL')}
+                    </span>
+                    <span>
+                      {DateTime.fromISO(b.start_at)
+                        .setZone(zone)
+                        .toFormat('HH:mm')}
+                    </span>
+                  </time>
                 </Link>
               ))}
-            </div>
-            <div className="row muted text-xs">
-              <Time value={buckets[0].start_at} />
-              <Time value={buckets[buckets.length - 1].end_at} />
             </div>
             <details>
               <summary>View chart data table</summary>

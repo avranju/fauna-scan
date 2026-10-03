@@ -163,8 +163,19 @@ export interface Recording {
   capabilities?: { browser_playback: boolean; download: boolean };
 }
 
-export async function api<T>(path: string, signal?: AbortSignal): Promise<T> {
+export interface Clip {
+  playback_url: string;
+  download_url: string;
+  expires_in_seconds: number;
+}
+
+export async function api<T>(
+  path: string,
+  signal?: AbortSignal,
+  method = 'GET',
+): Promise<T> {
   const response = await fetch(`/api/v1/${path}`, {
+    method,
     signal,
     headers: { Accept: 'application/json' },
   });

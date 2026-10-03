@@ -40,6 +40,11 @@ listen_address = "0.0.0.0:8787"
 clip_pre_roll_seconds = 10
 clip_post_roll_seconds = 20
 maximum_clip_duration_seconds = 120
+# Recording playback uses RTSP, independently of [nvr].port (ISAPI HTTP).
+rtsp_port = 554
+clips_enabled = true
+ffmpeg_path = "ffmpeg"
+max_concurrent_clip_encodes = 1
 # Color is #RRGGBB; width is in pixels of the original image.
 bounding_box_color = "#FFFF00"
 bounding_box_width_pixels = 3

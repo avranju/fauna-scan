@@ -15,7 +15,7 @@ import {
   Star,
 } from 'lucide-react';
 import {
-  api,
+  useApi,
   nameOf,
   percent,
   speciesOf,
@@ -143,6 +143,43 @@ export function Photo({
   );
 }
 
+// HTTP deployments do not expose navigator.clipboard. Keep a synchronous
+// selection-based fallback so a user click can still authorize the copy.
+export async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Permission policies can also block the API on HTTPS.
+    }
+  }
+  const focused = document.activeElement as HTMLElement | null;
+  const selection = window.getSelection();
+  const ranges = selection
+    ? Array.from({ length: selection.rangeCount }, (_, i) =>
+        selection.getRangeAt(i).cloneRange(),
+      )
+    : [];
+  const field = document.createElement('textarea');
+  field.value = text;
+  field.setAttribute('readonly', '');
+  field.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+  document.body.append(field);
+  try {
+    field.focus();
+    field.select();
+    if (!document.execCommand('copy')) {
+      throw new Error('Copy unavailable. Select and copy the displayed value.');
+    }
+  } finally {
+    field.remove();
+    focused?.focus({ preventScroll: true });
+    selection?.removeAllRanges();
+    ranges.forEach((range) => selection?.addRange(range));
+  }
+}
+
 export function CopyButton({
   text,
   label = 'Copy',
@@ -155,7 +192,7 @@ export function CopyButton({
     <button
       onClick={async () => {
         try {
-          await navigator.clipboard.writeText(text);
+          await copyText(text);
           toast('Copied to clipboard');
         } catch {
           toast('Copy unavailable. Select and copy the displayed value.');
@@ -223,6 +260,8 @@ export function ImageCard({
   search: string;
 }) {
   const toast = useContext(Toast);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const detail = useApi<ImageDetail>(`images/${image.id}`, '', menuOpen);
   const href = `/images/${image.id}?${search}`;
   const c = image.classification;
   return (
@@ -268,7 +307,10 @@ export function ImageCard({
           </div>
         </div>
       </Link>
-      <details className="card-menu">
+      <details
+        className="card-menu"
+        onToggle={(event) => setMenuOpen(event.currentTarget.open)}
+      >
         <summary aria-label={`Actions for image ${image.id}`}>
           <MoreHorizontal size={17} />
         </summary>
@@ -278,12 +320,18 @@ export function ImageCard({
             label="Copy detail link"
           />
           <button
+            disabled={!detail.data?.nvr.image_url}
+            title={
+              detail.isFetching
+                ? 'Loading NVR image URL…'
+                : detail.data?.nvr.image_url
+                  ? undefined
+                  : 'No validated NVR image URL is available.'
+            }
             onClick={async () => {
               try {
-                const detail = await api<ImageDetail>(`images/${image.id}`);
-                if (!detail.nvr.image_url)
-                  throw new Error('No validated NVR image URL is available.');
-                await navigator.clipboard.writeText(detail.nvr.image_url);
+                if (!detail.data?.nvr.image_url) return;
+                await copyText(detail.data.nvr.image_url);
                 toast('NVR image URL copied');
               } catch (e) {
                 toast(e instanceof Error ? e.message : 'Copy unavailable');

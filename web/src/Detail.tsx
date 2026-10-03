@@ -18,6 +18,7 @@ import {
   percent,
   useApi,
   type Config,
+  type Clip,
   type ImageDetail,
   type ImagePage,
   type Lifecycle,
@@ -55,14 +56,48 @@ function LifecyclePanel({ label, state }: { label: string; state: Lifecycle }) {
   );
 }
 
+function Uncertainties({ value }: { value: unknown }) {
+  const items = Array.isArray(value)
+    ? value.filter(
+        (item): item is string =>
+          typeof item === 'string' && item.trim().length > 0,
+      )
+    : typeof value === 'string' && value.trim()
+      ? [value]
+      : [];
+  if (items.length <= 1)
+    return <p>{items[0] || 'No uncertainties recorded.'}</p>;
+  return (
+    <ul className="uncertainties">
+      {items.map((item, i) => (
+        <li key={i}>{item}</li>
+      ))}
+    </ul>
+  );
+}
+
 function RecordingPanel({ id, config }: { id: string; config: Config }) {
   const [pre, setPre] = useState(config.default_clip_pre_roll_seconds);
   const [post, setPost] = useState(config.default_clip_post_roll_seconds);
+  const [playerFailed, setPlayerFailed] = useState(false);
+  const clip = useMutation({
+    mutationFn: () =>
+      api<Clip>(
+        `images/${id}/clip?pre_roll_seconds=${pre}&post_roll_seconds=${post}`,
+        undefined,
+        'POST',
+      ),
+    onSuccess: () => setPlayerFailed(false),
+  });
   const recording = useMutation({
     mutationFn: () =>
       api<Recording>(
         `images/${id}/recording?pre_roll_seconds=${pre}&post_roll_seconds=${post}`,
       ),
+    onSuccess: (data) => {
+      if (data.status === 'found' && data.capabilities?.browser_playback)
+        clip.mutate();
+    },
   });
   const invalid =
     pre < 0 ||
@@ -81,7 +116,11 @@ function RecordingPanel({ id, config }: { id: string; config: Config }) {
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          if (!invalid) recording.mutate();
+          if (!invalid) {
+            clip.reset();
+            setPlayerFailed(false);
+            recording.mutate();
+          }
         }}
       >
         <div className="actions">
@@ -89,12 +128,15 @@ function RecordingPanel({ id, config }: { id: string; config: Config }) {
             Seconds before
             <input
               type="number"
+              disabled={recording.isPending || clip.isPending}
               min="0"
               max={config.maximum_clip_duration_seconds}
               value={pre}
               onChange={(e) => {
                 setPre(Number(e.target.value));
                 recording.reset();
+                clip.reset();
+                setPlayerFailed(false);
               }}
             />
           </label>
@@ -102,12 +144,15 @@ function RecordingPanel({ id, config }: { id: string; config: Config }) {
             Seconds after
             <input
               type="number"
+              disabled={recording.isPending || clip.isPending}
               min="0"
               max={config.maximum_clip_duration_seconds}
               value={post}
               onChange={(e) => {
                 setPost(Number(e.target.value));
                 recording.reset();
+                clip.reset();
+                setPlayerFailed(false);
               }}
             />
           </label>
@@ -116,6 +161,7 @@ function RecordingPanel({ id, config }: { id: string; config: Config }) {
             disabled={
               invalid ||
               recording.isPending ||
+              clip.isPending ||
               !config.capabilities.nvr_recording_lookup
             }
           >
@@ -160,21 +206,57 @@ function RecordingPanel({ id, config }: { id: string; config: Config }) {
           </dl>
         </>
       )}
+      {clip.isPending && <p role="status">Preparing video clip…</p>}
+      {clip.isError && (
+        <ErrorBox error={clip.error} retry={() => clip.mutate()} />
+      )}
+      {clip.data && (
+        <>
+          <video
+            key={clip.data.playback_url}
+            controls
+            playsInline
+            preload="metadata"
+            aria-label="NVR recording clip"
+            src={clip.data.playback_url}
+            onError={() => setPlayerFailed(true)}
+          />
+          {playerFailed && (
+            <p role="alert">
+              Video unavailable or expired. Prepare the clip again.
+            </p>
+          )}
+          <p className="muted text-xs">
+            Clips are available for 15 minutes. Prepare the clip again if it
+            expires.
+          </p>
+        </>
+      )}
       <div className="actions">
         <button
-          disabled
-          title="No browser-compatible media adapter is configured"
+          disabled={
+            recording.data?.status !== 'found' ||
+            !config.capabilities.browser_clip_playback ||
+            clip.isPending
+          }
+          onClick={() => clip.mutate()}
         >
-          View clip
+          {clip.data ? 'Prepare clip again' : 'View clip'}
         </button>
-        <button disabled title="No bounded download adapter is configured">
-          Download clip
-        </button>
+        {clip.data ? (
+          <a className="button" href={clip.data.download_url} download>
+            Download video
+          </a>
+        ) : (
+          <button disabled>Download video</button>
+        )}
       </div>
-      <p className="muted text-xs">
-        Browser clip playback and download are unavailable in this deployment. A
-        resolved NVR URL can be copied or opened in an external player.
-      </p>
+      {!config.capabilities.browser_clip_playback && (
+        <p className="muted text-xs">
+          Browser playback and download require FFmpeg on the server. The NVR
+          URL can be opened in an external player.
+        </p>
+      )}
     </section>
   );
 }
@@ -188,14 +270,14 @@ export function Detail() {
   const [selected, setSelected] = useState<number | null>(null);
   const [failed, setFailed] = useState(false);
   const [dimensions, setDimensions] = useState('');
-  const [boxes, setBoxes] = useState(false);
+  const [boxes, setBoxes] = useState(true);
   const viewport = useRef<HTMLDivElement>(null);
   const natural = useRef({ width: 0, height: 0 });
   useEffect(() => {
     setSelected(null);
     setFailed(false);
     setDimensions('');
-    setBoxes(false);
+    setBoxes(true);
   }, [imageId]);
   const detail = image.data;
   const classification =
@@ -290,6 +372,7 @@ export function Detail() {
                     </button>
                   </div>
                   <div
+                    className="viewer-stage"
                     tabIndex={0}
                     role="group"
                     aria-label="Image viewer. Use arrow keys to pan."
@@ -470,7 +553,6 @@ export function Detail() {
                     value={classification.id}
                     onChange={(e) => {
                       setSelected(Number(e.target.value));
-                      setBoxes(false);
                     }}
                   >
                     {detail.classifications.map((c, i) => (
@@ -563,14 +645,9 @@ export function Detail() {
                 {classification.structured?.uncertainties != null && (
                   <>
                     <h3>Model uncertainties</h3>
-                    <p>
-                      {typeof classification.structured.uncertainties ===
-                      'string'
-                        ? classification.structured.uncertainties
-                        : JSON.stringify(
-                            classification.structured.uncertainties,
-                          )}
-                    </p>
+                    <Uncertainties
+                      value={classification.structured.uncertainties}
+                    />
                   </>
                 )}
               </>

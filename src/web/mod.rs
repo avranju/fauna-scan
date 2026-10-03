@@ -7,6 +7,7 @@
 
 mod assets;
 mod bounding_boxes;
+mod clips;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use axum::extract::{Path as AxumPath, Query, RawQuery, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -46,6 +47,7 @@ pub struct WebState {
     web: WebConfig,
     nvr: NvrConfig,
     recording_search: Arc<RecordingSearchClient>,
+    clips: clips::ClipStore,
     bounding_box_render_limit: Arc<Semaphore>,
     #[allow(dead_code)]
     started_at: Timestamp,
@@ -61,6 +63,7 @@ impl WebState {
             output_directory: config.general.output_directory.clone(),
             web: config.web.clone(),
             nvr: config.nvr.clone(),
+            clips: clips::ClipStore::new(&config.web),
             recording_search: Arc::new(RecordingSearchClient::new(
                 transport,
                 config.nvr.search.max_results,
@@ -109,6 +112,14 @@ pub async fn serve(state: WebState, shutdown: ShutdownToken) -> AppResult<()> {
 pub fn router(state: WebState) -> Router {
     let timeout =
         std::time::Duration::from_secs(state.nvr.request_timeout_seconds.saturating_add(5).max(30));
+    let clip_timeout = std::time::Duration::from_secs(
+        state
+            .web
+            .maximum_clip_duration_seconds
+            .saturating_mul(2)
+            .saturating_add(60)
+            .max(120),
+    );
     Router::new()
         // API endpoints
         .route("/api/v1/config", get(api_config))
@@ -122,8 +133,8 @@ pub fn router(state: WebState) -> Router {
         .route("/api/v1/images/{id}/content", get(api_image_content))
         .route("/api/v1/images/{id}/thumbnail", get(api_image_thumbnail))
         .route("/api/v1/images/{id}/recording", get(api_recording))
-        .route("/api/v1/images/{id}/clip", get(unsupported_clip))
-        .route("/api/v1/images/{id}/clip/download", get(unsupported_clip))
+        .route("/api/v1/images/{id}/clip", post(clips::prepare))
+        .route("/api/v1/clips/{token}", get(clips::serve))
         .route("/api/v1/activity", get(api_activity))
         .route("/api/v1/events", get(api_events))
         .fallback(assets::serve)
@@ -131,13 +142,26 @@ pub fn router(state: WebState) -> Router {
         .layer(CompressionLayer::new())
         .layer(axum::middleware::from_fn(
             move |request: axum::extract::Request, next: axum::middleware::Next| async move {
-                let sensitive = request.uri().path().ends_with("/recording")
+                let preparing_clip = request.method() == axum::http::Method::POST
+                    && request.uri().path().ends_with("/clip");
+                let sensitive = request.uri().path().contains("/clips/")
+                    || preparing_clip
+                    || request.uri().path().ends_with("/recording")
                     || request
                         .uri()
                         .path()
                         .strip_prefix("/api/v1/images/")
                         .is_some_and(|tail| !tail.contains('/'));
-                let mut response = match tokio::time::timeout(timeout, next.run(request)).await {
+                let mut response = match tokio::time::timeout(
+                    if preparing_clip {
+                        clip_timeout
+                    } else {
+                        timeout
+                    },
+                    next.run(request),
+                )
+                .await
+                {
                     Ok(response) => response,
                     Err(_) => WebError {
                         status: StatusCode::SERVICE_UNAVAILABLE,
@@ -262,8 +286,8 @@ async fn api_config(State(state): State<WebState>) -> Json<ConfigResponse> {
         capabilities: json!({
             "nvr_still_url": true,
             "nvr_recording_lookup": true,
-            "browser_clip_playback": false,
-            "clip_download": false
+            "browser_clip_playback": state.clips.available(),
+            "clip_download": state.clips.available()
         }),
     })
 }
@@ -1310,11 +1334,19 @@ struct RecordingParams {
     post_roll_seconds: Option<u64>,
 }
 
-async fn api_recording(
-    State(state): State<WebState>,
-    AxumPath(id): AxumPath<i64>,
-    Query(params): Query<RecordingParams>,
-) -> Result<Json<Value>, WebError> {
+struct RecordingLookup {
+    start: Timestamp,
+    end: Timestamp,
+    duration: u64,
+    recording: Option<crate::nvr::RecordingMatch>,
+    playback_uri: Option<String>,
+}
+
+async fn lookup_recording(
+    state: &WebState,
+    id: i64,
+    params: RecordingParams,
+) -> Result<RecordingLookup, WebError> {
     let pre = params
         .pre_roll_seconds
         .unwrap_or(state.web.clip_pre_roll_seconds);
@@ -1369,33 +1401,84 @@ async fn api_recording(
             }
         })?;
 
-    let Some(recording) = found else {
+    let playback_uri = found
+        .as_ref()
+        .map(|recording| {
+            bounded_recording_uri(
+                &recording.playback_uri,
+                &state.nvr,
+                state.web.rtsp_port,
+                &track,
+                start,
+                end,
+            )
+        })
+        .transpose()?;
+    Ok(RecordingLookup {
+        start,
+        end,
+        duration,
+        recording: found,
+        playback_uri,
+    })
+}
+
+async fn api_recording(
+    State(state): State<WebState>,
+    AxumPath(id): AxumPath<i64>,
+    Query(params): Query<RecordingParams>,
+) -> Result<Json<Value>, WebError> {
+    let lookup = lookup_recording(&state, id, params).await?;
+    let Some(recording) = lookup.recording else {
         return Ok(Json(json!({
             "status": "not_found",
-            "requested_start_at": start.to_string(),
-            "requested_end_at": end.to_string()
+            "requested_start_at": lookup.start.to_string(),
+            "requested_end_at": lookup.end.to_string()
         })));
     };
-
-    let playback_uri = validate_recording_uri(&recording.playback_uri, &state.nvr)?;
     Ok(Json(json!({
         "status": "found",
-        "requested_start_at": start.to_string(),
-        "requested_end_at": end.to_string(),
+        "requested_start_at": lookup.start.to_string(),
+        "requested_end_at": lookup.end.to_string(),
         "recording_start_at": recording.start_at.to_string(),
         "recording_end_at": recording.end_at.to_string(),
         "track_id": recording.track_id,
-        "nvr_playback_uri": playback_uri,
+        "nvr_playback_uri": lookup.playback_uri,
         "capabilities": {
             "open_external": true,
-            "browser_playback": false,
-            "download": false
+            "browser_playback": state.clips.available(),
+            "download": state.clips.available()
         }
     })))
 }
 
-async fn unsupported_clip() -> WebError {
-    WebError {status:StatusCode::UNPROCESSABLE_ENTITY,code:"recording_not_supported",message:"This deployment has no browser-compatible bounded clip adapter. Use the NVR playback URI in an external player.".into()}
+// The NVR search URI describes a whole storage segment and can even contain
+// the ISAPI port. Validate its source, then construct a bounded RTSP request.
+fn bounded_recording_uri(
+    raw: &str,
+    config: &NvrConfig,
+    port: u16,
+    track: &TrackId,
+    start: Timestamp,
+    end: Timestamp,
+) -> Result<String, WebError> {
+    validate_recording_uri(raw, config)?;
+    let mut url = Url::parse("rtsp://localhost/").expect("static URL");
+    url.set_host(Some(&config.host))
+        .map_err(|_| WebError::bad_request("Invalid NVR host"))?;
+    url.set_port(Some(port))
+        .map_err(|_| WebError::bad_request("Invalid RTSP port"))?;
+    url.set_path(&format!("/Streaming/tracks/{}/", track.as_str()));
+    url.query_pairs_mut()
+        .append_pair(
+            "starttime",
+            &start.as_datetime().format("%Y%m%dT%H%M%SZ").to_string(),
+        )
+        .append_pair(
+            "endtime",
+            &end.as_datetime().format("%Y%m%dT%H%M%SZ").to_string(),
+        );
+    Ok(url.to_string())
 }
 
 // ── API: activity ──────────────────────────────────────────────────────────
@@ -1700,7 +1783,7 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    async fn test_state() -> (tempfile::TempDir, WebState) {
+    pub(super) async fn test_state() -> (tempfile::TempDir, WebState) {
         let root = tempfile::tempdir().unwrap();
         let output = root.path().join("images");
         std::fs::create_dir(&output).unwrap();
@@ -1802,6 +1885,7 @@ mod tests {
             web: WebConfig::default(),
             nvr,
             recording_search: Arc::new(RecordingSearchClient::new(transport, 50)),
+            clips: clips::ClipStore::new(&WebConfig::default()),
             bounding_box_render_limit: Arc::new(Semaphore::new(2)),
             started_at: "2026-07-21T10:00:00Z".parse().unwrap(),
             event_limit: Arc::new(Semaphore::new(32)),
@@ -1809,6 +1893,31 @@ mod tests {
             cursor_key: [7; 32],
         };
         (root, state)
+    }
+
+    #[tokio::test]
+    async fn playback_uri_uses_requested_times_and_rtsp_port() {
+        let (_root, state) = test_state().await;
+        let start = "2026-10-03T05:40:00Z".parse().unwrap();
+        let end = "2026-10-03T05:40:30Z".parse().unwrap();
+        let uri = bounded_recording_uri(
+            "rtsp://nvr:8080/Streaming/tracks/301/?starttime=20261003T053317Z&endtime=20261003T060304Z&name=segment&size=123",
+            &state.nvr, 554, &TrackId::new("301"), start, end).unwrap();
+        assert_eq!(
+            uri,
+            "rtsp://nvr:554/Streaming/tracks/301/?starttime=20261003T054000Z&endtime=20261003T054030Z"
+        );
+        assert!(
+            bounded_recording_uri(
+                "rtsp://evil.example/Streaming/tracks/301/",
+                &state.nvr,
+                554,
+                &TrackId::new("301"),
+                start,
+                end
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2144,10 +2253,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.headers()[CACHE_CONTROL], "private, no-store");
-        assert_eq!(
-            get_json(&state, "/api/v1/images/1/clip").await.0,
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/images/1/clip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[tokio::test]

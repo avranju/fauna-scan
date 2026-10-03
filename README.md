@@ -196,9 +196,31 @@ Images supports shareable UTC time/camera filters, gallery/table views, species,
 confidence, model/prompt, lifecycle, text and local-file filters, and signed keyset
 pagination. Image detail preserves classification provenance and older results,
 provides zoom/pan controls and bounding-box overlays, and resolves NVR recordings
-only when **Find recording** is selected. Browser clip playback/download stay
-unavailable until a compatible media adapter is implemented; credential-free NVR
-playback URLs can be copied or opened in a native player.
+only when **Find recording** is selected. This prepares a bounded MP4 for the
+embedded player and **Download video** using server-side FFmpeg and the existing
+`[nvr]` username/password secret. Credentials are never returned to the browser
+or included in FFmpeg logs. Use the raw NVR password in the configuration; the
+adapter URL-encodes it when authenticating RTSP.
+
+`[web].rtsp_port` defaults to 554, independently of the NVR ISAPI HTTP port.
+The returned RTSP URL uses the requested pre/post-roll times rather than the
+entire storage segment. Browser clips require FFmpeg with `libx264` and AAC
+support (included in the Docker image). For native installations, install FFmpeg
+and optionally set `[web].ffmpeg_path`. Set `clips_enabled = false` to disable
+preparation. Availability is detected at web-server startup.
+
+MP4 clips are transcoded to H.264/AAC, with video scaled to at most 1920 pixels
+wide, so H.265 and other NVR codecs can play in browsers. Preparation is limited
+to `max_concurrent_clip_encodes` jobs (default 1, allowed 1–4), two codec threads,
+the configured maximum duration, a wall-clock timeout, and 64 MiB per clip.
+At most eight prepared clips are retained in private temporary directories,
+expire after 15 minutes, and support HTTP byte ranges for seeking. A fresh
+preparation is required after expiry or server restart. A capture near a gap or
+recording boundary may have a shorter clip if the NVR lacks the full interval.
+
+`POST /api/v1/images/{id}/clip?pre_roll_seconds=10&post_roll_seconds=20`
+prepares a clip and returns temporary `playback_url` and `download_url` values.
+Playback and download share the same prepared MP4.
 
 Live pages use SSE invalidations with polling fallback and retain their last
 successful data during connection failures. Continuous downloader/scanner workers

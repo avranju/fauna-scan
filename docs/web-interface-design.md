@@ -1106,6 +1106,19 @@ refresh. The browser coalesces invalidations, falls back to polling, and pauses
 background traffic when hidden.
 
 Recording resolution remains on demand through the existing authenticated NVR
-transport. No browser media adapter is implemented, so View/Download clip actions
-are unavailable and explained. Real NVR firmware validation and the million-row
-performance target require deployment-specific acceptance testing.
+transport. Search results describe full storage segments; playback URLs are
+rebuilt using the camera primary track, requested pre/post-roll interval, configured
+NVR host, and `[web].rtsp_port` (554 by default).
+
+The FFmpeg adapter prepares H.264/AAC MP4 clips using the resolved NVR credentials
+on the server. `POST /api/v1/images/:id/clip` accepts the same pre/post-roll query
+parameters as recording lookup and returns temporary playback/download URLs.
+`GET /api/v1/clips/:token` supports byte ranges; `?download=true` adds attachment
+disposition. This replaces the planned per-image GET clip/download routes above.
+Preparation has a concurrency semaphore, two codec threads, duration and
+wall-clock limits, and a 64 MiB file cap. Eight clips at most are cached in private
+temporary directories for 15 minutes; expired clips require preparation again.
+No credential-bearing input URI or FFmpeg stderr is logged or returned to clients.
+
+Real NVR firmware validation and the million-row performance target require
+deployment-specific acceptance testing.

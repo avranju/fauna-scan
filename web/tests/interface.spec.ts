@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
+import { readFileSync } from 'node:fs';
 
 const captured = '2026-10-01T10:00:00Z';
 const classification = {
@@ -14,6 +15,12 @@ const classification = {
   completed_at: captured,
   request_started_at: '2026-10-01T09:59:58Z',
   request_completed_at: captured,
+  structured: {
+    uncertainties: [
+      'Low light may obscure fine details.',
+      'Species identification is uncertain.',
+    ],
+  },
   bounding_boxes: [{ x_min: 0.2, y_min: 0.2, x_max: 0.7, y_max: 0.8 }],
 };
 const image = {
@@ -77,8 +84,8 @@ async function fixture(page: Page) {
         maximum_clip_duration_seconds: 120,
         capabilities: {
           nvr_recording_lookup: true,
-          browser_clip_playback: false,
-          clip_download: false,
+          browser_clip_playback: true,
+          clip_download: true,
         },
       };
     else if (path === 'health')
@@ -169,8 +176,24 @@ async function fixture(page: Page) {
         recording_start_at: captured,
         recording_end_at: captured,
         nvr_playback_uri: 'rtsp://nvr.local/Streaming/tracks/301',
-        capabilities: { browser_playback: false, download: false },
+        capabilities: { browser_playback: true, download: true },
       };
+    else if (/images\/\d+\/clip$/.test(path))
+      body = {
+        playback_url: '/api/v1/clips/fixture',
+        download_url: '/api/v1/clips/fixture?download=true',
+        expires_in_seconds: 900,
+      };
+    else if (path === 'clips/fixture')
+      return route.fulfill({
+        contentType: 'video/mp4',
+        body: readFileSync(new URL('./fixtures/clip.mp4', import.meta.url)),
+        headers: {
+          'Content-Disposition': url.searchParams.has('download')
+            ? 'attachment; filename="clip.mp4"'
+            : 'inline',
+        },
+      });
     else if (/images\/\d+$/.test(path))
       body = {
         ...image,
@@ -191,6 +214,7 @@ async function fixture(page: Page) {
             summary: 'Earlier classification summary.',
             confidence: 0.7,
             bounding_boxes: null,
+            structured: { uncertainties: ['Only one uncertainty.'] },
           },
         ],
       };
@@ -301,12 +325,20 @@ test('detail shows provenance, older results, zoom, and on-demand NVR recording'
     page.getByRole('link', { name: 'Open in video player' }),
   ).toHaveAttribute('rel', 'noopener noreferrer');
   expect(recordingRequests).toBe(1);
+  const video = page.locator('video');
+  await expect(video).toBeVisible();
   await expect(
-    page.getByRole('button', { name: 'View clip', exact: true }),
-  ).toBeDisabled();
-  await expect(
-    page.getByRole('button', { name: 'Download clip', exact: true }),
-  ).toBeDisabled();
+    page.getByRole('link', { name: 'Download video' }),
+  ).toHaveAttribute('href', '/api/v1/clips/fixture?download=true');
+  await expect
+    .poll(() => video.evaluate((v: HTMLVideoElement) => v.readyState))
+    .toBeGreaterThan(0);
+  await video.evaluate((v: HTMLVideoElement) => v.play());
+  await expect
+    .poll(() => video.evaluate((v: HTMLVideoElement) => v.currentTime))
+    .toBeGreaterThan(0);
+  await page.getByLabel('Seconds before').fill('5');
+  await expect(video).toHaveCount(0);
 });
 
 test('all screens are accessible and fit desktop/mobile viewports', async ({
@@ -401,4 +433,146 @@ test('live disconnects keep images visible, poll, and recover', async ({
     source.dispatchEvent(new MessageEvent('invalidate', { data: '{}' }));
   });
   await expect(page.getByText(/Live updates disconnected/)).toHaveCount(0);
+});
+
+test('every histogram bar shows its capture interval start', async ({
+  page,
+}) => {
+  await page.goto('/?range=all&tz=UTC');
+  await expect(page.locator('.histogram-label')).toHaveCount(12);
+  await expect(page.locator('.histogram-label').first()).toContainText('00:00');
+  await expect(page.locator('.histogram-label').last()).toContainText('11:00');
+});
+
+test('zoom controls stay clickable and bounding boxes default on', async ({
+  page,
+}) => {
+  await page.goto('/images/1');
+  const boxes = page.getByRole('checkbox', { name: /Draw latest/ });
+  const photo = page.locator('.viewer img');
+  await expect(boxes).toBeChecked();
+  await expect(photo).toHaveAttribute('src', /draw-bounding-box=true/);
+  for (let i = 0; i < 6; i++) {
+    await page.getByRole('button', { name: 'Zoom in', exact: true }).click();
+    await page.waitForTimeout(250);
+  }
+  for (const name of ['Zoom out', '100%', 'Fit', 'Reset image view']) {
+    await page.getByRole('button', { name, exact: true }).click();
+  }
+  await boxes.uncheck();
+  await expect(photo).not.toHaveAttribute('src', /draw-bounding-box/);
+  await page.getByRole('link', { name: 'Next', exact: true }).click();
+  await expect(boxes).toBeChecked();
+});
+
+test('uncertainties show a list for multiple entries and plain text for one', async ({
+  page,
+}) => {
+  await page.goto('/images/1');
+  await expect(page.locator('.uncertainties li')).toHaveText([
+    'Low light may obscure fine details.',
+    'Species identification is uncertain.',
+  ]);
+  await page.getByLabel('Classification result').selectOption('3');
+  await expect(page.locator('.uncertainties')).toHaveCount(0);
+  await expect(
+    page.getByText('Only one uncertainty.', { exact: true }),
+  ).toBeVisible();
+});
+
+test('copy falls back when Clipboard API is unavailable or denied', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: undefined,
+    });
+    Object.assign(window, { copiedValues: [] });
+    document.execCommand = (command: string) => {
+      if (command !== 'copy') return false;
+      const field = document.activeElement as HTMLTextAreaElement;
+      (window as unknown as { copiedValues: string[] }).copiedValues.push(
+        field.value.slice(field.selectionStart, field.selectionEnd),
+      );
+      return true;
+    };
+  });
+  await page.goto('/images/1');
+  const button = page.getByRole('button', { name: 'Copy detail link' });
+  await button.click();
+  await expect(
+    page.getByText('Copied to clipboard', { exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => (window as unknown as { copiedValues: string[] }).copiedValues,
+    ),
+  ).toEqual([page.url()]);
+  await expect(button).toBeFocused();
+  await page.evaluate(() =>
+    Object.defineProperty(navigator, 'clipboard', {
+      value: { writeText: () => Promise.reject(new Error('Denied')) },
+    }),
+  );
+  await button.click();
+  expect(
+    await page.evaluate(
+      () =>
+        (window as unknown as { copiedValues: string[] }).copiedValues.length,
+    ),
+  ).toBe(2);
+  await page.goto('/images');
+  await page.getByLabel('Actions for image 1').click();
+  await page
+    .getByRole('button', { name: 'Copy NVR image URL', exact: true })
+    .click();
+  await expect(
+    page.getByText('NVR image URL copied', { exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      (window as unknown as { copiedValues: string[] }).copiedValues.at(-1),
+    ),
+  ).toBe('http://nvr.local/picture/1');
+});
+
+test('HTTP copy fallback writes to the actual system clipboard', async ({
+  page,
+}, testInfo) => {
+  test.skip(
+    testInfo.project.name === 'mobile',
+    'System clipboard is shared across browser contexts.',
+  );
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.addInitScript(() => {
+    Object.assign(window, { nativeClipboard: navigator.clipboard });
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: undefined,
+    });
+  });
+  await page.goto('/images/1');
+  await page
+    .getByRole('button', { name: 'Copy detail link', exact: true })
+    .click();
+  expect(
+    await page.evaluate(() =>
+      (
+        window as unknown as { nativeClipboard: Clipboard }
+      ).nativeClipboard.readText(),
+    ),
+  ).toBe(page.url());
+  await page.goto('/images');
+  await page.getByLabel('Actions for image 1').click();
+  await page
+    .getByRole('button', { name: 'Copy NVR image URL', exact: true })
+    .click();
+  expect(
+    await page.evaluate(() =>
+      (
+        window as unknown as { nativeClipboard: Clipboard }
+      ).nativeClipboard.readText(),
+    ),
+  ).toBe('http://nvr.local/picture/1');
 });
