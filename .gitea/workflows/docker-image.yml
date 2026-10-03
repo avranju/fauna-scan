@@ -9,7 +9,7 @@ on:
         type: string
 
 env:
-  REGISTRY: git.nerdworks.dev
+  REGISTRY: registry.nerdworks.dev
   REGISTRY_USERNAME: ${{ vars.REGISTRY_USERNAME }}
   IMAGE_NAME: avranju/fauna-scan
   IMAGE_TAG: ${{ inputs.tag }}
