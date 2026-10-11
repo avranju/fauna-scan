@@ -16,7 +16,8 @@ use tokio::sync::Semaphore;
 
 use super::{WebError, WebState};
 use crate::authentication::{
-    fingerprint, hash_password, new_session_token, validate_credentials, verify_password,
+    fingerprint, hash_password, is_api_token, new_session_token, validate_credentials,
+    verify_password,
 };
 
 const COOKIE: &str = "fauna_scan_session";
@@ -61,7 +62,10 @@ impl LoginGuard {
 }
 
 #[derive(Clone)]
-pub(super) struct LoggedIn(pub String);
+pub(super) enum LoggedIn {
+    User(String),
+    ApiToken(String),
+}
 
 fn error(status: StatusCode, code: &'static str, message: &str) -> WebError {
     WebError {
@@ -77,6 +81,31 @@ fn unauthorized() -> WebError {
         "unauthenticated",
         "Please sign in to continue.",
     )
+}
+
+/// Reject ambiguous or malformed Authorization headers rather than falling
+/// back to a cookie. The scheme is case insensitive per HTTP authentication.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim_start_matches(' ');
+    (scheme.eq_ignore_ascii_case("bearer") && is_api_token(token)).then_some(token)
+}
+
+fn bearer_unauthorized() -> Response {
+    let mut response = unauthorized().into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 fn cookie_token(headers: &HeaderMap) -> Option<String> {
@@ -124,6 +153,33 @@ pub(super) async fn require_login(
 ) -> Response {
     let path = request.uri().path();
     let public = path == "/login" || path.starts_with("/assets/") || path == "/api/v1/auth/login";
+    // Explicit API credentials take precedence over browser cookies. They
+    // cannot mint a browser session and don't rely on ambient credentials, so
+    // valid bearer requests do not need the cookie CSRF header.
+    if !public && path.starts_with("/api/") && request.headers().contains_key(header::AUTHORIZATION)
+    {
+        let Some(token) = bearer_token(request.headers()) else {
+            return bearer_unauthorized();
+        };
+        let metadata = match state
+            .ops
+            .find_api_token(&fingerprint(token), Utc::now().timestamp())
+            .await
+        {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => return bearer_unauthorized(),
+            Err(error) => return WebError::from(error).into_response(),
+        };
+        request
+            .extensions_mut()
+            .insert(LoggedIn::ApiToken(metadata.name));
+        let mut response = next.run(request).await;
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        return response;
+    }
     if !matches!(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
@@ -181,7 +237,9 @@ pub(super) async fn require_login(
         })
         .unwrap_or(COOKIE_LIFETIME);
     let logging_out = path == "/api/v1/auth/logout";
-    request.extensions_mut().insert(LoggedIn(session.username));
+    request
+        .extensions_mut()
+        .insert(LoggedIn::User(session.username));
     let mut response = next.run(request).await;
     if !logging_out {
         set_cookie(&mut response, &state, &token, lifetime);
@@ -299,13 +357,24 @@ pub(super) async fn login(
 }
 
 pub(super) async fn session(Extension(user): Extension<LoggedIn>) -> Json<serde_json::Value> {
-    Json(json!({ "username": user.0 }))
+    Json(match user {
+        LoggedIn::User(username) => json!({ "username": username }),
+        LoggedIn::ApiToken(name) => json!({ "api_token": name }),
+    })
 }
 
 pub(super) async fn logout(
     State(state): State<WebState>,
+    Extension(user): Extension<LoggedIn>,
     headers: HeaderMap,
 ) -> Result<Response, WebError> {
+    if matches!(user, LoggedIn::ApiToken(_)) {
+        return Err(error(
+            StatusCode::FORBIDDEN,
+            "api_token_logout",
+            "Revoke API tokens using the CLI.",
+        ));
+    }
     if let Some(token) = cookie_token(&headers) {
         state.ops.remove_session(&fingerprint(&token)).await?;
     }
@@ -371,6 +440,176 @@ mod tests {
             "private, no-store"
         );
         value.split(';').next().unwrap().to_string()
+    }
+
+    async fn token_request(
+        state: &WebState,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        let mut builder = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        super::super::router(state.clone())
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bearer_tokens_authenticate_media_and_mutations_without_a_cookie_or_csrf_header() {
+        let (_root, state) = super::super::tests::test_state().await;
+        let token = crate::authentication::new_api_token();
+        assert!(
+            state
+                .ops
+                .create_api_token("automation", &fingerprint(&token), None)
+                .await
+                .unwrap()
+        );
+        let authorization = format!("bEaReR {token}");
+        for path in [
+            "/api/v1/images/1/content",
+            "/api/v1/images/1/content?draw-bounding-box=true",
+            "/api/v1/images",
+            "/api/v1/auth/session",
+        ] {
+            let response =
+                token_request(&state, "GET", path, &[("authorization", &authorization)]).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            if path.ends_with("/session") {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap())
+                        .unwrap();
+                assert_eq!(body, json!({"api_token": "automation"}));
+            }
+        }
+        // A missing image reaches the POST handler rather than the CSRF/auth gate.
+        let response = token_request(
+            &state,
+            "POST",
+            "/api/v1/images/999999/clip",
+            &[("authorization", &authorization)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        // API credentials cannot mint a browser session or log out a cookie.
+        let response = token_request(
+            &state,
+            "GET",
+            "/images",
+            &[("authorization", &authorization)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let response = token_request(
+            &state,
+            "POST",
+            "/api/v1/auth/logout",
+            &[("authorization", &authorization)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_expired_revoked_and_ambiguous_bearers_cannot_fall_back_to_cookies() {
+        let (_root, state) = super::super::tests::test_state().await;
+        credentials(&state).await;
+        let cookie = sign_in(&state).await;
+        let token = crate::authentication::new_api_token();
+        let authorization = format!("Bearer {token}");
+        let now = Utc::now().timestamp();
+        state
+            .ops
+            .create_api_token("expired", &fingerprint(&token), Some(now))
+            .await
+            .unwrap();
+        for value in [
+            &authorization,
+            "Bearer invalid",
+            "Bearer",
+            "Basic credentials",
+            "",
+            &format!("{authorization} trailing"),
+        ] {
+            let response = token_request(
+                &state,
+                "GET",
+                "/api/v1/images/1/content",
+                &[("authorization", value), ("cookie", &cookie)],
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(response.headers()[header::WWW_AUTHENTICATE], "Bearer");
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+        }
+        state.ops.revoke_api_token("expired").await.unwrap();
+        state
+            .ops
+            .create_api_token("valid", &fingerprint(&token), Some(now + 3600))
+            .await
+            .unwrap();
+        let response = token_request(
+            &state,
+            "GET",
+            "/api/v1/auth/session",
+            &[("authorization", &authorization), ("cookie", &cookie)],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        let response = token_request(
+            &state,
+            "GET",
+            "/api/v1/auth/session",
+            &[
+                ("authorization", &authorization),
+                ("authorization", &authorization),
+            ],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(state.ops.revoke_api_token("valid").await.unwrap());
+        assert_eq!(
+            token_request(
+                &state,
+                "GET",
+                "/api/v1/auth/session",
+                &[("authorization", &authorization)]
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Revocation of an API token leaves the browser session valid.
+        assert_eq!(
+            request(&state, "GET", "/api/v1/auth/session", Some(&cookie), None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        // Neither query parameters nor a session cookie can carry API tokens.
+        let api_cookie = format!("fauna_scan_session={token}");
+        assert_eq!(
+            token_request(
+                &state,
+                "GET",
+                &format!("/api/v1/images?api_token={token}"),
+                &[("cookie", &api_cookie)]
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

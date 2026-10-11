@@ -72,6 +72,20 @@ pub fn fingerprint(value: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
 }
 
+/// Separate API credentials from browser session tokens with a type prefix.
+pub fn new_api_token() -> String {
+    format!("fs_api_{}", new_session_token())
+}
+
+pub fn is_api_token(token: &str) -> bool {
+    token.strip_prefix("fs_api_").is_some_and(|secret| {
+        secret.len() == 43
+            && secret
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

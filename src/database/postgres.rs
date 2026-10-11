@@ -16,7 +16,7 @@ use sqlx::Row;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
-use super::auth_models::{SessionCredential, UserCredential};
+use super::auth_models::{ApiTokenMetadata, SessionCredential, UserCredential};
 use super::models::*;
 use super::repository::{
     DataStore, DatabaseOps, GcOperation, GcOutcome, RateLimitGrant, RateLimitReservation,
@@ -1134,6 +1134,46 @@ async fn build_image_summaries_pg(
 
 #[async_trait]
 impl DataStore for PostgresDataStore {
+    async fn create_api_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        expires_at: Option<i64>,
+    ) -> AppResult<bool> {
+        let result = sqlx::query("INSERT INTO api_tokens (name, token_hash, expires_at) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING")
+            .bind(name).bind(token_hash).bind(expires_at)
+            .execute(&self.pool).await
+            .map_err(|error| map_sqlx_error("create_api_token", error))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn list_api_tokens(&self) -> AppResult<Vec<ApiTokenMetadata>> {
+        sqlx::query_as("SELECT name, expires_at FROM api_tokens ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error("list_api_tokens", error))
+    }
+
+    async fn find_api_token(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> AppResult<Option<ApiTokenMetadata>> {
+        sqlx::query_as("SELECT name, expires_at FROM api_tokens WHERE token_hash = $1 AND (expires_at IS NULL OR expires_at > $2)")
+            .bind(token_hash).bind(now)
+            .fetch_optional(&self.pool).await
+            .map_err(|error| map_sqlx_error("find_api_token", error))
+    }
+
+    async fn revoke_api_token(&self, name: &str) -> AppResult<bool> {
+        let result = sqlx::query("DELETE FROM api_tokens WHERE name = $1")
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| map_sqlx_error("revoke_api_token", error))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn list_users(&self) -> AppResult<Vec<String>> {
         let result = sqlx::query_scalar("SELECT username FROM users ORDER BY username")
             .fetch_all(&self.pool)

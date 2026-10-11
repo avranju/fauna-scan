@@ -32,6 +32,7 @@ fn help_lists_all_subcommands() {
             .and(predicate::str::contains("download"))
             .and(predicate::str::contains("scan"))
             .and(predicate::str::contains("web"))
+            .and(predicate::str::contains("api-token"))
             .and(predicate::str::contains("status")),
     );
 }
@@ -106,6 +107,144 @@ start_at = "2026-01-01T00:00:00Z"
 
 [classifier]
 "#
+}
+
+#[tokio::test]
+async fn api_token_cli_prints_secret_once_and_manages_only_hashed_credentials() {
+    use fauna_scan::authentication::{fingerprint, is_api_token};
+    use fauna_scan::database::sqlite::SqliteDataStore;
+    let dir = tempfile::tempdir().unwrap();
+    let database_path = dir.path().join("tokens.sqlite3");
+    let config_path = dir.path().join("config.toml");
+    let config = minimal_valid_config().replace(
+        "[general]",
+        &format!(
+            "[database]\nbackend = \"sqlite\"\npath = {:?}\n\n[general]",
+            database_path
+        ),
+    );
+    std::fs::write(&config_path, config).unwrap();
+    let common = [
+        "--config",
+        config_path.to_str().unwrap(),
+        "--log-level",
+        "debug",
+        "api-token",
+    ];
+    let output = cmd()
+        .args(common)
+        .args(["create", "automation ' quoted", "--no-expiry"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let token = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(token.lines().count(), 1);
+    let token = token.trim();
+    assert!(is_api_token(token));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(token));
+    let store = SqliteDataStore::connect(&database_path, 1).await.unwrap();
+    let stored: (String, Option<i64>) =
+        sqlx::query_as("SELECT token_hash, expires_at FROM api_tokens")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored.0, fingerprint(token));
+    assert_ne!(stored.0, token);
+    assert_eq!(stored.1, None);
+    assert!(
+        store
+            .ops()
+            .find_api_token(&stored.0, chrono::Utc::now().timestamp())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    cmd()
+        .args(common)
+        .args(["create", "automation ' quoted", "--no-expiry"])
+        .assert()
+        .failure()
+        .stdout("");
+    cmd()
+        .args(common)
+        .args([
+            "create",
+            "dated",
+            "--expires-at",
+            "2099-01-01T05:30:00+05:30",
+        ])
+        .assert()
+        .success();
+    cmd()
+        .args(common)
+        .args(["create", "date-only", "--expires-at", "2099-01-01"])
+        .assert()
+        .success();
+    let metadata = store.ops().list_api_tokens().await.unwrap();
+    assert_eq!(metadata.len(), 3);
+    assert_eq!(metadata[1].expires_at, metadata[2].expires_at);
+    let output = cmd()
+        .args(common)
+        .arg("list")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("automation ' quoted\tnever"));
+    assert!(output.contains("2099-01-01T00:00:00+00:00"));
+    assert!(!output.contains(token));
+    assert!(!output.contains(&stored.0));
+    cmd()
+        .args(common)
+        .args(["revoke", "automation ' quoted"])
+        .assert()
+        .success();
+    assert!(
+        store
+            .ops()
+            .find_api_token(&stored.0, chrono::Utc::now().timestamp())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    cmd()
+        .args(common)
+        .args(["revoke", "automation ' quoted"])
+        .assert()
+        .failure();
+    // Reusing a revoked name produces a new independent secret.
+    let output = cmd()
+        .args(common)
+        .args(["create", "automation ' quoted", "--no-expiry"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_ne!(String::from_utf8(output).unwrap().trim(), token);
+}
+
+#[test]
+fn api_token_creation_rejects_ambiguous_invalid_and_past_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, minimal_valid_config()).unwrap();
+    let common = ["--config", path.to_str().unwrap(), "api-token", "create"];
+    for args in [
+        vec!["name"],
+        vec!["name", "--no-expiry", "--expires-at", "2099-01-01"],
+        vec!["name", "--expires-at", "bad date"],
+        vec!["name", "--expires-at", "2020-01-01"],
+        vec!["name", "--expires-at", "2099-01-01T00:00:00"],
+        vec!["name", "--expires-at", "2099-02-30"],
+        vec!["", "--no-expiry"],
+        vec!["bad\nname", "--no-expiry"],
+    ] {
+        cmd().args(common).args(args).assert().failure().stdout("");
+    }
 }
 
 #[test]

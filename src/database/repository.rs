@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use crate::domain::{CameraId, ClassificationId, ImageId, Timestamp};
 use crate::error::AppResult;
 
-use super::auth_models::{SessionCredential, UserCredential};
+use super::auth_models::{ApiTokenMetadata, SessionCredential, UserCredential};
 use super::models::*;
 use super::web_models::*;
 
@@ -104,6 +104,20 @@ pub trait DataStore: Send + Sync {
         now: i64,
     ) -> AppResult<Option<SessionCredential>>;
     async fn remove_session(&self, token_hash: &str) -> AppResult<()>;
+
+    async fn create_api_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        expires_at: Option<i64>,
+    ) -> AppResult<bool>;
+    async fn list_api_tokens(&self) -> AppResult<Vec<ApiTokenMetadata>>;
+    async fn find_api_token(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> AppResult<Option<ApiTokenMetadata>>;
+    async fn revoke_api_token(&self, name: &str) -> AppResult<bool>;
 
     // ── Camera operations ───────────────────────────────────────────────
 
@@ -441,6 +455,33 @@ impl DatabaseOps {
 
     pub async fn remove_session(&self, token_hash: &str) -> AppResult<()> {
         self.inner.remove_session(token_hash).await
+    }
+
+    pub async fn create_api_token(
+        &self,
+        name: &str,
+        token_hash: &str,
+        expires_at: Option<i64>,
+    ) -> AppResult<bool> {
+        self.inner
+            .create_api_token(name, token_hash, expires_at)
+            .await
+    }
+
+    pub async fn list_api_tokens(&self) -> AppResult<Vec<ApiTokenMetadata>> {
+        self.inner.list_api_tokens().await
+    }
+
+    pub async fn find_api_token(
+        &self,
+        token_hash: &str,
+        now: i64,
+    ) -> AppResult<Option<ApiTokenMetadata>> {
+        self.inner.find_api_token(token_hash, now).await
+    }
+
+    pub async fn revoke_api_token(&self, name: &str) -> AppResult<bool> {
+        self.inner.revoke_api_token(name).await
     }
 
     /// Create a new DatabaseOps wrapping the given DataStore.

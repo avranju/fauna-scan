@@ -179,6 +179,10 @@ fauna-scan --config PATH status
 fauna-scan --config PATH users list
 fauna-scan --config PATH users add "USER NAME" "PASSWORD"
 fauna-scan --config PATH users remove "USER NAME"
+fauna-scan --config PATH api-token create automation --expires-at 2027-01-01
+fauna-scan --config PATH api-token create automation --no-expiry
+fauna-scan --config PATH api-token list
+fauna-scan --config PATH api-token revoke automation
 fauna-scan --config PATH check-config
 fauna-scan --log-level debug --config PATH run
 fauna-scan --help
@@ -237,7 +241,61 @@ is provided. The web interface sends it automatically. API clients must log in
 using `POST /api/v1/auth/login` with JSON `{"username":"...","password":"..."}`
 and that header, then retain the returned cookie. `GET /api/v1/auth/session`
 reports the signed-in user; `POST /api/v1/auth/logout` revokes their session.
-The `sqlite-to-pg` utility preserves users and sessions when migrating backend.
+The `sqlite-to-pg` utility preserves users, sessions, and API tokens when migrating backend.
+
+### API tokens for automation
+
+Create a named bearer token on the server using the same configuration/database
+as the web service. Choose either a future expiry or explicitly opt out of expiry:
+
+```bash
+fauna-scan --config PATH api-token create image-script --expires-at 2027-01-01T00:00:00Z
+# Or create a token with no expiry:
+fauna-scan --config PATH api-token create image-script --no-expiry
+```
+
+The examples are alternatives: active token names must be unique. Expiry accepts
+RFC 3339 with an explicit timezone, or `YYYY-MM-DD` meaning **00:00 UTC at the
+start of that date**. Past expiry dates and missing/conflicting expiry options
+are rejected. The secret is printed as a single line to stdout only after the
+database write succeeds; command logs go to stderr. Save it immediately in your
+automation's secret store: it cannot be displayed or recovered later.
+
+Tokens contain 256 random bits and an `fs_api_` prefix. Only the SHA-256 hash,
+management name, and optional expiry timestamp are persisted, in both SQLite
+and PostgreSQL. Tokens are independent of web users and their passwords; they
+grant access to **all API operations**, including writes. There are currently
+no permission scopes. Treat a token as a credential and send it over HTTPS in
+the Authorization header, never in a query parameter:
+
+```bash
+# FAUNA_API_TOKEN comes from your secret store.
+curl --fail \
+  --header "Authorization: Bearer ${FAUNA_API_TOKEN}" \
+  --output 108662.jpg \
+  'https://fauna.nerdworks.dev/api/v1/images/108662/content?draw-bounding-box=true'
+```
+
+Each protected `/api/` request checks the stored hash and expiry. An invalid,
+expired, revoked, malformed, or duplicate Authorization header returns `401`
+without falling back to browser cookies. Valid bearer requests do not need
+`X-Fauna-Scan-Request: 1` and do not create or change browser session cookies.
+Browser pages continue to require a cookie login. The public login endpoint
+still requires username/password and the CSRF header; a token cannot be
+exchanged for a browser session. `GET /api/v1/auth/session` returns
+`{"api_token":"image-script"}` for a bearer client. Browser logout is for
+cookie sessions and returns `403` for a bearer client; revoke tokens with the CLI:
+
+```bash
+fauna-scan --config PATH api-token list
+fauna-scan --config PATH api-token revoke image-script
+```
+
+Listing shows names and expiry dates (or `never`), including expired tokens,
+without secrets or hashes. Revocation deletes the stored hash and takes effect
+on the next request without a server restart. A request already authorized,
+including an open event stream, is not interrupted. A revoked name can be reused
+to issue a fresh token; its previous secret remains invalid.
 
 Images supports shareable UTC time/camera filters, gallery/table views, species,
 confidence, model/prompt, lifecycle, text and local-file filters, and signed keyset
@@ -293,9 +351,10 @@ installed Chromium otherwise (`cd web && npx playwright install chromium`).
 lines after imports, between functions, and between interface blocks;
 `npm run format:check --prefix web` checks both rules.
 
-The default listener is loopback-only. Keep it on loopback or place it behind an
-authenticated TLS reverse proxy; the service does not provide built-in user
-authentication. Thumbnail rendering shares the configured render semaphore with
+The default listener is loopback-only. Keep it on loopback or place it behind a
+TLS reverse proxy with `[web].secure_cookie = true`. The service authenticates
+browser users with cookies and API clients with cookies or bearer tokens.
+Thumbnail rendering shares the configured render semaphore with
 bounding-box overlays, limits decoding to 32 MP/128 MiB, and maintains a bounded
 64 MiB / 512-entry memory cache. Local-file filtering checks actual safe filesystem
 presence; sparsely matching pages may offer another batch to scan.

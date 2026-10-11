@@ -52,6 +52,35 @@ pub enum Command {
         #[command(subcommand)]
         command: UsersCommand,
     },
+
+    /// Manage bearer tokens for API clients in the configured database.
+    ApiToken {
+        #[command(subcommand)]
+        command: ApiTokenCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ApiTokenCommand {
+    /// Create a named token and print its secret once, to stdout.
+    Create {
+        /// Unique name used to list and revoke this token.
+        name: String,
+        /// Expiry as RFC 3339 with timezone, or YYYY-MM-DD (00:00 UTC).
+        #[arg(
+            long,
+            required_unless_present = "no_expiry",
+            conflicts_with = "no_expiry"
+        )]
+        expires_at: Option<String>,
+        /// Explicitly create a token without an expiry.
+        #[arg(long)]
+        no_expiry: bool,
+    },
+    /// List names and expiry dates; never token secrets or hashes.
+    List,
+    /// Revoke a token by its name.
+    Revoke { name: String },
 }
 
 #[derive(Subcommand)]

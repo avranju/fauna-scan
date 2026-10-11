@@ -6,7 +6,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
-const CURRENT_SQLITE_MIGRATION: i64 = 10;
+const CURRENT_SQLITE_MIGRATION: i64 = 11;
 const TABLES: &[&str] = &[
     "cameras",
     "images",
@@ -17,6 +17,7 @@ const TABLES: &[&str] = &[
     "classifier_rate_limit_daily_usage",
     "users",
     "web_sessions",
+    "api_tokens",
 ];
 
 #[derive(Parser, Debug)]
@@ -541,6 +542,30 @@ async fn copy_authentication(
         query.build().execute(&mut **tx).await?;
         after = rows.last().map(|session| session.token_hash.clone());
     }
+    #[derive(FromRow)]
+    struct ApiToken {
+        name: String,
+        token_hash: String,
+        expires_at: Option<i64>,
+    }
+    let mut after: Option<String> = None;
+    loop {
+        let rows = sqlx::query_as::<_, ApiToken>(
+            "SELECT name, token_hash, expires_at FROM api_tokens WHERE (? IS NULL OR name > ?) ORDER BY name LIMIT ?",
+        ).bind(&after).bind(&after).bind(batch_size as i64).fetch_all(sqlite).await?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut query =
+            QueryBuilder::<Postgres>::new("INSERT INTO api_tokens (name, token_hash, expires_at) ");
+        query.push_values(&rows, |mut row, token| {
+            row.push_bind(&token.name)
+                .push_bind(&token.token_hash)
+                .push_bind(token.expires_at);
+        });
+        query.build().execute(&mut **tx).await?;
+        after = rows.last().map(|token| token.name.clone());
+    }
     Ok(())
 }
 
@@ -571,7 +596,7 @@ async fn reset_sequences(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct Counts([i64; 9]);
+struct Counts([i64; 10]);
 
 async fn sqlite_counts(sqlite: &SqlitePool) -> Result<Counts> {
     Ok(Counts([
@@ -600,6 +625,9 @@ async fn sqlite_counts(sqlite: &SqlitePool) -> Result<Counts> {
             .fetch_one(sqlite)
             .await?,
         sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(sqlite)
+            .await?,
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens")
             .fetch_one(sqlite)
             .await?,
     ]))
@@ -632,6 +660,9 @@ async fn pg_counts(pg: &PgPool) -> Result<Counts> {
             .fetch_one(pg)
             .await?,
         sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions")
+            .fetch_one(pg)
+            .await?,
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_tokens")
             .fetch_one(pg)
             .await?,
     ]))

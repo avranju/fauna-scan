@@ -257,7 +257,7 @@ start_at = "2026-01-01T00:00:00Z"
 
 #[tokio::test]
 #[ignore = "requires FAUNA_SCAN_TEST_POSTGRES_URL"]
-async fn test_sqlite_to_pg_preserves_users_and_sessions() {
+async fn test_sqlite_to_pg_preserves_users_sessions_and_api_tokens() {
     use fauna_scan::authentication::{fingerprint, hash_password, new_session_token};
 
     let (pool, schema) = setup_test_schema("authentication_migration", 1).await;
@@ -271,6 +271,7 @@ async fn test_sqlite_to_pg_preserves_users_and_sessions() {
     let ops = sqlite.ops();
     let hash = hash_password("migration password").unwrap();
     let mut sessions = Vec::new();
+    let mut api_tokens = Vec::new();
     for index in 0..3 {
         let username = format!("Migration User {index}");
         ops.add_user(&username, &hash).await.unwrap();
@@ -285,6 +286,12 @@ async fn test_sqlite_to_pg_preserves_users_and_sessions() {
             .await
             .unwrap();
         sessions.push((username, token, expires_at));
+        let api_token = fauna_scan::authentication::new_api_token();
+        let name = format!("migration-token-{index}");
+        ops.create_api_token(&name, &fingerprint(&api_token), expires_at)
+            .await
+            .unwrap();
+        api_tokens.push((name, api_token, expires_at));
     }
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sqlite-to-pg"))
         .args([
@@ -307,6 +314,16 @@ async fn test_sqlite_to_pg_preserves_users_and_sessions() {
         .unwrap();
     let ops = postgres.ops();
     assert_eq!(ops.list_users().await.unwrap().len(), 3);
+    assert_eq!(ops.list_api_tokens().await.unwrap().len(), 3);
+    for (name, token, expires_at) in api_tokens {
+        let metadata = ops
+            .find_api_token(&fingerprint(&token), Utc::now().timestamp())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.name, name);
+        assert_eq!(metadata.expires_at, expires_at);
+    }
     for (username, token, expires_at) in sessions {
         assert_eq!(
             ops.find_user(&username)

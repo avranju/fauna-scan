@@ -13,3 +13,10 @@ pub struct SessionCredential {
     pub credential_fingerprint: String,
     pub expires_at: Option<i64>,
 }
+
+/// Public management metadata; the secret and its hash are never returned.
+#[derive(sqlx::FromRow)]
+pub struct ApiTokenMetadata {
+    pub name: String,
+    pub expires_at: Option<i64>,
+}

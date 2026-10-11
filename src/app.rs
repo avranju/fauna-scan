@@ -35,6 +35,7 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
             .map_err(|error| with_command_context("web", error)),
         Command::CheckConfig => handle_check_config(config_path),
         Command::Users { command } => handle_users(command, config_path).await,
+        Command::ApiToken { command } => handle_api_token(command, config_path).await,
         Command::Discover => handle_discover(config_path).await,
         Command::Download(args) => handle_download(args, config_path).await,
         Command::Scan(args) => handle_scan(args, config_path).await,
@@ -42,6 +43,95 @@ pub async fn execute(command: Command, config_path: Option<&Path>) -> AppResult<
             .await
             .map_err(|error| with_command_context("status", error)),
     }
+}
+
+/// Administrative token management; token secrets only ever go to stdout at creation.
+async fn handle_api_token(
+    command: crate::cli::ApiTokenCommand,
+    config_path: Option<&Path>,
+) -> AppResult<()> {
+    use crate::authentication::{fingerprint, new_api_token};
+    use crate::cli::ApiTokenCommand;
+    use chrono::{DateTime, NaiveDate, Utc};
+
+    let invalid = |message: &str| AppError::new(ErrorCategory::Configuration, "api_token", message);
+    // Validate before opening the database or creating directories.
+    let expiry = match &command {
+        ApiTokenCommand::Create {
+            name,
+            expires_at,
+            no_expiry,
+        } => {
+            if name.is_empty() || name.len() > 256 || name.chars().any(char::is_control) {
+                return Err(invalid(
+                    "token name must contain 1 to 256 bytes and no control characters",
+                ));
+            }
+            match (expires_at, no_expiry) {
+                (Some(value), false) => {
+                    let date = DateTime::parse_from_rfc3339(value)
+                        .map(|dt| dt.timestamp())
+                        .or_else(|_| {
+                            NaiveDate::parse_from_str(value, "%Y-%m-%d").map(|date| {
+                                date.and_hms_opt(0, 0, 0)
+                                    .expect("midnight")
+                                    .and_utc()
+                                    .timestamp()
+                            })
+                        })
+                        .map_err(|_| {
+                            invalid(
+                                "expiry must be RFC 3339 with timezone or YYYY-MM-DD (00:00 UTC)",
+                            )
+                        })?;
+                    if date <= Utc::now().timestamp() {
+                        return Err(invalid("expiry must be in the future"));
+                    }
+                    Some(date)
+                }
+                (None, true) => None,
+                _ => return Err(invalid("specify either --expires-at or --no-expiry")),
+            }
+        }
+        _ => None,
+    };
+    let config = Config::load(config_path)?;
+    create_runtime_directories(&config)?;
+    let ops = Database::connect(&config.database).await?.ops();
+    match command {
+        ApiTokenCommand::Create { name, .. } => {
+            let token = new_api_token();
+            if !ops
+                .create_api_token(&name, &fingerprint(&token), expiry)
+                .await?
+            {
+                return Err(invalid(
+                    "token name already exists; revoke it before reusing the name",
+                ));
+            }
+            println!("{token}");
+        }
+        ApiTokenCommand::List => {
+            for token in ops.list_api_tokens().await? {
+                let expiry = token
+                    .expires_at
+                    .map(|expiry| {
+                        DateTime::from_timestamp(expiry, 0)
+                            .map(|date| date.to_rfc3339())
+                            .unwrap_or_else(|| expiry.to_string())
+                    })
+                    .unwrap_or_else(|| "never".into());
+                println!("{}\t{expiry}", token.name);
+            }
+        }
+        ApiTokenCommand::Revoke { name } => {
+            if !ops.revoke_api_token(&name).await? {
+                return Err(invalid("token name does not exist"));
+            }
+            println!("Revoked API token: {name}");
+        }
+    }
+    Ok(())
 }
 
 /// Manage credentials without contacting the NVR or classifier.

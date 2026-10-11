@@ -15,7 +15,8 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     // Initialize logging; if this fails, report and exit without panicking.
-    if let Err(e) = logging::init(cli.log_level) {
+    let stdout_reserved = matches!(cli.command, fauna_scan::cli::Command::ApiToken { .. });
+    if let Err(e) = logging::init_with_output(cli.log_level, stdout_reserved) {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
