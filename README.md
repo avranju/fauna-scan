@@ -199,6 +199,13 @@ rebuild the frontend **before** rebuilding Rust whenever frontend source changes
 A Rust-only build without frontend assets still provides the API and explains
 how to build the missing interface.
 
+Use the search icon in the top right to search the entire image archive. Searches
+match text within species names, model summaries and structured descriptions
+(including uncertainties), classification history, and camera names. Results
+open in the image explorer with gallery/table views, pagination, and shareable
+URLs. Refine results with time, camera, and image filters. Matching is
+case-insensitive for ASCII text and treats `%`, `_`, and `!` literally.
+
 Web authentication is mandatory for all pages, APIs (including health), images,
 clips, and live events. The login page and its static assets are public. Create
 the first user with `fauna-scan --config PATH users add "USER NAME" "PASSWORD"`

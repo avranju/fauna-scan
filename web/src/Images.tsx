@@ -3,13 +3,14 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useInfiniteQuery } from '@tanstack/react-query';
 import { Grid2X2, List, SlidersHorizontal } from 'lucide-react';
 import { api, nameOf, percent, speciesOf, useApi, type ImagePage } from './api';
-import { defaultRange, imageParams } from './filters';
+import { defaultRange, imageParams, searchParams } from './filters';
 import { Badge, Empty, ErrorBox, ImageCard, Loading, Photo, Time } from './ui';
 
 export function Images() {
   const [params, setParams] = useSearchParams();
   const [filters, setFilters] = useState(false);
   const table = params.get('view') === 'table';
+  const term = params.get('q')?.trim() || '';
   const query = imageParams(params);
   const facets = useApi<{
     download_status: Record<string, number>;
@@ -80,8 +81,12 @@ export function Images() {
       <div className="page-heading">
         <div>
           <p className="eyebrow">YOUR FIELD ARCHIVE</p>
-          <h1>Images</h1>
-          <p className="muted">Every capture has a story. Find yours.</p>
+          <h1>{term ? 'Search results' : 'Images'}</h1>
+          <p className="muted">
+            {term
+              ? `Images matching “${term}” in species, model descriptions, or camera names. Includes classification history.`
+              : 'Every capture has a story. Find yours.'}
+          </p>
         </div>
         <span className="subtle-label">
           {rows.length.toLocaleString()}
@@ -160,7 +165,8 @@ export function Images() {
             .filter((k) => params.has(k))
             .map((k) => (
               <button key={k} onClick={() => update(k, '')}>
-                {k.replaceAll('_', ' ')}: {params.get(k)} ×
+                {k === 'q' ? 'Search' : k.replaceAll('_', ' ')}: {params.get(k)}{' '}
+                ×
               </button>
             ))}
         </div>
@@ -301,7 +307,7 @@ export function Images() {
             />
           </label>
           <label>
-            Search summaries / cameras
+            Search species / model text / cameras
             <input
               name="q"
               defaultValue={params.get('q') || ''}
@@ -312,7 +318,12 @@ export function Images() {
             <button type="submit" className="primary">
               Apply image filters
             </button>
-            <button type="button" onClick={() => setParams(defaultRange())}>
+            <button
+              type="button"
+              onClick={() =>
+                setParams(term ? searchParams(term, params) : defaultRange())
+              }
+            >
               Reset
             </button>
           </div>
@@ -328,13 +339,21 @@ export function Images() {
           title={
             images.hasNextPage
               ? 'No matching images in this batch'
-              : 'No images match this view'
+              : term
+                ? `No images match “${term}”`
+                : 'No images match this view'
           }
         >
           <p>
-            Try another time range or include pending downloads. If discovery
-            has not run yet, captures will appear here once it does.
+            {term
+              ? 'Try a different search term or broaden the time, camera, and image filters.'
+              : 'Try another time range or include pending downloads. If discovery has not run yet, captures will appear here once it does.'}
           </p>
+          {term && (
+            <button onClick={() => setParams(searchParams(term, params))}>
+              Search all dates and cameras
+            </button>
+          )}
           <button
             onClick={() =>
               setParams(

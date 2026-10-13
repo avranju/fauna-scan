@@ -831,6 +831,10 @@ fn build_image_filter(params: &ImageParams) -> Result<WebImageFilter, WebError> 
     {
         return Err(WebError::bad_request("unsupported failure filter"));
     }
+    let text = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    if text.is_some_and(|q| q.chars().count() > 200) {
+        return Err(WebError::bad_request("q must be at most 200 characters"));
+    }
     Ok(WebImageFilter {
         scope,
         download_status,
@@ -848,7 +852,7 @@ fn build_image_filter(params: &ImageParams) -> Result<WebImageFilter, WebError> 
                 .unwrap_or_default(),
             model: params.model.clone(),
             prompt_version: params.prompt_version.clone(),
-            text: params.q.clone(),
+            text: text.map(str::to_owned),
             failure: params.failure.clone(),
         },
     })
@@ -2125,6 +2129,94 @@ mod tests {
         }
         assert_eq!(
             get_json(&state, "/api/v1/images?typo=true").await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_search_matches_species_model_text_and_history() {
+        let (root, state) = test_state().await;
+        add_images(&root).await;
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            root.path().join("web.sqlite3").display()
+        ))
+        .await
+        .unwrap();
+        for (image_id, version, summary, species, structured) in [
+            (2, "v1", "An animal.", r#"[{"name":"Wild BOAR"}]"#, "{}"),
+            (3, "v1", "A boar at the fence. 100%_! certain.", "[]", "{}"),
+            (
+                4,
+                "v1",
+                "Unclear animal.",
+                "[]",
+                r#"{"uncertainties":["Possibly a \u0062oar."],"notes":{"detail":"Near the café."},"key-only-marker":false}"#,
+            ),
+            (4, "v2", "A deer.", r#"[{"name":"deer"}]"#, "{}"),
+        ] {
+            sqlx::query("INSERT INTO classifications (image_id, model, prompt_version, contains_wildlife, is_interesting, summary, species_json, classification_json, raw_response, request_started_at, request_completed_at, created_at) VALUES (?, 'vision', ?, 1, 0, ?, ?, ?, 'raw-only-marker', '2026-07-21T10:00:00Z', ?, '2026-07-21T10:00:00Z')")
+                .bind(image_id).bind(version).bind(summary).bind(species).bind(structured)
+                .bind(if version == "v2" { "2026-07-21T12:00:00Z" } else { "2026-07-21T11:00:00Z" })
+                .execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+
+        for (query, ids) in [
+            ("q=%20BoAr%20", vec![4, 3, 2]),
+            ("q=wild%20boar", vec![2]),
+            ("q=fence", vec![3]),
+            ("q=possibly", vec![4]),
+            ("q=caf%C3%A9", vec![4]),
+            ("q=%25_%21", vec![3]),
+            ("q=%25", vec![3]),
+            ("q=key-only-marker", vec![]),
+            ("q=raw-only-marker", vec![]),
+            ("q=%27%20OR%201%3D1--", vec![]),
+            ("q=boar&camera=99", vec![]),
+            ("q=boar&download_status=downloaded", vec![]),
+            ("q=boar&species=deer", vec![4]),
+            ("q=boar&from=2026-07-22T00:00:00Z", vec![]),
+            ("q=%20%20", vec![4, 3, 2, 1]),
+        ] {
+            let (status, images) = get_json(&state, &format!("/api/v1/images?{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {images}");
+            let found: Vec<_> = images["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|image| image["id"].as_i64().unwrap())
+                .collect();
+            assert_eq!(found, ids, "{query}");
+            let (status, overview) = get_json(&state, &format!("/api/v1/overview?{query}")).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {overview}");
+            assert_eq!(overview["counts"]["discovered"], ids.len(), "{query}");
+        }
+        let mut cursor = String::new();
+        let mut found = Vec::new();
+        loop {
+            let (status, page) =
+                get_json(&state, &format!("/api/v1/images?q=boar&limit=1{cursor}")).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            found.push(page["data"][0]["id"].as_i64().unwrap());
+            if found.len() == 1 {
+                assert_eq!(page["data"][0]["classification"]["summary"], "A deer.");
+            }
+            let Some(next) = page["page"]["next_cursor"].as_str() else {
+                break;
+            };
+            cursor = format!("&cursor={next}");
+            assert!(found.len() < 4);
+        }
+        assert_eq!(found, vec![4, 3, 2]);
+        let (status, neighbors) = get_json(&state, "/api/v1/images/3/neighbors?q=boar").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(neighbors["previous"], 4);
+        assert_eq!(neighbors["next"], 2);
+        assert_eq!(
+            get_json(&state, &format!("/api/v1/images?q={}", "a".repeat(201)))
+                .await
+                .0,
             StatusCode::BAD_REQUEST
         );
     }

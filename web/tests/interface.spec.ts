@@ -392,11 +392,134 @@ test('image filters and pagination use the server and preserve existing items', 
   await expect(page).toHaveURL(/species=squirrel/);
   await page.getByRole('button', { name: 'Load more images' }).click();
   await expect(page.locator('.image-card')).toHaveCount(2);
-  await page.getByLabel('Search summaries / cameras').fill('no results');
+  await page
+    .getByLabel('Search species / model text / cameras')
+    .fill('no results');
   await page.getByRole('button', { name: 'Apply image filters' }).click();
   await expect(
-    page.getByRole('heading', { name: 'No images match this view' }),
+    page.getByRole('heading', { name: 'No images match “no results”' }),
   ).toBeVisible();
+});
+
+test('header search spans the archive and keeps results through exploration', async ({
+  page,
+}) => {
+  await page.goto(
+    '/images?range=custom&from=2026-10-01T00:00:00Z&to=2026-10-02T00:00:00Z&camera=1&species=deer&tz=UTC&cursor=old',
+  );
+  const trigger = page.getByRole('button', {
+    name: 'Search images',
+    exact: true,
+  });
+  await trigger.click();
+  const input = page.getByRole('searchbox', { name: 'Search the archive' });
+  await expect(input).toBeFocused();
+  await input.fill('   ');
+  await expect(
+    page.getByRole('button', { name: 'Search', exact: true }),
+  ).toBeDisabled();
+  await input.fill(' boar ');
+  const request = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return (
+      url.pathname === '/api/v1/images' && url.searchParams.get('q') === 'boar'
+    );
+  });
+  await input.press('Enter');
+  const sent = new URL((await request).url()).searchParams;
+  expect(sent.get('q')).toBe('boar');
+  for (const key of [
+    'from',
+    'to',
+    'camera',
+    'species',
+    'cursor',
+    'download_status',
+  ])
+    expect(sent.has(key)).toBe(false);
+  await expect(
+    page.getByRole('heading', { name: 'Search results', exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'All time', exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'All cameras', exact: true }),
+  ).toBeVisible();
+  await expect(input).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+  expect(new URL(page.url()).searchParams.get('tz')).toBe('UTC');
+
+  await page.getByRole('button', { name: 'Load more images' }).click();
+  await expect(page.locator('.image-card')).toHaveCount(2);
+  await page.locator('.image-card').first().click();
+  await expect(page).toHaveURL(/\/images\/1\?.*q=boar/);
+  await page.getByRole('link', { name: 'Back to images' }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Search results', exact: true }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'Table view' }).click();
+  await expect(page.getByRole('table')).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole('table')).toBeVisible();
+
+  await trigger.click();
+  await expect(input).toHaveValue('boar');
+  await input.fill('no results');
+  await input.press('Enter');
+  await expect(
+    page.getByRole('heading', { name: 'No images match “no results”' }),
+  ).toBeVisible();
+  await page.goBack();
+  await expect(
+    page.getByRole('heading', { name: 'Search results', exact: true }),
+  ).toBeVisible();
+  expect(new URL(page.url()).searchParams.get('q')).toBe('boar');
+  await page
+    .getByRole('button', { name: 'Search: boar ×', exact: true })
+    .click();
+  await expect(
+    page.getByRole('heading', { name: 'Images', exact: true }),
+  ).toBeVisible();
+});
+
+test('search is accessible, fits the viewport, and opens from any page', async ({
+  page,
+}) => {
+  await page.goto('/about');
+  const trigger = page.getByRole('button', {
+    name: 'Search images',
+    exact: true,
+  });
+  await trigger.click();
+  const form = page.getByRole('search', { name: 'Search the archive' });
+  const input = page.getByRole('searchbox', { name: 'Search the archive' });
+  const box = await form.boundingBox();
+  expect(box!.x).toBeGreaterThanOrEqual(0);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
+  await input.press('Escape');
+  await expect(form).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+  await trigger.click();
+  await page.getByRole('heading', { name: 'About Fauna Scan' }).click();
+  await expect(form).toHaveCount(0);
+  await trigger.click();
+  await input.fill('boar');
+  await input.press('Enter');
+  await expect(
+    page.getByRole('heading', { name: 'Search results', exact: true }),
+  ).toBeVisible();
+  await page.getByRole('button', { name: 'All time', exact: true }).click();
+  await page.getByLabel('Time range', { exact: true }).selectOption('7d');
+  await page.getByRole('checkbox', { name: /Back garden/ }).check();
+  await page
+    .getByRole('button', { name: 'Apply filters', exact: true })
+    .click();
+  expect(new URL(page.url()).searchParams.get('q')).toBe('boar');
+  await page.getByRole('button', { name: 'Reset', exact: true }).click();
+  expect(new URL(page.url()).searchParams.get('q')).toBe('boar');
+  expect(new URL(page.url()).searchParams.get('range')).toBe('all');
 });
 
 test('detail shows provenance, older results, zoom, and on-demand NVR recording', async ({

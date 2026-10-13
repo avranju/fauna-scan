@@ -123,6 +123,7 @@ p {
   background: var(--surface);
 }
 .header-inner {
+  position: relative;
   max-width: 1536px;
   margin: auto;
   padding: 0 40px;
@@ -194,6 +195,33 @@ p {
 }
 .header-status time {
   color: var(--muted);
+}
+.search-toggle {
+  padding: 9px;
+}
+.search-form {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 18px;
+  z-index: 30;
+  width: min(420px, calc(100vw - 36px));
+  padding: 18px;
+  box-shadow: 0 12px 32px #16251c26;
+}
+.search-form .row {
+  margin-bottom: 12px;
+}
+.search-entry {
+  display: flex;
+  gap: 8px;
+}
+.search-entry input {
+  flex: 1;
+  min-width: 0;
+}
+.search-form p {
+  margin: 10px 0 0;
+  font-size: 12px;
 }
 .main {
   max-width: 1536px;

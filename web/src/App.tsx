@@ -29,6 +29,7 @@ import { Overview } from './Overview';
 import { Images } from './Images';
 import { Detail } from './Detail';
 import { Activity } from './Activity';
+import { Search } from './Search';
 
 function About() {
   const config = useApi<Config>('config');
@@ -198,8 +199,8 @@ export function App({
     return () => clearTimeout(timer);
   }, [toast]);
   useEffect(() => {
-    document.title = `${location.pathname === '/' ? 'Overview' : location.pathname === '/activity' ? 'Scan activity' : location.pathname === '/about' ? 'About' : 'Images'} · Fauna Scan`;
-  }, [location.pathname]);
+    document.title = `${location.pathname === '/' ? 'Overview' : location.pathname === '/activity' ? 'Scan activity' : location.pathname === '/about' ? 'About' : location.pathname === '/images' && params.get('q')?.trim() ? 'Search results' : 'Images'} · Fauna Scan`;
+  }, [location.pathname, location.search]);
   const nav = [
     ['/', 'Overview', LayoutDashboard],
     ['/images', 'Images', ImagesIcon],
@@ -242,6 +243,7 @@ export function App({
               ))}
             </nav>
             <div className="header-status">
+              <Search />
               <span title="API connectivity is separate from pipeline health">
                 <Radio size={14} />
                 {health.isError

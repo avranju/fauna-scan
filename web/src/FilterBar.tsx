@@ -8,7 +8,7 @@ import {
   X,
 } from 'lucide-react';
 import { nameOf, type Camera } from './api';
-import { defaultRange, localToUTC, presets } from './filters';
+import { defaultRange, localToUTC, presets, searchParams } from './filters';
 import { Zone } from './ui';
 
 export function FilterBar({ cameras }: { cameras: Camera[] }) {
@@ -27,6 +27,11 @@ export function FilterBar({ cameras }: { cameras: Camera[] }) {
     params.get('range') ||
     (params.has('from') || params.has('to') ? 'custom' : 'all');
   const ids = params.getAll('camera').flatMap((v) => v.split(','));
+
+  function reset() {
+    const term = params.get('q')?.trim();
+    setParams(term ? searchParams(term, params) : defaultRange());
+  }
 
   function open() {
     setDraft(new URLSearchParams(params));
@@ -117,10 +122,7 @@ export function FilterBar({ cameras }: { cameras: Camera[] }) {
           Filters
         </button>
         {(ids.length > 0 || range !== '24h') && (
-          <button
-            className="text-button"
-            onClick={() => setParams(defaultRange())}
-          >
+          <button className="text-button" onClick={reset}>
             Reset
           </button>
         )}
@@ -315,7 +317,7 @@ export function FilterBar({ cameras }: { cameras: Camera[] }) {
             <button
               type="button"
               onClick={() => {
-                setParams(defaultRange());
+                reset();
                 dialog.current?.close();
               }}
             >

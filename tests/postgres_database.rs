@@ -3158,6 +3158,117 @@ async fn test_postgres_rate_limit_daily_refund() {
 
 #[tokio::test]
 #[ignore = "requires FAUNA_SCAN_TEST_POSTGRES_URL"]
+async fn test_postgres_archive_text_search() {
+    let (pool, schema) = setup_test_schema("archive_text_search", 4).await;
+    let base = std::env::var("FAUNA_SCAN_TEST_POSTGRES_URL").unwrap();
+    let store = PostgresDataStore::connect(&Secret::new(schema_url(&base, &schema)), 4)
+        .await
+        .unwrap();
+    let ops = store.ops();
+    let camera = insert_camera(&pool, 1, "track-1").await;
+    let mut ids = Vec::new();
+    for seconds in ["00", "01", "02", "03"] {
+        ids.push(
+            insert_image(
+                &pool,
+                camera,
+                "track-1",
+                &format!("2026-07-21T10:00:{seconds}.000000000Z"),
+                "downloaded",
+                "done",
+            )
+            .await,
+        );
+    }
+    for (index, version, summary, species, structured) in [
+        (1, "v1", "An animal.", r#"[{"name":"Wild BOAR"}]"#, "{}"),
+        (2, "v1", "A boar at the fence. 100%_! certain.", "[]", "{}"),
+        (
+            3,
+            "v1",
+            "Unclear animal.",
+            "[]",
+            r#"{"uncertainties":["Possibly a \u0062oar."],"notes":{"detail":"Near the café."},"key-only-marker":false}"#,
+        ),
+        (3, "v2", "A deer.", r#"[{"name":"deer"}]"#, "{}"),
+    ] {
+        let class = insert_classification(
+            &pool,
+            ids[index],
+            "vision",
+            version,
+            if version == "v2" {
+                "2026-07-21T12:00:00Z"
+            } else {
+                "2026-07-21T11:00:00Z"
+            },
+        )
+        .await;
+        sqlx::query("UPDATE classifications SET summary = $1, species_json = $2, classification_json = $3, raw_response = 'raw-only-marker' WHERE id = $4")
+            .bind(summary).bind(species).bind(structured).bind(class).execute(&pool).await.unwrap();
+    }
+    let mut filter = WebImageFilter {
+        scope: WebScopeFilter {
+            from: None,
+            to: None,
+            camera_ids: Vec::new(),
+        },
+        download_status: None,
+        processing_status: None,
+        classified: None,
+        contains_wildlife: None,
+        is_interesting: None,
+        confidence_min: None,
+        advanced: WebAdvancedFilter::default(),
+    };
+    for (term, expected) in [
+        ("BoAr", vec![ids[3], ids[2], ids[1]]),
+        ("wild boar", vec![ids[1]]),
+        ("fence", vec![ids[2]]),
+        ("possibly", vec![ids[3]]),
+        ("café", vec![ids[3]]),
+        ("%_!", vec![ids[2]]),
+        ("%", vec![ids[2]]),
+        ("key-only-marker", vec![]),
+        ("raw-only-marker", vec![]),
+        ("' OR 1=1--", vec![]),
+    ] {
+        filter.advanced.text = Some(term.into());
+        let mut query = WebImageQuery {
+            filter: filter.clone(),
+            order: WebImageOrder::CapturedDescending,
+            limit: 1,
+            cursor: None,
+        };
+        let mut found = Vec::new();
+        loop {
+            let (rows, cursor) = ops.web_query_images(&query).await.unwrap();
+            found.extend(rows.into_iter().map(|row| row.id));
+            if cursor.is_none() {
+                break;
+            }
+            query.cursor = cursor;
+            assert!(found.len() < 4);
+        }
+        assert_eq!(found, expected, "{term}");
+        assert_eq!(
+            ops.web_overview(&filter).await.unwrap().discovered,
+            expected.len() as i64,
+            "{term}"
+        );
+    }
+    filter.advanced.text = Some("boar".into());
+    filter.scope.camera_ids = vec![camera + 1];
+    assert_eq!(ops.web_overview(&filter).await.unwrap().discovered, 0);
+    filter.scope.camera_ids.clear();
+    filter.advanced.species = vec!["deer".into()];
+    assert_eq!(ops.web_overview(&filter).await.unwrap().discovered, 1);
+    drop(store);
+    drop_schema(&pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires FAUNA_SCAN_TEST_POSTGRES_URL"]
 async fn test_postgres_explorer_filters_sorts_and_buckets() {
     let (pool, schema) = setup_test_schema("explorer_filters_sorts_buckets", 4).await;
     let base = std::env::var("FAUNA_SCAN_TEST_POSTGRES_URL").unwrap();

@@ -268,7 +268,7 @@ In addition to global time and cameras, support:
 - Minimum overall confidence: 0–100%.
 - Model and prompt version.
 - Local file: present/missing.
-- Text search over camera name and model summary. This is optional for the first milestone if SQLite FTS is not introduced.
+- Text search over camera names, species, model summaries, and decoded text values in structured classifications, including classification history. The header search opens the image explorer across all dates and cameras; URL-backed filters can then narrow the results. Search uses literal substring matching with ASCII case folding, bound SQL parameters, and the existing signed pagination cursors on SQLite and PostgreSQL.
 
 Facet counts should reflect the global time/camera predicate and all other active filters, excluding the facet itself. This lets the user understand how many results a selection will produce.
 

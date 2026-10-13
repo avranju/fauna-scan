@@ -21,6 +21,19 @@ export function defaultRange() {
   });
 }
 
+export function searchParams(term: string, current: URLSearchParams) {
+  const next = new URLSearchParams({
+    range: 'all',
+    download_status: 'all',
+    q: term.trim(),
+  });
+  ['tz', 'view'].forEach((key) => {
+    const value = current.get(key);
+    if (value) next.set(key, value);
+  });
+  return next;
+}
+
 export function scopeParams(p: URLSearchParams) {
   const q = new URLSearchParams();
   globalKeys.forEach((k) => p.getAll(k).forEach((v) => q.append(k, v)));

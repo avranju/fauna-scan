@@ -102,7 +102,29 @@ pub(super) fn predicates(f: &WebImageFilter, c: &str, postgres: bool) -> (Vec<St
         }
     }
     if let Some(q) = &f.advanced.text {
-        conditions.push(format!("(lower(COALESCE(cameras.name,'')) LIKE ? ESCAPE '!' OR lower(COALESCE({c}.summary,'')) LIKE ? ESCAPE '!')"));
+        // Search decoded JSON strings, so keys and JSON escaping do not affect
+        // matches. EXISTS includes classification history without duplicating
+        // images or changing the latest classification displayed in the list.
+        let text_values = |column: &str| {
+            if postgres {
+                format!(
+                    "EXISTS (SELECT 1 FROM jsonb_path_query(COALESCE(search_class.{column}, 'null')::jsonb, 'strict $.**') AS text_value(value) \
+                     WHERE jsonb_typeof(value) = 'string' AND lower(value #>> '{{}}') LIKE ? ESCAPE '!')"
+                )
+            } else {
+                format!(
+                    "EXISTS (SELECT 1 FROM json_tree(search_class.{column}) AS text_value \
+                     WHERE text_value.type = 'text' AND lower(text_value.atom) LIKE ? ESCAPE '!')"
+                )
+            }
+        };
+        conditions.push(format!(
+            "(lower(COALESCE(cameras.name, '')) LIKE ? ESCAPE '!' OR \
+             EXISTS (SELECT 1 FROM classifications AS search_class WHERE search_class.image_id = images.id AND \
+             (lower(COALESCE(search_class.summary, '')) LIKE ? ESCAPE '!' OR {} OR {})))",
+            text_values("species_json"),
+            text_values("classification_json"),
+        ));
         let q = format!(
             "%{}%",
             q.to_lowercase()
@@ -110,8 +132,9 @@ pub(super) fn predicates(f: &WebImageFilter, c: &str, postgres: bool) -> (Vec<St
                 .replace('%', "!%")
                 .replace('_', "!_")
         );
-        params.push(Box::new(q.clone()));
-        params.push(Box::new(q));
+        for _ in 0..4 {
+            params.push(Box::new(q.clone()));
+        }
     }
     if let Some(failure) = &f.advanced.failure {
         conditions.push(if failure=="retryable" {"(images.download_status = 'retry_wait' OR images.processing_status = 'retry_wait')"}else{"(images.download_status IN ('failed','unavailable') OR images.processing_status IN ('failed','missing'))"}.to_owned());
